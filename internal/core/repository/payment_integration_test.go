@@ -430,6 +430,32 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("release ages the lock so an immediate retry takes over", func(t *testing.T) {
+		k, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Fresh lock: a second claim would normally be ErrKeyLocked.
+		if _, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r"); !errors.Is(err, ErrKeyLocked) {
+			t.Fatalf("fresh lock should block, got %v", err)
+		}
+		// Release ages the lock; the next claim takes over (proceed=true).
+		if err := repo.Release(ctx, k.ID); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		_, proceed, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
+		if err != nil || !proceed {
+			t.Fatalf("after release, retry must take over: proceed=%v err=%v", proceed, err)
+		}
+		// Release on a finished key is a no-op (guarded by response_code IS NULL).
+		if err := repo.Finish(ctx, k.ID, 201, []byte(`{"ok":true}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Release(ctx, k.ID); err != nil {
+			t.Fatalf("release on finished key must be a harmless no-op, got %v", err)
+		}
+	})
+
 	t.Run("reap removes old keys", func(t *testing.T) {
 		k, _, err := repo.Claim(ctx, 11, "k-old", "POST", "/p", "h")
 		if err != nil {
