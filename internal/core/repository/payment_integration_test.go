@@ -310,6 +310,18 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("refund on a missing payment is rejected", func(t *testing.T) {
+		if _, err := repo.CreateRefund(ctx, 999999, 100, "", "no-such-payment"); !errors.Is(err, domain.ErrRefundRejected) {
+			t.Fatalf("refund on missing payment: want ErrRefundRejected, got %v", err)
+		}
+	})
+
+	t.Run("settling a missing refund returns ErrNotFound", func(t *testing.T) {
+		if err := repo.SettleRefund(ctx, 999999, domain.RefundSucceeded, "re_x"); !errors.Is(err, domain.ErrNotFound) {
+			t.Fatalf("settle missing refund: want ErrNotFound, got %v", err)
+		}
+	})
+
 	t.Run("crash-recovery: same key does not insert a duplicate refund", func(t *testing.T) {
 		// Reproduces the H1 double-insert: a crash after the refund INSERT but
 		// before the key is finished lets a takeover retry re-enter CreateRefund
