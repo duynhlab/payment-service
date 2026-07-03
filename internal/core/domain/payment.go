@@ -112,6 +112,7 @@ type Refund struct {
 	Status           RefundStatus `json:"status"`
 	ProviderRefundID string       `json:"provider_refund_id,omitempty"`
 	Reason           string       `json:"reason,omitempty"`
+	IdempotencyKey   string       `json:"-"` // dedupe key; never exposed in API responses
 	CreatedAt        time.Time    `json:"created_at"`
 	UpdatedAt        time.Time    `json:"updated_at"`
 }

@@ -251,6 +251,56 @@ func TestCreateRefund_CorruptCache(t *testing.T) {
 	}
 }
 
+// Crash-recovery for refunds: the first attempt settled the refund but the
+// key was never finished (crash before Finish). A takeover retry must adopt the
+// existing refund — not create a second one, not re-charge the provider.
+func TestCreateRefund_TakeoverAdoptsSettledRefund(t *testing.T) {
+	fp := newFakePayments()
+	ei := &erroringIdem{fakeIdem: newFakeIdem()}
+	prov := provider.NewStub()
+	svc := NewService(fp, ei, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	// First refund settles, but Finish fails → key left unfinished.
+	ei.finishErr = errBoom
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 500, "damaged"); !errors.Is(err, errBoom) {
+		t.Fatalf("setup: want finish error, got %v", err)
+	}
+	fp.mu.Lock()
+	refundsAfterFirst := len(fp.refs)
+	fp.mu.Unlock()
+
+	// Takeover: age the lock, clear the injected error, retry the same key.
+	ei.finishErr = nil
+	ei.mu.Lock()
+	for _, k := range ei.keys {
+		if k.Key == "rk" {
+			k.LockedAt = time.Unix(0, 0)
+		}
+	}
+	ei.mu.Unlock()
+
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 500, "damaged")
+	if err != nil {
+		t.Fatalf("takeover retry: %v", err)
+	}
+	if replayed {
+		t.Fatalf("takeover re-drives (not a cache replay); replayed=%v", replayed)
+	}
+	if ref.Status != domain.RefundSucceeded {
+		t.Fatalf("adopted refund status = %s, want succeeded", ref.Status)
+	}
+	fp.mu.Lock()
+	n := len(fp.refs)
+	fp.mu.Unlock()
+	if n != refundsAfterFirst {
+		t.Fatalf("takeover must adopt, not insert: refunds %d -> %d", refundsAfterFirst, n)
+	}
+}
+
 // A new idempotency key re-requesting an order whose payment already FAILED
 // must replay the 422 by adopting the existing failed payment — never a
 // second provider charge.

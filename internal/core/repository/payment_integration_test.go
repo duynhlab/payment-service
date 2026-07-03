@@ -14,6 +14,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -213,12 +214,12 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
 			map[string]any{"captured_at": time.Now()})
 
-		r1, err := repo.CreateRefund(ctx, p.ID, 500, "damaged")
+		r1, err := repo.CreateRefund(ctx, p.ID, 500, "damaged", "gk-500")
 		if err != nil {
 			t.Fatalf("partial refund: %v", err)
 		}
 		// Pending refunds count against the cap: 1600 > 2000-500.
-		if _, err := repo.CreateRefund(ctx, p.ID, 1600, ""); !errors.Is(err, ErrRefundRejected) {
+		if _, err := repo.CreateRefund(ctx, p.ID, 1600, "", "gk-1600"); !errors.Is(err, ErrRefundRejected) {
 			t.Fatalf("oversubscribe with pending refund: %v", err)
 		}
 		if err := repo.SettleRefund(ctx, r1.ID, domain.RefundSucceeded, "re_1"); err != nil {
@@ -229,7 +230,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			t.Fatalf("after partial: refunded=%d partially=%v", got.RefundedMinor, got.PartiallyRefunded())
 		}
 
-		r2, err := repo.CreateRefund(ctx, p.ID, 1500, "")
+		r2, err := repo.CreateRefund(ctx, p.ID, 1500, "", "gk-1500")
 		if err != nil {
 			t.Fatalf("remainder refund: %v", err)
 		}
@@ -241,7 +242,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			t.Fatalf("after full refund status=%s, want refunded", got.Status)
 		}
 		// Terminal: further refunds rejected.
-		if _, err := repo.CreateRefund(ctx, p.ID, 1, ""); !errors.Is(err, ErrRefundRejected) {
+		if _, err := repo.CreateRefund(ctx, p.ID, 1, "", "gk-1"); !errors.Is(err, ErrRefundRejected) {
 			t.Fatalf("refund on refunded payment: %v", err)
 		}
 	})
@@ -259,7 +260,10 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		errs := make([]error, 2)
 		wg.Add(2)
 		for i := 0; i < 2; i++ {
-			go func(i int) { defer wg.Done(); _, errs[i] = repo.CreateRefund(ctx, p.ID, 600, "") }(i)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = repo.CreateRefund(ctx, p.ID, 600, "", fmt.Sprintf("conc-%d", i))
+			}(i)
 		}
 		wg.Wait()
 
@@ -290,7 +294,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
 			map[string]any{"captured_at": time.Now()})
 
-		r, err := repo.CreateRefund(ctx, p.ID, 1000, "")
+		r, err := repo.CreateRefund(ctx, p.ID, 1000, "", "fk-1000a")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -301,8 +305,39 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if got.Status != domain.StatusCaptured || got.RefundedMinor != 0 {
 			t.Fatalf("failed refund must release: status=%s refunded=%d", got.Status, got.RefundedMinor)
 		}
-		if _, err := repo.CreateRefund(ctx, p.ID, 1000, ""); err != nil {
+		if _, err := repo.CreateRefund(ctx, p.ID, 1000, "", "fk-1000b"); err != nil {
 			t.Fatalf("retry refund after failure: %v", err)
+		}
+	})
+
+	t.Run("crash-recovery: same key does not insert a duplicate refund", func(t *testing.T) {
+		// Reproduces the H1 double-insert: a crash after the refund INSERT but
+		// before the key is finished lets a takeover retry re-enter CreateRefund
+		// with the same key. It must adopt the existing refund, not add a second.
+		p := createPending(t, repo, 7, nil, 2000)
+		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
+			map[string]any{"provider_payment_id": "mp_r", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
+		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
+			map[string]any{"captured_at": time.Now()})
+
+		first, err := repo.CreateRefund(ctx, p.ID, 500, "", "recover-key")
+		if err != nil {
+			t.Fatalf("first refund: %v", err)
+		}
+		second, err := repo.CreateRefund(ctx, p.ID, 500, "", "recover-key")
+		if err != nil {
+			t.Fatalf("retry refund (adopt): %v", err)
+		}
+		if second.ID != first.ID {
+			t.Fatalf("retry must adopt refund %d, got a new one %d (double insert)", first.ID, second.ID)
+		}
+		var count int
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM refunds WHERE payment_id = $1`, p.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("exactly one refund row for the key, got %d", count)
 		}
 	})
 
@@ -438,7 +473,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 			t.Fatal(err)
 		}
 		dead.Close()
-		if _, err := NewPaymentRepository(dead).CreateRefund(ctx, 1, 100, ""); err == nil {
+		if _, err := NewPaymentRepository(dead).CreateRefund(ctx, 1, 100, "", "dead-key"); err == nil {
 			t.Fatal("CreateRefund on a closed pool must error")
 		}
 	})

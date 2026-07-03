@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,22 +34,34 @@ import (
 const fieldStatus = "status"
 
 func main() {
+	if err := run(); err != nil {
+		// Fatal startup failure — exit non-zero so init containers, Jobs, and
+		// exit-code alerting see the failure instead of a clean exit.
+		fmt.Fprintln(os.Stderr, "payment-service: fatal:", err)
+		os.Exit(1)
+	}
+}
+
+// run wires and serves the payment service, returning an error on any fatal
+// startup failure. It owns all the shutdown defers, so main can os.Exit(1)
+// without skipping cleanup (os.Exit in main would bypass defers).
+func run() error {
 	cfg := config.Load()
 
 	logger, err := zapx.New(os.Getenv("LOG_LEVEL"))
 	if err != nil {
-		panic("Failed to initialize logger: " + err.Error())
+		return fmt.Errorf("initialize logger: %w", err)
 	}
 	defer func() { _ = logger.Sync() }()
 
 	// `<binary> migrate` runs embedded schema migrations (its SQL runs and the
 	// process exits). No args serves the app.
 	if maybeRunSubcommand(cfg, logger) {
-		return
+		return nil
 	}
 
 	if err := cfg.Validate(); err != nil {
-		panic("Configuration validation failed: " + err.Error())
+		return fmt.Errorf("configuration validation: %w", err)
 	}
 
 	logger.Info("Service starting",
@@ -68,8 +81,7 @@ func main() {
 
 	pool, err := database.Connect(context.Background(), cfg)
 	if err != nil {
-		logger.Error("Failed to connect to database", zap.Error(err))
-		return
+		return fmt.Errorf("connect to database: %w", err)
 	}
 	defer pool.Close()
 	logger.Info("Database connection pool established")
@@ -79,8 +91,7 @@ func main() {
 	// refreshes in the background, so a verifier is safe to build at startup.
 	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
 	if err != nil {
-		logger.Error("JWKS verifier init failed", zap.Error(err))
-		return
+		return fmt.Errorf("JWKS verifier init: %w", err)
 	}
 
 	// Repositories + provider + logic. P1 runs the in-memory provider stub;
@@ -109,6 +120,7 @@ func main() {
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, verifier, paymentHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
+	return nil
 }
 
 // runBackgroundJobs drives the two periodic maintenance loops: expiring

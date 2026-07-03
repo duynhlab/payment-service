@@ -135,9 +135,19 @@ func (f *fakePayments) refundedLocked(paymentID int64) int64 {
 	return sum
 }
 
-func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor int64, reason string) (*domain.Refund, error) {
+func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor int64, reason, idemKey string) (*domain.Refund, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Idempotent by key: adopt an existing refund for the same key (mirrors the
+	// real partial unique index) rather than inserting a duplicate.
+	if idemKey != "" {
+		for _, r := range f.refs {
+			if r.IdempotencyKey == idemKey {
+				out := *r
+				return &out, nil
+			}
+		}
+	}
 	p, ok := f.items[paymentID]
 	if !ok || (p.Status != domain.StatusCaptured && p.Status != domain.StatusRefunded) {
 		return nil, repository.ErrRefundRejected
@@ -146,7 +156,7 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 		return nil, repository.ErrRefundRejected
 	}
 	f.refSeq++
-	r := &domain.Refund{ID: f.refSeq, PaymentID: paymentID, AmountMinor: amountMinor, Status: domain.RefundPending, Reason: reason}
+	r := &domain.Refund{ID: f.refSeq, PaymentID: paymentID, AmountMinor: amountMinor, Status: domain.RefundPending, Reason: reason, IdempotencyKey: idemKey}
 	f.refs[r.ID] = r
 	out := *r
 	return &out, nil

@@ -27,7 +27,7 @@ type PaymentRepo interface {
 	ListByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Payment, int, error)
 	TransitionStatus(ctx context.Context, id int64, from, to domain.Status, set map[string]any) error
 	ExpireStaleAuthorizations(ctx context.Context, now time.Time) (int64, error)
-	CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason string) (*domain.Refund, error)
+	CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason, idemKey string) (*domain.Refund, error)
 	SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error
 }
 
@@ -348,22 +348,28 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	if err != nil {
 		return nil, false, err
 	}
-	ref, err := s.payments.CreateRefund(ctx, pay.ID, amountMinor, reason)
+	// The refund insert is idempotent by this scoped key: a crash-recovery
+	// retry adopts the existing refund rather than creating a second one.
+	scopedKey := fmt.Sprintf("%d:%s", userID, idemKey)
+	ref, err := s.payments.CreateRefund(ctx, pay.ID, amountMinor, reason, scopedKey)
 	if err != nil {
 		return nil, false, err // incl. repository.ErrRefundRejected
 	}
 
-	providerRefundID, err := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor,
-		fmt.Sprintf("%d:%s", userID, idemKey))
-	status := domain.RefundSucceeded
-	if err != nil {
-		status = domain.RefundFailed
+	// An adopted refund that already settled (crash after settle, before finish)
+	// must not be re-sent to the provider or re-settled — just finish.
+	if ref.Status == domain.RefundPending {
+		providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor, scopedKey)
+		status := domain.RefundSucceeded
+		if provErr != nil {
+			status = domain.RefundFailed
+		}
+		if err := s.payments.SettleRefund(ctx, ref.ID, status, providerRefundID); err != nil {
+			return nil, false, err
+		}
+		ref.Status = status
+		ref.ProviderRefundID = providerRefundID
 	}
-	if err := s.payments.SettleRefund(ctx, ref.ID, status, providerRefundID); err != nil {
-		return nil, false, err
-	}
-	ref.Status = status
-	ref.ProviderRefundID = providerRefundID
 
 	body, _ := json.Marshal(ref)
 	if err := s.idem.Finish(ctx, key.ID, 201, body); err != nil {
