@@ -86,9 +86,44 @@ func main() {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, provider.NewStub(), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
+	jobsCtx, stopJobs := context.WithCancel(context.Background())
+	defer stopJobs()
+	go runBackgroundJobs(jobsCtx, paymentService, cfg, logger)
+
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, verifier, paymentHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown)
+}
+
+// runBackgroundJobs drives the two periodic maintenance loops: expiring
+// authorized holds whose TTL passed (every minute — an expired hold must stop
+// being capturable promptly) and reaping idempotency keys older than their
+// retention window (hourly; the window itself is 24h, so cadence is not
+// critical). Both are single-statement queries, safe to run on every replica.
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, cfg *config.Config, logger *zap.Logger) {
+	expiry := time.NewTicker(time.Minute)
+	reap := time.NewTicker(time.Hour)
+	defer expiry.Stop()
+	defer reap.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-expiry.C:
+			if n, err := svc.ExpireHolds(ctx); err != nil {
+				logger.Error("Expire stale authorizations failed", zap.Error(err))
+			} else if n > 0 {
+				logger.Info("Expired stale authorization holds", zap.Int64("count", n))
+			}
+		case <-reap.C:
+			if n, err := svc.ReapIdempotencyKeys(ctx, cfg.Payment.IdempotencyKeyTTL); err != nil {
+				logger.Error("Reap idempotency keys failed", zap.Error(err))
+			} else if n > 0 {
+				logger.Info("Reaped expired idempotency keys", zap.Int64("count", n))
+			}
+		}
+	}
 }
 
 // maybeRunSubcommand handles the `migrate` subcommand, reporting whether it
