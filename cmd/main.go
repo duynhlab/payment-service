@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -27,6 +28,9 @@ import (
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
 )
+
+// fieldStatus is the JSON key for the health/ready probe responses.
+const fieldStatus = "status"
 
 func main() {
 	cfg := config.Load()
@@ -86,9 +90,66 @@ func main() {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, provider.NewStub(), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
+	jobsCtx, stopJobs := context.WithCancel(context.Background())
+	var jobsWG sync.WaitGroup
+	jobsWG.Add(1)
+	go func() {
+		defer jobsWG.Done()
+		runBackgroundJobs(jobsCtx, paymentService, cfg, logger)
+	}()
+
+	// Stop the background loops and wait for the in-flight tick to finish
+	// before the pool is closed — otherwise a tick landing after pool.Close()
+	// acquires from a closed pool and logs a spurious error.
+	stopJobsAndWait := func() {
+		stopJobs()
+		jobsWG.Wait()
+	}
+
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, verifier, paymentHandler, &isShuttingDown)
-	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown)
+	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
+}
+
+// runBackgroundJobs drives the two periodic maintenance loops: expiring
+// authorized holds whose TTL passed (every minute — an expired hold must stop
+// being capturable promptly) and reaping idempotency keys older than their
+// retention window (hourly; the window itself is 24h, so cadence is not
+// critical). Both are single-statement queries, safe to run on every replica.
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, cfg *config.Config, logger *zap.Logger) {
+	expiry := time.NewTicker(time.Minute)
+	reap := time.NewTicker(time.Hour)
+	defer expiry.Stop()
+	defer reap.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-expiry.C:
+			runJob(ctx, "Expire stale authorizations", logger, func(jctx context.Context) (int64, error) {
+				return svc.ExpireHolds(jctx)
+			})
+		case <-reap.C:
+			runJob(ctx, "Reap idempotency keys", logger, func(jctx context.Context) (int64, error) {
+				return svc.ReapIdempotencyKeys(jctx, cfg.Payment.IdempotencyKeyTTL)
+			})
+		}
+	}
+}
+
+// runJob executes one maintenance tick under a bounded timeout so a single
+// hung query cannot stall the loop, logging the affected-row count or error.
+func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(context.Context) (int64, error)) {
+	jctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	n, err := fn(jctx)
+	switch {
+	case err != nil:
+		logger.Error(name+" failed", zap.Error(err))
+	case n > 0:
+		logger.Info(name+" completed", zap.Int64("count", n))
+	}
 }
 
 // maybeRunSubcommand handles the `migrate` subcommand, reporting whether it
@@ -180,14 +241,14 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 	r.Use(middleware.PrometheusMiddleware())
 
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
+		c.JSON(200, gin.H{fieldStatus: "ok"})
 	})
 	r.GET("/ready", func(c *gin.Context) {
 		if isShuttingDown.Load() {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "shutting_down"})
+			c.JSON(http.StatusServiceUnavailable, gin.H{fieldStatus: "shutting_down"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{fieldStatus: "ok"})
 	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
@@ -209,6 +270,7 @@ func runGracefulShutdown(
 	pool interface{ Close() },
 	logger *zap.Logger,
 	isShuttingDown *atomic.Bool,
+	beforePoolClose func(),
 ) {
 	go func() {
 		logger.Info("Starting payment service", zap.String("port", cfg.Service.Port))
@@ -240,6 +302,11 @@ func runGracefulShutdown(
 		logger.Error("HTTP server shutdown error", zap.Error(err))
 	} else {
 		logger.Info("HTTP server shutdown complete")
+	}
+
+	if beforePoolClose != nil {
+		beforePoolClose()
+		logger.Info("Background jobs stopped")
 	}
 
 	pool.Close()

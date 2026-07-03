@@ -246,6 +246,43 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("concurrent refunds cannot oversubscribe (FOR UPDATE guard)", func(t *testing.T) {
+		p := createPending(t, repo, 7, nil, 1000)
+		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
+			map[string]any{"provider_payment_id": "mp_c", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
+		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
+			map[string]any{"captured_at": time.Now()})
+
+		// Two refunds of 600 against a 1000 capture racing: without the row
+		// lock both would snapshot SUM=0 and commit, oversubscribing to 1200.
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		wg.Add(2)
+		for i := 0; i < 2; i++ {
+			go func(i int) { defer wg.Done(); _, errs[i] = repo.CreateRefund(ctx, p.ID, 600, "") }(i)
+		}
+		wg.Wait()
+
+		ok, rejected := 0, 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrRefundRejected):
+				rejected++
+			default:
+				t.Fatalf("unexpected refund error: %v", err)
+			}
+		}
+		if ok != 1 || rejected != 1 {
+			t.Fatalf("want exactly one refund admitted, got ok=%d rejected=%d", ok, rejected)
+		}
+		got, _ := repo.FindByID(ctx, p.ID, 0)
+		if got.RefundedMinor > got.AmountMinor {
+			t.Fatalf("oversubscribed: refunded=%d > amount=%d", got.RefundedMinor, got.AmountMinor)
+		}
+	})
+
 	t.Run("failed refund releases its reserved amount", func(t *testing.T) {
 		p := createPending(t, repo, 7, nil, 1000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
@@ -317,6 +354,17 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("same key different path or method conflicts", func(t *testing.T) {
+		// A key identifies one request: reusing it on another endpoint (even
+		// with the identical body hash) must conflict, never cross-replay.
+		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/other", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+			t.Fatalf("different path: want ErrKeyConflict, got %v", err)
+		}
+		if _, _, err := repo.Claim(ctx, 7, "k1", "DELETE", "/p", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+			t.Fatalf("different method: want ErrKeyConflict, got %v", err)
+		}
+	})
+
 	t.Run("per-user key namespaces", func(t *testing.T) {
 		_, proceed, err := repo.Claim(ctx, 8, "k1", "POST", "/p", "hash-a")
 		if err != nil || !proceed {
@@ -379,6 +427,45 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		}
 		if took.RecoveryPoint != RecoveryProviderCalled || took.PaymentID == nil || *took.PaymentID != pay.ID {
 			t.Fatalf("takeover must surface checkpoint, got %+v", took)
+		}
+	})
+
+	t.Run("CreateRefund surfaces a transaction begin error", func(t *testing.T) {
+		// A closed pool makes Begin fail — exercises the tx error path without
+		// a live fault-injection harness.
+		dead, err := pgxpool.New(ctx, pool.Config().ConnString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dead.Close()
+		if _, err := NewPaymentRepository(dead).CreateRefund(ctx, 1, 100, ""); err == nil {
+			t.Fatal("CreateRefund on a closed pool must error")
+		}
+	})
+
+	t.Run("release ages the lock so an immediate retry takes over", func(t *testing.T) {
+		k, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Fresh lock: a second claim would normally be ErrKeyLocked.
+		if _, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r"); !errors.Is(err, ErrKeyLocked) {
+			t.Fatalf("fresh lock should block, got %v", err)
+		}
+		// Release ages the lock; the next claim takes over (proceed=true).
+		if err := repo.Release(ctx, k.ID); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		_, proceed, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
+		if err != nil || !proceed {
+			t.Fatalf("after release, retry must take over: proceed=%v err=%v", proceed, err)
+		}
+		// Release on a finished key is a no-op (guarded by response_code IS NULL).
+		if err := repo.Finish(ctx, k.ID, 201, []byte(`{"ok":true}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repo.Release(ctx, k.ID); err != nil {
+			t.Fatalf("release on finished key must be a harmless no-op, got %v", err)
 		}
 	})
 

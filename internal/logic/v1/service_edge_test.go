@@ -64,26 +64,84 @@ func TestCreateRefund_ProviderFailureSettlesFailed(t *testing.T) {
 	}
 }
 
-func TestCreateRefund_NotCapturedRejected(t *testing.T) {
-	svc, _, _, _ := newTestService()
-	res, _ := svc.CreateIntent(context.Background(), "k-nc", intent(2000)) // authorized only
-	_, _, err := svc.CreateRefund(context.Background(), "rk-nc", res.Payment.ID, 7, 500, "")
-	if !errors.Is(err, repository.ErrRefundRejected) {
-		t.Fatalf("refunding an uncaptured payment must reject, got %v", err)
+// TestCreateRefund_RejectedByState covers every non-refundable state: a refund
+// is only valid against a captured payment, so authorized/voided/expired/failed
+// payments must all be rejected.
+func TestCreateRefund_RejectedByState(t *testing.T) {
+	// setup drives a fresh payment into the named state and returns its id.
+	setups := map[string]func(t *testing.T, svc *Service) int64{
+		"authorized (never captured)": func(t *testing.T, svc *Service) int64 {
+			res, _ := svc.CreateIntent(context.Background(), "k-auth", intent(2000))
+			return res.Payment.ID
+		},
+		"voided": func(t *testing.T, svc *Service) int64 {
+			res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
+			if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err != nil {
+				t.Fatal(err)
+			}
+			return res.Payment.ID
+		},
+		"failed (declined)": func(t *testing.T, svc *Service) int64 {
+			res, _ := svc.CreateIntent(context.Background(), "k-fail", intent(2002)) // ...02 => decline
+			return res.Payment.ID
+		},
+	}
+	for name, setup := range setups {
+		t.Run(name, func(t *testing.T) {
+			svc, _, _, _ := newTestService()
+			id := setup(t, svc)
+			_, _, err := svc.CreateRefund(context.Background(), "rk-"+name, id, 7, 500, "")
+			if !errors.Is(err, repository.ErrRefundRejected) {
+				t.Fatalf("refund on %s must be rejected, got %v", name, err)
+			}
+		})
 	}
 }
 
-func TestCaptureVoid_ProviderErrorPropagates(t *testing.T) {
+// When the provider call fails, the CAS-first ordering means the row was
+// already moved; the operation must roll it back to authorized so the row never
+// disagrees with the (unchanged) provider state. Assert the rollback, not just
+// the error.
+func TestCapture_ProviderFailureRollsBackToAuthorized(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down"), voidErr: errors.New("void down")}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
 	svc := NewService(fp, fi, prov, 168*time.Hour)
 
-	res, _ := svc.CreateIntent(context.Background(), "k-pe", intent(2000))
+	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "capture down") {
 		t.Fatalf("capture provider error must propagate, got %v", err)
 	}
+	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.StatusAuthorized {
+		t.Fatalf("after failed capture, status = %s, want authorized (rolled back)", got.Status)
+	}
+}
+
+func TestVoid_ProviderFailureRollsBackToAuthorized(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(), voidErr: errors.New("void down")}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
 	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "void down") {
 		t.Fatalf("void provider error must propagate, got %v", err)
+	}
+	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.StatusAuthorized {
+		t.Fatalf("after failed void, status = %s, want authorized (rolled back)", got.Status)
+	}
+}
+
+func TestVoid_NotFound(t *testing.T) {
+	svc, _, _, _ := newTestService()
+	if _, err := svc.Void(context.Background(), 999, 7); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("voiding a missing payment must return ErrNotFound, got %v", err)
 	}
 }
 
@@ -112,14 +170,18 @@ func TestConcurrentCaptureAndVoid_OnlyOneWins(t *testing.T) {
 	}
 }
 
-func TestCapture_NotFoundAndOwnerScope(t *testing.T) {
+func TestCapture_NotFound(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	if _, err := svc.Capture(context.Background(), 999, 7); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("missing payment: %v", err)
+		t.Fatalf("capturing a missing payment must return ErrNotFound, got %v", err)
 	}
+}
+
+func TestGet_ForeignUserScoped(t *testing.T) {
+	svc, _, _, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "k-owner", intent(2000))
 	if _, err := svc.Get(context.Background(), res.Payment.ID, 8); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("foreign user must not see the payment, got %v", err)
+		t.Fatalf("a foreign user must not see the payment, got %v", err)
 	}
 }
 
@@ -138,12 +200,26 @@ func TestList_Pagination(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("page2 len=%d, want 1", len(items))
 	}
+	// Page beyond the last still reports the true total with an empty page.
+	items, total, err = svc.List(context.Background(), 7, 99, 2)
+	if err != nil || total != 3 || len(items) != 0 {
+		t.Fatalf("page-beyond: err=%v total=%d len=%d, want total=3 len=0", err, total, len(items))
+	}
 }
 
-func TestReapIdempotencyKeys_Passthrough(t *testing.T) {
-	svc, _, _, _ := newTestService()
-	if _, err := svc.ReapIdempotencyKeys(context.Background(), time.Hour); err != nil {
-		t.Fatal(err)
+func TestReapIdempotencyKeys_DelegatesTTLAndCount(t *testing.T) {
+	svc, _, fi, _ := newTestService()
+	fi.reapCount = 4
+
+	n, err := svc.ReapIdempotencyKeys(context.Background(), 24*time.Hour)
+	if err != nil {
+		t.Fatalf("ReapIdempotencyKeys: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("returned count = %d, want 4 (from the repo)", n)
+	}
+	if fi.reapTTL != 24*time.Hour {
+		t.Fatalf("delegated TTL = %v, want 24h", fi.reapTTL)
 	}
 }
 
@@ -175,6 +251,48 @@ func TestCreateRefund_CorruptCache(t *testing.T) {
 	}
 }
 
+// A new idempotency key re-requesting an order whose payment already FAILED
+// must replay the 422 by adopting the existing failed payment — never a
+// second provider charge.
+func TestCreateIntent_AdoptFailedOrderReturns422NoRecharge(t *testing.T) {
+	svc, _, _, stub := newTestService()
+	order := int64(77)
+	in := intent(2002) // ...02 => declines on the first attempt
+	in.OrderID = &order
+
+	first, err := svc.CreateIntent(context.Background(), "k-a", in)
+	if err != nil || first.Code != 422 || first.Payment.Status != domain.StatusFailed {
+		t.Fatalf("first attempt: err=%v code=%d status=%v", err, first.Code, first.Payment.Status)
+	}
+
+	in2 := intent(2002)
+	in2.OrderID = &order
+	second, err := svc.CreateIntent(context.Background(), "k-b", in2)
+	if err != nil {
+		t.Fatalf("re-request on failed order: %v", err)
+	}
+	if second.Code != 422 || second.Payment.ID != first.Payment.ID {
+		t.Fatalf("adopt failed order: code=%d id=%d (want 422, id=%d)", second.Code, second.Payment.ID, first.Payment.ID)
+	}
+	if got := stub.Charges(); got != 0 {
+		t.Fatalf("a declined order must never mint a charge, got %d", got)
+	}
+}
+
+// The S3 guard: if the authorize CAS goes stale for a reason other than a
+// benign re-entry (e.g. the expiry job flipped the row), the charge succeeded
+// but the row is not authorized/captured — driveCharge must reject, never
+// cache a bogus 201.
+func TestCreateIntent_ChargeSucceededButRowNotAuthorizedRejects(t *testing.T) {
+	ep := &erroringPayments{fakePayments: newFakePayments(), transitionErr: repository.ErrStaleTransition}
+	svc := NewService(ep, newFakeIdem(), provider.NewStub(), 168*time.Hour)
+
+	_, err := svc.CreateIntent(context.Background(), "k-exp", intent(2000))
+	if !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("charge succeeded but row not in a success state must reject, got %v", err)
+	}
+}
+
 func TestCreateIntent_ReentryUsesExistingPayment(t *testing.T) {
 	// A takeover whose key already checkpointed a payment must reuse it, not
 	// create a second one.
@@ -183,7 +301,7 @@ func TestCreateIntent_ReentryUsesExistingPayment(t *testing.T) {
 
 	// Simulate a crashed first attempt: claim + create payment + checkpoint,
 	// then nothing else.
-	key, _, err := fi.Claim(context.Background(), in.UserID, "k-re", "POST", "/payment/v1/private/payments", hashInput(in))
+	key, _, err := fi.Claim(context.Background(), in.UserID, "k-re", "POST", "/payment/v1/private/payments", hashJSON(in))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -175,6 +175,10 @@ type fakeIdem struct {
 	seq  int64
 	keys map[string]*repository.IdempotencyKey
 	take time.Duration
+	// reapTTL/reapCount record the last Reap call so tests can assert the
+	// service delegates the configured TTL and surfaces the returned count.
+	reapTTL   time.Duration
+	reapCount int64
 }
 
 func newFakeIdem() *fakeIdem {
@@ -186,7 +190,9 @@ func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, has
 	defer f.mu.Unlock()
 	id := key
 	if k, ok := f.keys[id]; ok {
-		if k.RequestHash != hash {
+		// Mirror the real repository: a key identifies ONE request — same key
+		// with a different body, path, or method is a conflict, never a replay.
+		if k.RequestHash != hash || k.RequestPath != path || k.RequestMethod != method {
 			return nil, false, repository.ErrKeyConflict
 		}
 		if k.Finished() {
@@ -224,6 +230,17 @@ func (f *fakeIdem) Advance(_ context.Context, id int64, point string, paymentID 
 	return nil
 }
 
+func (f *fakeIdem) Release(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.keys {
+		if k.ID == id && !k.Finished() {
+			k.LockedAt = time.Unix(0, 0)
+		}
+	}
+	return nil
+}
+
 func (f *fakeIdem) Finish(_ context.Context, id int64, code int, body []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -237,7 +254,12 @@ func (f *fakeIdem) Finish(_ context.Context, id int64, code int, body []byte) er
 	return nil
 }
 
-func (f *fakeIdem) Reap(_ context.Context, _ time.Duration) (int64, error) { return 0, nil }
+func (f *fakeIdem) Reap(_ context.Context, ttl time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reapTTL = ttl
+	return f.reapCount, nil
+}
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -313,39 +335,47 @@ func TestCreateIntent_SameKeyDifferentBody(t *testing.T) {
 }
 
 func TestCreateIntent_DeclineCaches422(t *testing.T) {
-	svc, _, _, _ := newTestService()
-	res, err := svc.CreateIntent(context.Background(), "key-4", intent(2002)) // ...02 => decline
-	if err != nil {
-		t.Fatalf("CreateIntent: %v", err)
+	// Each deterministic decline trigger fails the intent with its own code,
+	// caches 422, and replays on retry without re-charging.
+	tests := []struct {
+		name    string
+		amount  int64
+		decline string
+	}{
+		{"generic decline", 2002, provider.DeclineGeneric},         // ...02
+		{"insufficient funds", 2095, provider.DeclineInsufficient}, // ...95
 	}
-	if res.Code != 422 || res.Payment.Status != domain.StatusFailed || res.Payment.DeclineCode != provider.DeclineGeneric {
-		t.Fatalf("got code=%d status=%s decline=%q", res.Code, res.Payment.Status, res.Payment.DeclineCode)
-	}
-	// The decline replays too — a retry must NOT re-charge.
-	res2, err := svc.CreateIntent(context.Background(), "key-4", intent(2002))
-	if err != nil || !res2.Replayed || res2.Code != 422 {
-		t.Fatalf("decline replay got (%v, replayed=%v code=%d)", err, res2.Replayed, res2.Code)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, _, _ := newTestService()
+			res, err := svc.CreateIntent(context.Background(), "key-4", intent(tt.amount))
+			if err != nil {
+				t.Fatalf("CreateIntent: %v", err)
+			}
+			if res.Code != 422 || res.Payment.Status != domain.StatusFailed || res.Payment.DeclineCode != tt.decline {
+				t.Fatalf("got code=%d status=%s decline=%q, want 422 failed %q",
+					res.Code, res.Payment.Status, res.Payment.DeclineCode, tt.decline)
+			}
+			// The decline replays too — a retry must NOT re-charge.
+			res2, err := svc.CreateIntent(context.Background(), "key-4", intent(tt.amount))
+			if err != nil || !res2.Replayed || res2.Code != 422 {
+				t.Fatalf("decline replay got (%v, replayed=%v code=%d)", err, res2.Replayed, res2.Code)
+			}
+		})
 	}
 }
 
-func TestCreateIntent_TransientLeavesKeyRetryable(t *testing.T) {
+func TestCreateIntent_TransientReleasesLockForImmediateRetry(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	_, err := svc.CreateIntent(context.Background(), "key-5", intent(2019)) // ...19 => transient once
 	if !errors.Is(err, provider.ErrTransient) {
 		t.Fatalf("want transient error, got %v", err)
 	}
-	// Stale-lock takeover path: pretend the lock aged past the threshold.
-	svcImpl := svc
-	fi := svcImpl.idem.(*fakeIdem)
-	fi.mu.Lock()
-	for _, k := range fi.keys {
-		k.LockedAt = time.Now().Add(-2 * time.Minute)
-	}
-	fi.mu.Unlock()
-
+	// No artificial lock-aging: the transient path released the lock, so an
+	// IMMEDIATE same-key retry must re-drive (not ErrKeyLocked) and succeed.
 	res, err := svc.CreateIntent(context.Background(), "key-5", intent(2019))
 	if err != nil {
-		t.Fatalf("retry after transient: %v", err)
+		t.Fatalf("immediate retry after transient: %v", err)
 	}
 	if res.Code != 201 || res.Payment.Status != domain.StatusAuthorized {
 		t.Fatalf("retry got code=%d status=%s", res.Code, res.Payment.Status)
@@ -355,7 +385,7 @@ func TestCreateIntent_TransientLeavesKeyRetryable(t *testing.T) {
 func TestCreateIntent_InFlightLocked(t *testing.T) {
 	svc, _, fi, _ := newTestService()
 	// Seed an unfinished, fresh-locked key manually.
-	_, _, err := fi.Claim(context.Background(), 7, "key-6", "POST", "/payment/v1/private/payments", hashInput(intent(2000)))
+	_, _, err := fi.Claim(context.Background(), 7, "key-6", "POST", "/payment/v1/private/payments", hashJSON(intent(2000)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,19 +395,55 @@ func TestCreateIntent_InFlightLocked(t *testing.T) {
 	}
 }
 
-func TestCreateIntent_OrderUniqueness(t *testing.T) {
-	svc, _, _, _ := newTestService()
+func TestCreateIntent_OrderIdempotencyAndSquatProtection(t *testing.T) {
+	svc, fp, _, stub := newTestService()
 	order := int64(42)
 	in := intent(2000)
 	in.OrderID = &order
-	if _, err := svc.CreateIntent(context.Background(), "key-7", in); err != nil {
+	first, err := svc.CreateIntent(context.Background(), "key-7", in)
+	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
+
+	// A second request for the SAME order by the SAME user with the SAME amount
+	// but a different key adopts the existing payment — idempotent by order_id
+	// (the saga's crash-recovery path), and MUST NOT charge the provider again.
 	in2 := intent(2000)
 	in2.OrderID = &order
-	_, err := svc.CreateIntent(context.Background(), "key-8", in2)
-	if !errors.Is(err, repository.ErrPaymentExists) {
-		t.Fatalf("duplicate order payment must be rejected, got %v", err)
+	second, err := svc.CreateIntent(context.Background(), "key-8", in2)
+	if err != nil {
+		t.Fatalf("same-order re-request must adopt, got %v", err)
+	}
+	if second.Payment.ID != first.Payment.ID {
+		t.Fatalf("adopt must reuse payment %d, got %d", first.Payment.ID, second.Payment.ID)
+	}
+	if second.Payment.ProviderPaymentID != first.Payment.ProviderPaymentID {
+		t.Fatalf("adopt must not re-charge: provider id changed %q -> %q",
+			first.Payment.ProviderPaymentID, second.Payment.ProviderPaymentID)
+	}
+	if got := stub.Charges(); got != 1 {
+		t.Fatalf("provider charged %d times, want exactly 1 (no double charge)", got)
+	}
+	fp.mu.Lock()
+	n := len(fp.items)
+	fp.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("exactly one payment for the order, got %d", n)
+	}
+
+	// A DIFFERENT amount on the same order is a real conflict (squat / mismatch).
+	mismatch := intent(9999)
+	mismatch.OrderID = &order
+	if _, err := svc.CreateIntent(context.Background(), "key-9", mismatch); !errors.Is(err, repository.ErrPaymentExists) {
+		t.Fatalf("amount mismatch on existing order must reject, got %v", err)
+	}
+
+	// A DIFFERENT user squatting the same order is rejected (no cross-user adopt).
+	foreign := intent(2000)
+	foreign.OrderID = &order
+	foreign.UserID = 99
+	if _, err := svc.CreateIntent(context.Background(), "key-10", foreign); !errors.Is(err, repository.ErrPaymentExists) {
+		t.Fatalf("foreign user on existing order must reject, got %v", err)
 	}
 }
 

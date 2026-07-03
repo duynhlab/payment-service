@@ -30,6 +30,9 @@ var ErrStaleTransition = errors.New("payment state changed concurrently")
 // (unique index uq_payments_order_id).
 var ErrPaymentExists = errors.New("order already has a payment")
 
+// errCreateRefund wraps failures from the CreateRefund transaction.
+const errCreateRefund = "create refund: %w"
+
 // PaymentRepository is the persistence port used by the logic layer.
 type PaymentRepository struct {
 	pool *pgxpool.Pool
@@ -134,12 +137,17 @@ func (r *PaymentRepository) TransitionStatus(ctx context.Context, id int64, from
 	q.WriteString(`UPDATE payments SET status = $1, updated_at = now()`)
 	args := []any{to}
 	i := 2
-	for _, col := range []string{"provider_payment_id", "decline_code", "authorized_at", "expires_at", "captured_at"} {
+	allowed := []string{"provider_payment_id", "decline_code", "authorized_at", "expires_at", "captured_at"}
+	for _, col := range allowed {
 		if v, ok := set[col]; ok {
 			fmt.Fprintf(&q, ", %s = $%d", col, i)
 			args = append(args, v)
 			i++
 		}
+	}
+	// A typoed key would otherwise silently drop a lifecycle stamp.
+	if matched := i - 2; matched != len(set) {
+		return fmt.Errorf("transition %s->%s: unknown column in set (allowed: %v)", from, to, allowed)
 	}
 	fmt.Fprintf(&q, " WHERE id = $%d AND status = $%d", i, i+1)
 	args = append(args, id, from)
@@ -167,10 +175,30 @@ func (r *PaymentRepository) ExpireStaleAuthorizations(ctx context.Context, now t
 }
 
 // CreateRefund inserts a pending refund IF the accumulated pending+succeeded
-// refunds (including this one) stay within the captured amount. The check and
-// the insert are one statement, so concurrent refunds cannot oversubscribe.
+// refunds (including this one) stay within the captured amount. The payment
+// row is locked (FOR UPDATE) before the guarded insert: under READ COMMITTED
+// each statement snapshots independently, so without the lock two concurrent
+// refunds would each see the other's uncommitted row as absent and both pass
+// the guard — oversubscribing the capture.
 func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason string) (*domain.Refund, error) {
-	row := r.pool.QueryRow(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf(errCreateRefund, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Serialize refund admission per payment; the lock also confirms existence.
+	var lockedID int64
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM payments WHERE id = $1 FOR UPDATE`, paymentID).Scan(&lockedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRefundRejected
+	}
+	if err != nil {
+		return nil, fmt.Errorf("create refund: lock payment: %w", err)
+	}
+
+	row := tx.QueryRow(ctx, `
 		INSERT INTO refunds (payment_id, amount_minor, reason)
 		SELECT p.id, $2::bigint, $3::text FROM payments p
 		WHERE p.id = $1 AND p.status IN ('captured','refunded')
@@ -182,13 +210,16 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 		paymentID, amountMinor, reason)
 
 	var ref domain.Refund
-	err := row.Scan(&ref.ID, &ref.PaymentID, &ref.AmountMinor, &ref.Status,
+	err = row.Scan(&ref.ID, &ref.PaymentID, &ref.AmountMinor, &ref.Status,
 		&ref.ProviderRefundID, &ref.Reason, &ref.CreatedAt, &ref.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRefundRejected
 	}
 	if err != nil {
-		return nil, fmt.Errorf("create refund: %w", err)
+		return nil, fmt.Errorf(errCreateRefund, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf(errCreateRefund, err)
 	}
 	return &ref, nil
 }
