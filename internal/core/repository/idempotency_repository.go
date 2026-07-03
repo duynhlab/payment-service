@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Recovery points for the multi-phase idempotent flow (RFC-0010 §Idempotency).
+// Recovery points for the multi-phase idempotent flow.
 // The provider call happens OUTSIDE any DB transaction; a crash between
 // checkpoints is recovered by re-entering at the recorded phase, and the
 // provider-side idempotency key makes the re-driven call safe to repeat.
@@ -108,7 +108,11 @@ func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, me
 		return existing, true, nil // fresh claim — we won the index race
 	}
 
-	if existing.RequestHash != hash {
+	// A key identifies ONE request: same key on a different endpoint or with a
+	// different body is a conflict, never a replay. Path+method scoping keeps
+	// a create-payment key from ever answering a refund (or any future
+	// endpoint whose body shape happens to collide).
+	if existing.RequestHash != hash || existing.RequestPath != path || existing.RequestMethod != method {
 		return nil, false, ErrKeyConflict
 	}
 	if existing.Finished() {
@@ -141,6 +145,18 @@ func (r *IdempotencyRepository) Advance(ctx context.Context, id int64, point str
 		WHERE id = $1`, id, point, paymentID)
 	if err != nil {
 		return fmt.Errorf("advance idempotency key: %w", err)
+	}
+	return nil
+}
+
+// Release ages the lock so an immediate same-key retry is treated as a
+// takeover instead of ErrKeyLocked — used when an attempt fails transiently
+// and the caller is told to retry. Only affects still-in-flight keys.
+func (r *IdempotencyRepository) Release(ctx context.Context, id int64) error {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE idempotency_keys SET locked_at = 'epoch' WHERE id = $1 AND response_code IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("release idempotency key: %w", err)
 	}
 	return nil
 }

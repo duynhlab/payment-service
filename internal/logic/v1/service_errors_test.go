@@ -107,31 +107,34 @@ func TestFinishIntent_FindErrorPropagates(t *testing.T) {
 	}
 }
 
-func TestCreateRefund_ErrorPaths(t *testing.T) {
-	ep := &erroringPayments{fakePayments: newFakePayments()}
+func TestCreateRefund_ClaimError(t *testing.T) {
+	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: errBoom}
+	svc := NewService(&erroringPayments{fakePayments: newFakePayments()}, ei, provider.NewStub(), 168*time.Hour)
+
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, errBoom) {
+		t.Fatalf("claim error must propagate, got %v", err)
+	}
+}
+
+func TestCreateRefund_PaymentLookupError(t *testing.T) {
+	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour)
+
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("missing payment must surface ErrNotFound, got %v", err)
+	}
+}
+
+func TestCreateRefund_FinishError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
 
-	// Claim error.
-	ei.claimErr = errBoom
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-e1", 1, 7, 100, ""); !errors.Is(err, errBoom) {
-		t.Fatalf("claim err: %v", err)
-	}
-	ei.claimErr = nil
-
-	// Payment lookup error.
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-e2", 999, 7, 100, ""); !errors.Is(err, repository.ErrNotFound) {
-		t.Fatalf("missing payment: %v", err)
-	}
-
-	// Finish error after a successful refund.
 	res, _ := svc.CreateIntent(context.Background(), "k-rf", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
 		t.Fatal(err)
 	}
 	ei.finishErr = errBoom
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-e3", res.Payment.ID, 7, 100, ""); !errors.Is(err, errBoom) {
-		t.Fatalf("finish err: %v", err)
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 100, ""); !errors.Is(err, errBoom) {
+		t.Fatalf("finish error must propagate, got %v", err)
 	}
 }
 

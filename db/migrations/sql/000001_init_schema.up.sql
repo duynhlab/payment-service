@@ -1,5 +1,5 @@
 -- V1__init_schema.sql
--- Core payment tables (RFC-0010 P1): payments, refunds, idempotency_keys.
+-- Core payment tables (P1): payments, refunds, idempotency_keys.
 -- Amounts are ALWAYS integer minor units (2000 = $20.00) — never floats.
 -- Ledger + outbox tables arrive in P2.
 
@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS payments (
                         CHECK (status IN ('pending','authorized','captured','failed','voided','expired','refunded')),
     capture_method      TEXT        NOT NULL DEFAULT 'manual'
                         CHECK (capture_method IN ('manual','automatic')),
-    payment_method      TEXT        NOT NULL,             -- opaque test token (tok_*); never PAN-like data
+    payment_method      VARCHAR(64) NOT NULL,             -- opaque test token (tok_*); never PAN-like data (capped as defense-in-depth)
     provider_payment_id TEXT,                             -- shared identifier for reconciliation
     decline_code        TEXT,                             -- provider decline reason when status=failed
     authorized_at       TIMESTAMPTZ,
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS refunds (
 
 CREATE INDEX IF NOT EXISTS idx_refunds_payment ON refunds (payment_id);
 
--- Brandur-style idempotency keys with recovery points (RFC-0010 §Idempotency).
+-- Brandur-style idempotency keys with recovery points.
 -- The UNIQUE index is the race-free claim: INSERT ... ON CONFLICT DO NOTHING,
 -- rows-affected decides the winner.
 CREATE TABLE IF NOT EXISTS idempotency_keys (

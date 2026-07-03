@@ -246,6 +246,43 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("concurrent refunds cannot oversubscribe (FOR UPDATE guard)", func(t *testing.T) {
+		p := createPending(t, repo, 7, nil, 1000)
+		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
+			map[string]any{"provider_payment_id": "mp_c", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
+		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
+			map[string]any{"captured_at": time.Now()})
+
+		// Two refunds of 600 against a 1000 capture racing: without the row
+		// lock both would snapshot SUM=0 and commit, oversubscribing to 1200.
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		wg.Add(2)
+		for i := 0; i < 2; i++ {
+			go func(i int) { defer wg.Done(); _, errs[i] = repo.CreateRefund(ctx, p.ID, 600, "") }(i)
+		}
+		wg.Wait()
+
+		ok, rejected := 0, 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				ok++
+			case errors.Is(err, ErrRefundRejected):
+				rejected++
+			default:
+				t.Fatalf("unexpected refund error: %v", err)
+			}
+		}
+		if ok != 1 || rejected != 1 {
+			t.Fatalf("want exactly one refund admitted, got ok=%d rejected=%d", ok, rejected)
+		}
+		got, _ := repo.FindByID(ctx, p.ID, 0)
+		if got.RefundedMinor > got.AmountMinor {
+			t.Fatalf("oversubscribed: refunded=%d > amount=%d", got.RefundedMinor, got.AmountMinor)
+		}
+	})
+
 	t.Run("failed refund releases its reserved amount", func(t *testing.T) {
 		p := createPending(t, repo, 7, nil, 1000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
@@ -314,6 +351,17 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 	t.Run("same key different hash conflicts", func(t *testing.T) {
 		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-B"); !errors.Is(err, ErrKeyConflict) {
 			t.Fatalf("want ErrKeyConflict, got %v", err)
+		}
+	})
+
+	t.Run("same key different path or method conflicts", func(t *testing.T) {
+		// A key identifies one request: reusing it on another endpoint (even
+		// with the identical body hash) must conflict, never cross-replay.
+		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/other", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+			t.Fatalf("different path: want ErrKeyConflict, got %v", err)
+		}
+		if _, _, err := repo.Claim(ctx, 7, "k1", "DELETE", "/p", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+			t.Fatalf("different method: want ErrKeyConflict, got %v", err)
 		}
 	})
 

@@ -283,6 +283,10 @@ func (c *Config) validateDatabase() []string {
 			errs = append(errs, "DB_PORT must be a valid number, got: "+c.Database.Port)
 		}
 	}
+	// A payment service must not ship data-in-transit in cleartext in prod.
+	if c.IsProduction() && (c.Database.SSLMode == "" || c.Database.SSLMode == "disable") {
+		errs = append(errs, "DB_SSLMODE must not be disabled in production")
+	}
 	return errs
 }
 
@@ -383,29 +387,7 @@ func getEnvDuration(key string, defaultValue time.Duration) time.Duration {
 // Max: 60 seconds (safety limit)
 // Returns default on invalid values (silent fallback for startup safety)
 func getEnvDurationSeconds(key string, defaultValueSeconds int) int {
-	const maxSeconds = 60
-
-	timeoutStr := os.Getenv(key)
-	if timeoutStr == "" {
-		return defaultValueSeconds
-	}
-
-	timeout, err := time.ParseDuration(timeoutStr)
-	if err != nil {
-		// Invalid format - use default (silent fallback for startup safety)
-		return defaultValueSeconds
-	}
-
-	// Convert to seconds
-	seconds := int(timeout.Seconds())
-
-	// Validate: must be positive and within reasonable limit
-	if seconds <= 0 || seconds > maxSeconds {
-		// Invalid value - use default (silent fallback for startup safety)
-		return defaultValueSeconds
-	}
-
-	return seconds
+	return getEnvDurationSecondsWithMax(key, defaultValueSeconds, 60)
 }
 
 // getEnvDurationSecondsWithMax reads a duration env var and returns seconds as int.

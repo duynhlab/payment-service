@@ -1,5 +1,5 @@
 // Package domain holds the payment service's core types: the Payment and
-// Refund models and the payment state machine (RFC-0010).
+// Refund models and the payment state machine.
 package domain
 
 import (
