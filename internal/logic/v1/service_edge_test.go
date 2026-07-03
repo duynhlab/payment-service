@@ -98,17 +98,50 @@ func TestCreateRefund_RejectedByState(t *testing.T) {
 	}
 }
 
-func TestCaptureVoid_ProviderErrorPropagates(t *testing.T) {
+// When the provider call fails, the CAS-first ordering means the row was
+// already moved; the operation must roll it back to authorized so the row never
+// disagrees with the (unchanged) provider state. Assert the rollback, not just
+// the error.
+func TestCapture_ProviderFailureRollsBackToAuthorized(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down"), voidErr: errors.New("void down")}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
 	svc := NewService(fp, fi, prov, 168*time.Hour)
 
-	res, _ := svc.CreateIntent(context.Background(), "k-pe", intent(2000))
+	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "capture down") {
 		t.Fatalf("capture provider error must propagate, got %v", err)
 	}
+	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.StatusAuthorized {
+		t.Fatalf("after failed capture, status = %s, want authorized (rolled back)", got.Status)
+	}
+}
+
+func TestVoid_ProviderFailureRollsBackToAuthorized(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(), voidErr: errors.New("void down")}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
 	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "void down") {
 		t.Fatalf("void provider error must propagate, got %v", err)
+	}
+	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.StatusAuthorized {
+		t.Fatalf("after failed void, status = %s, want authorized (rolled back)", got.Status)
+	}
+}
+
+func TestVoid_NotFound(t *testing.T) {
+	svc, _, _, _ := newTestService()
+	if _, err := svc.Void(context.Background(), 999, 7); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("voiding a missing payment must return ErrNotFound, got %v", err)
 	}
 }
 

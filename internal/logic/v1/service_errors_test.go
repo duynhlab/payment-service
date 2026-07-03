@@ -16,7 +16,10 @@ var errBoom = errors.New("boom")
 // erroringIdem injects failures into individual idem operations.
 type erroringIdem struct {
 	*fakeIdem
-	claimErr, advanceErr, finishErr error
+	claimErr, advanceErr, finishErr, releaseErr error
+	// advanceHook, when set, decides the error per recovery point (nil = ok),
+	// letting a test fail only a specific checkpoint.
+	advanceHook func(point string) error
 }
 
 func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*repository.IdempotencyKey, bool, error) {
@@ -30,7 +33,19 @@ func (e *erroringIdem) Advance(ctx context.Context, id int64, point string, paym
 	if e.advanceErr != nil {
 		return e.advanceErr
 	}
+	if e.advanceHook != nil {
+		if err := e.advanceHook(point); err != nil {
+			return err
+		}
+	}
 	return e.fakeIdem.Advance(ctx, id, point, paymentID)
+}
+
+func (e *erroringIdem) Release(ctx context.Context, id int64) error {
+	if e.releaseErr != nil {
+		return e.releaseErr
+	}
+	return e.fakeIdem.Release(ctx, id)
 }
 
 func (e *erroringIdem) Finish(ctx context.Context, id int64, code int, body []byte) error {
@@ -135,6 +150,120 @@ func TestCreateRefund_FinishError(t *testing.T) {
 	ei.finishErr = errBoom
 	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 100, ""); !errors.Is(err, errBoom) {
 		t.Fatalf("finish error must propagate, got %v", err)
+	}
+}
+
+func TestCreateIntent_TransientReleaseErrorPropagates(t *testing.T) {
+	// A transient provider error tries to release the lock; if that release
+	// itself fails, the wrapped error surfaces (not swallowed).
+	ei := &erroringIdem{fakeIdem: newFakeIdem(), releaseErr: errBoom}
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+
+	_, err := svc.CreateIntent(context.Background(), "k-tr", intent(2019)) // ...19 => transient
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("release failure must surface, got %v", err)
+	}
+}
+
+func TestCreateIntent_AdoptPendingOrderCompletesCharge(t *testing.T) {
+	// A prior attempt created the order's payment (pending) but crashed before
+	// charging. A fresh re-request adopts that row and drives the charge to
+	// completion — one payment, one charge, authorized.
+	svc, fp, _, stub := newTestService()
+	order := int64(61)
+	if _, err := fp.Create(context.Background(), &domain.Payment{
+		UserID: 7, OrderID: &order, AmountMinor: 2000, Currency: "USD",
+		CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	in := intent(2000)
+	in.OrderID = &order
+
+	res, err := svc.CreateIntent(context.Background(), "k-adopt-ok", in)
+	if err != nil {
+		t.Fatalf("adopt+charge: %v", err)
+	}
+	if res.Code != 201 || res.Payment.Status != domain.StatusAuthorized {
+		t.Fatalf("got code=%d status=%s, want 201 authorized", res.Code, res.Payment.Status)
+	}
+	if got := stub.Charges(); got != 1 {
+		t.Fatalf("provider charged %d times, want 1", got)
+	}
+	fp.mu.Lock()
+	n := len(fp.items)
+	fp.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("exactly one payment for the order, got %d", n)
+	}
+}
+
+func TestCreateIntent_ProviderCalledAdvanceErrorPropagates(t *testing.T) {
+	// The checkpoint after a successful charge (RecoveryProviderCalled) must
+	// propagate its error rather than proceed to the state transitions.
+	ep := &erroringPayments{fakePayments: newFakePayments()}
+	ei := &erroringIdem{fakeIdem: newFakeIdem()}
+	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+
+	// Let the first Advance (RecoveryStarted) succeed, fail the second one
+	// (RecoveryProviderCalled) — flip the flag after the create checkpoint.
+	ei.advanceHook = func(point string) error {
+		if point == repository.RecoveryProviderCalled {
+			return errBoom
+		}
+		return nil
+	}
+	if _, err := svc.CreateIntent(context.Background(), "k-pc", intent(2000)); !errors.Is(err, errBoom) {
+		t.Fatalf("provider-called advance error must propagate, got %v", err)
+	}
+}
+
+func TestCreateIntent_AdoptAdvanceErrorPropagates(t *testing.T) {
+	// Adoption of an existing pending order-payment must propagate an Advance
+	// (checkpoint) failure rather than silently charging.
+	ep := &erroringPayments{fakePayments: newFakePayments()}
+	ei := &erroringIdem{fakeIdem: newFakeIdem()}
+	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+
+	order := int64(51)
+	// Seed a pending payment for the order directly (a prior crashed attempt).
+	if _, err := ep.fakePayments.Create(context.Background(), &domain.Payment{
+		UserID: 7, OrderID: &order, AmountMinor: 2000, Currency: "USD",
+		CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ei.advanceErr = errBoom
+	in := intent(2000)
+	in.OrderID = &order
+	if _, err := svc.CreateIntent(context.Background(), "k-adopt", in); !errors.Is(err, errBoom) {
+		t.Fatalf("adopt advance error must propagate, got %v", err)
+	}
+}
+
+func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
+	// On takeover the key already has a checkpointed payment_id; a FindByID
+	// failure there must propagate.
+	fp := newFakePayments()
+	ep := &erroringPayments{fakePayments: fp}
+	fi := newFakeIdem()
+	svc := NewService(ep, fi, provider.NewStub(), 168*time.Hour)
+
+	// Seed a checkpointed, in-flight key whose lock is already stale.
+	pid := int64(123)
+	fi.mu.Lock()
+	fi.seq++
+	fi.keys["k-re"] = &repository.IdempotencyKey{
+		ID: fi.seq, UserID: 7, Key: "k-re",
+		RequestMethod: "POST", RequestPath: "/payment/v1/private/payments",
+		RequestHash: hashJSON(intent(2000)),
+		LockedAt:    time.Unix(0, 0), PaymentID: &pid,
+	}
+	fi.mu.Unlock()
+
+	ep.findErr = errBoom
+	if _, err := svc.CreateIntent(context.Background(), "k-re", intent(2000)); !errors.Is(err, errBoom) {
+		t.Fatalf("re-entry find error must propagate, got %v", err)
 	}
 }
 
