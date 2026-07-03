@@ -1,0 +1,121 @@
+version: "2"
+
+run:
+  timeout: 3m
+  tests: true
+
+linters:
+  settings:
+    gocyclo:
+      min-complexity: 30
+
+    lll:
+      line-length: 100
+
+    funlen:
+      lines: 100
+      statements: 50
+
+    nestif:
+      min-complexity: 8
+
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        - fmt.Print
+        - fmt.Printf
+        - fmt.Println
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*log.Logger).Print
+        - (*log.Logger).Printf
+        - (*log.Logger).Println
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - copyloopvar
+    - dupl
+    - durationcheck
+    - embeddedstructfieldcheck
+    - errcheck
+    - errname
+    - errorlint
+    - exhaustive
+    - exptostd
+    - fatcontext
+    - forbidigo
+    - funlen
+    - gocheckcompilerdirectives
+    - gochecknoinits
+    - gochecksumtype
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - gomoddirectives
+    - goprintffuncname
+    - gosec
+    - govet
+    - iface
+    - ineffassign
+    - intrange
+    - iotamixing
+    - loggercheck
+    - makezero
+    - mirror
+    - musttag
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnesserr
+    - noctx
+    - nosprintfhostport
+    - perfsprint
+    - predeclared
+    - promlinter
+    - reassign
+    - rowserrcheck
+    - sloglint
+    - spancheck
+    - sqlclosecheck
+    - staticcheck
+    - testableexamples
+    - testifylint
+    - testpackage
+    - tparallel
+    - unconvert
+    - unparam
+    - unqueryvet
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - funlen
+          - gocyclo
+          - dupl
+          - errcheck
+
+      - linters:
+          - errcheck
+          - gosec
+        text: "Error return value of .*(Close|Write|Print|Error).*not checked"
+
+      - linters:
+          - errcheck
+          - gosec
+        text: "Error return value of .*fmt\\.Print.*not checked"
+    paths:
+      - _test\.go
+      - vendor\/
+      - .*\.pb\.go$
+      - .*_generated\.go$
