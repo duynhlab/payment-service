@@ -2,18 +2,9 @@ package domain
 
 import "time"
 
-// Recovery points for the multi-phase idempotent flow.
-// The provider call happens OUTSIDE any DB transaction; a crash between
-// checkpoints is recovered by re-entering at the recorded phase, and the
-// provider-side idempotency key makes the re-driven call safe to repeat.
-const (
-	RecoveryStarted        = "started"
-	RecoveryProviderCalled = "provider_called"
-	RecoveryFinished       = "finished"
-)
-
-// IdempotencyKey is one claimed request: its identity, progress, and (once
-// finished) the cached response that replays verbatim.
+// IdempotencyKey is one claimed request: its identity, in-flight lock, the
+// payment it created (checkpointed for crash-recovery re-entry), and — once
+// finished — the cached response that replays verbatim.
 type IdempotencyKey struct {
 	ID            int64
 	UserID        int64
@@ -22,7 +13,6 @@ type IdempotencyKey struct {
 	RequestPath   string
 	RequestHash   string
 	LockedAt      time.Time
-	RecoveryPoint string
 	PaymentID     *int64
 	ResponseCode  *int
 	ResponseBody  []byte

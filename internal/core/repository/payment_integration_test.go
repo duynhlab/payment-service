@@ -436,7 +436,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		}
 	})
 
-	t.Run("stale lock takeover with recovery point", func(t *testing.T) {
+	t.Run("stale lock takeover surfaces the checkpointed payment", func(t *testing.T) {
 		k, _, err := repo.Claim(ctx, 10, "k-stale", "POST", "/p", "hash-s")
 		if err != nil {
 			t.Fatal(err)
@@ -448,7 +448,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.Advance(ctx, k.ID, domain.RecoveryProviderCalled, &pay.ID); err != nil {
+		if err := repo.Checkpoint(ctx, k.ID, &pay.ID); err != nil {
 			t.Fatal(err)
 		}
 		// Age the lock beyond the takeover threshold.
@@ -460,8 +460,8 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		if err != nil || !proceed {
 			t.Fatalf("takeover: %v proceed=%v", err, proceed)
 		}
-		if took.RecoveryPoint != domain.RecoveryProviderCalled || took.PaymentID == nil || *took.PaymentID != pay.ID {
-			t.Fatalf("takeover must surface checkpoint, got %+v", took)
+		if took.PaymentID == nil || *took.PaymentID != pay.ID {
+			t.Fatalf("takeover must surface the checkpointed payment, got %+v", took)
 		}
 	})
 

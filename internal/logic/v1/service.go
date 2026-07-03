@@ -34,7 +34,7 @@ type PaymentRepo interface {
 // repository.IdempotencyRepository).
 type IdemRepo interface {
 	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error)
-	Advance(ctx context.Context, id int64, point string, paymentID *int64) error
+	Checkpoint(ctx context.Context, id int64, paymentID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
 	Reap(ctx context.Context, ttl time.Duration) (int64, error)
@@ -122,7 +122,7 @@ func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateInt
 	if err != nil {
 		return nil, err
 	}
-	if err := s.idem.Advance(ctx, key.ID, domain.RecoveryStarted, &pay.ID); err != nil {
+	if err := s.idem.Checkpoint(ctx, key.ID, &pay.ID); err != nil {
 		return nil, err
 	}
 	return s.driveCharge(ctx, key, in, pay)
@@ -146,7 +146,7 @@ func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *domain.Ide
 		}
 		return s.finishIntent(ctx, key.ID, code, existing.ID)
 	}
-	if err := s.idem.Advance(ctx, key.ID, domain.RecoveryStarted, &existing.ID); err != nil {
+	if err := s.idem.Checkpoint(ctx, key.ID, &existing.ID); err != nil {
 		return nil, err
 	}
 	return s.driveCharge(ctx, key, in, existing)
@@ -185,10 +185,6 @@ func (s *Service) driveCharge(ctx context.Context, key *domain.IdempotencyKey, i
 			return nil, fmt.Errorf("provider transient (%w); lock release failed: %w", chErr, relErr)
 		}
 		return nil, chErr
-	}
-
-	if err := s.idem.Advance(ctx, key.ID, domain.RecoveryProviderCalled, nil); err != nil {
-		return nil, err
 	}
 
 	// Apply the successful outcome through the whitelisted transitions.

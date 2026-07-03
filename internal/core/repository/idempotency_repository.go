@@ -27,12 +27,12 @@ func NewIdempotencyRepository(pool *pgxpool.Pool, lockTakeover time.Duration) *I
 }
 
 const idemColumns = `id, user_id, idem_key, request_method, request_path, request_hash,
-	locked_at, recovery_point, payment_id, response_code, response_body, created_at`
+	locked_at, payment_id, response_code, response_body, created_at`
 
 func scanKey(row pgx.Row) (*domain.IdempotencyKey, error) {
 	var k domain.IdempotencyKey
 	err := row.Scan(&k.ID, &k.UserID, &k.Key, &k.RequestMethod, &k.RequestPath,
-		&k.RequestHash, &k.LockedAt, &k.RecoveryPoint, &k.PaymentID,
+		&k.RequestHash, &k.LockedAt, &k.PaymentID,
 		&k.ResponseCode, &k.ResponseBody, &k.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
@@ -44,12 +44,12 @@ func scanKey(row pgx.Row) (*domain.IdempotencyKey, error) {
 }
 
 // Claim atomically claims (userID, key) for this request. Outcomes:
-//   - fresh claim               -> (key, true, nil): caller proceeds from RecoveryPoint
+//   - fresh claim               -> (key, true, nil): caller proceeds
 //   - finished + same hash      -> (key, false, nil): caller replays the cached response
 //   - finished/in-flight, other hash -> ErrKeyConflict
 //   - in-flight, fresh lock     -> ErrKeyLocked
-//   - in-flight, stale lock     -> (key, true, nil): TAKEOVER — caller re-drives
-//     from the recorded RecoveryPoint (provider-side key makes that safe)
+//   - in-flight, stale lock     -> (key, true, nil): TAKEOVER — caller re-drives,
+//     reusing the checkpointed payment id (provider-side key makes that safe)
 func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash)
@@ -100,14 +100,15 @@ func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, me
 	return took, true, nil
 }
 
-// Advance records checkpoint progress (recovery point + optional subject
-// payment) so a takeover re-enters at the right phase.
-func (r *IdempotencyRepository) Advance(ctx context.Context, id int64, point string, paymentID *int64) error {
+// Checkpoint records the payment this key created and refreshes the lock, so a
+// crash-recovery takeover adopts the existing payment instead of creating a
+// second one.
+func (r *IdempotencyRepository) Checkpoint(ctx context.Context, id int64, paymentID *int64) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE idempotency_keys SET recovery_point = $2, payment_id = COALESCE($3, payment_id), locked_at = now()
-		WHERE id = $1`, id, point, paymentID)
+		UPDATE idempotency_keys SET payment_id = COALESCE($2, payment_id), locked_at = now()
+		WHERE id = $1`, id, paymentID)
 	if err != nil {
-		return fmt.Errorf("advance idempotency key: %w", err)
+		return fmt.Errorf("checkpoint idempotency key: %w", err)
 	}
 	return nil
 }
@@ -131,8 +132,8 @@ func (r *IdempotencyRepository) Release(ctx context.Context, id int64) error {
 // hex literal, which jsonb rejects.
 func (r *IdempotencyRepository) Finish(ctx context.Context, id int64, code int, body []byte) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE idempotency_keys SET recovery_point = $2, response_code = $3, response_body = $4::jsonb
-		WHERE id = $1`, id, domain.RecoveryFinished, code, string(body))
+		UPDATE idempotency_keys SET response_code = $2, response_body = $3::jsonb
+		WHERE id = $1`, id, code, string(body))
 	if err != nil {
 		return fmt.Errorf("finish idempotency key: %w", err)
 	}

@@ -218,18 +218,17 @@ func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, has
 	f.seq++
 	k := &domain.IdempotencyKey{ID: f.seq, UserID: userID, Key: key,
 		RequestMethod: method, RequestPath: path, RequestHash: hash,
-		LockedAt: time.Now(), RecoveryPoint: domain.RecoveryStarted}
+		LockedAt: time.Now()}
 	f.keys[id] = k
 	cp := *k
 	return &cp, true, nil
 }
 
-func (f *fakeIdem) Advance(_ context.Context, id int64, point string, paymentID *int64) error {
+func (f *fakeIdem) Checkpoint(_ context.Context, id int64, paymentID *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, k := range f.keys {
 		if k.ID == id {
-			k.RecoveryPoint = point
 			if paymentID != nil {
 				k.PaymentID = paymentID
 			}
@@ -255,7 +254,6 @@ func (f *fakeIdem) Finish(_ context.Context, id int64, code int, body []byte) er
 	defer f.mu.Unlock()
 	for _, k := range f.keys {
 		if k.ID == id {
-			k.RecoveryPoint = domain.RecoveryFinished
 			k.ResponseCode = &code
 			k.ResponseBody = body
 		}

@@ -359,7 +359,7 @@ func TestCreateIntent_ReentryUsesExistingPayment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fi.Advance(context.Background(), key.ID, domain.RecoveryStarted, &pay.ID); err != nil {
+	if err := fi.Checkpoint(context.Background(), key.ID, &pay.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Age the lock past takeover.
