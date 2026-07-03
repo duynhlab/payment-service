@@ -174,13 +174,33 @@ func (r *PaymentRepository) ExpireStaleAuthorizations(ctx context.Context, now t
 	return tag.RowsAffected(), nil
 }
 
+const refundColumns = `id, payment_id, amount_minor, status,
+	COALESCE(provider_refund_id,''), COALESCE(reason,''), created_at, updated_at`
+
+func scanRefund(row pgx.Row) (*domain.Refund, error) {
+	var ref domain.Refund
+	err := row.Scan(&ref.ID, &ref.PaymentID, &ref.AmountMinor, &ref.Status,
+		&ref.ProviderRefundID, &ref.Reason, &ref.CreatedAt, &ref.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &ref, nil
+}
+
 // CreateRefund inserts a pending refund IF the accumulated pending+succeeded
-// refunds (including this one) stay within the captured amount. The payment
-// row is locked (FOR UPDATE) before the guarded insert: under READ COMMITTED
-// each statement snapshots independently, so without the lock two concurrent
-// refunds would each see the other's uncommitted row as absent and both pass
-// the guard — oversubscribing the capture.
-func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason string) (*domain.Refund, error) {
+// refunds (including this one) stay within the captured amount. Two safety
+// properties:
+//   - the payment row is locked (FOR UPDATE) before the guarded insert so
+//     concurrent refunds cannot both pass the amount guard (READ COMMITTED
+//     snapshots each statement independently);
+//   - the insert carries the client idempotency key with a partial unique
+//     index, so a crash-recovery retry adopts the existing refund instead of
+//     inserting a duplicate.
+//
+// idemKey is the user-scoped Idempotency-Key. On the guarded insert matching
+// nothing, an existing refund for the same key is adopted (recovery); a truly
+// absent one means the amount/state guard rejected it.
+func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason, idemKey string) (*domain.Refund, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf(errCreateRefund, err)
@@ -198,22 +218,32 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 		return nil, fmt.Errorf("create refund: lock payment: %w", err)
 	}
 
-	row := tx.QueryRow(ctx, `
-		INSERT INTO refunds (payment_id, amount_minor, reason)
-		SELECT p.id, $2::bigint, $3::text FROM payments p
+	ref, err := scanRefund(tx.QueryRow(ctx, `
+		INSERT INTO refunds (payment_id, amount_minor, reason, idempotency_key)
+		SELECT p.id, $2::bigint, $3::text, $4::text FROM payments p
 		WHERE p.id = $1 AND p.status IN ('captured','refunded')
 		  AND $2::bigint + COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
 		                             WHERE r.payment_id = p.id AND r.status IN ('pending','succeeded')), 0)
 		      <= p.amount_minor
-		RETURNING id, payment_id, amount_minor, status, COALESCE(provider_refund_id,''),
-		          COALESCE(reason,''), created_at, updated_at`,
-		paymentID, amountMinor, reason)
+		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+		RETURNING `+refundColumns,
+		paymentID, amountMinor, reason, idemKey))
 
-	var ref domain.Refund
-	err = row.Scan(&ref.ID, &ref.PaymentID, &ref.AmountMinor, &ref.Status,
-		&ref.ProviderRefundID, &ref.Reason, &ref.CreatedAt, &ref.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrRefundRejected
+		// No row inserted: either the client key already has a refund (adopt it
+		// — crash-recovery) or the amount/state guard genuinely rejected it.
+		existing, exErr := scanRefund(tx.QueryRow(ctx,
+			`SELECT `+refundColumns+` FROM refunds WHERE idempotency_key = $1`, idemKey))
+		if errors.Is(exErr, pgx.ErrNoRows) {
+			return nil, ErrRefundRejected
+		}
+		if exErr != nil {
+			return nil, fmt.Errorf(errCreateRefund, exErr)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, fmt.Errorf(errCreateRefund, err)
+		}
+		return existing, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf(errCreateRefund, err)
@@ -221,7 +251,7 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf(errCreateRefund, err)
 	}
-	return &ref, nil
+	return ref, nil
 }
 
 // ErrRefundRejected means the guarded insert matched nothing: payment not
