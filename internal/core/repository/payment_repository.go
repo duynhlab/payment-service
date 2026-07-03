@@ -17,19 +17,6 @@ import (
 	"github.com/duynhlab/payment-service/internal/core/domain"
 )
 
-// ErrNotFound is returned when a payment/refund does not exist (or is not
-// visible to the requesting user).
-var ErrNotFound = errors.New("not found")
-
-// ErrStaleTransition is returned when the CAS update matched no row: the
-// payment moved to another state concurrently. Callers map it to
-// 409 INVALID_TRANSITION after re-reading.
-var ErrStaleTransition = errors.New("payment state changed concurrently")
-
-// ErrPaymentExists is returned when an order already has a payment
-// (unique index uq_payments_order_id).
-var ErrPaymentExists = errors.New("order already has a payment")
-
 // errCreateRefund wraps failures from the CreateRefund transaction.
 const errCreateRefund = "create refund: %w"
 
@@ -57,7 +44,7 @@ func scanPayment(row pgx.Row) (*domain.Payment, error) {
 		&p.DeclineCode, &p.AuthorizedAt, &p.ExpiresAt, &p.CapturedAt,
 		&p.CreatedAt, &p.UpdatedAt, &p.RefundedMinor)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, domain.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scan payment: %w", err)
@@ -75,7 +62,7 @@ func (r *PaymentRepository) Create(ctx context.Context, p *domain.Payment) (*dom
 		p.UserID, p.OrderID, p.AmountMinor, p.Currency, p.CaptureMethod, p.PaymentMethod)
 	created, err := scanPayment(row)
 	if err != nil && isUniqueViolation(err, "uq_payments_order_id") {
-		return nil, ErrPaymentExists
+		return nil, domain.ErrPaymentExists
 	}
 	return created, err
 }
@@ -157,7 +144,7 @@ func (r *PaymentRepository) TransitionStatus(ctx context.Context, id int64, from
 		return fmt.Errorf("transition %s->%s: %w", from, to, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return ErrStaleTransition
+		return domain.ErrStaleTransition
 	}
 	return nil
 }
@@ -212,7 +199,7 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM payments WHERE id = $1 FOR UPDATE`, paymentID).Scan(&lockedID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrRefundRejected
+		return nil, domain.ErrRefundRejected
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create refund: lock payment: %w", err)
@@ -235,7 +222,7 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 		existing, exErr := scanRefund(tx.QueryRow(ctx,
 			`SELECT `+refundColumns+` FROM refunds WHERE idempotency_key = $1`, idemKey))
 		if errors.Is(exErr, pgx.ErrNoRows) {
-			return nil, ErrRefundRejected
+			return nil, domain.ErrRefundRejected
 		}
 		if exErr != nil {
 			return nil, fmt.Errorf(errCreateRefund, exErr)
@@ -254,10 +241,6 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 	return ref, nil
 }
 
-// ErrRefundRejected means the guarded insert matched nothing: payment not
-// capturable/refundable or the amount would exceed the capture.
-var ErrRefundRejected = errors.New("refund rejected: not refundable or exceeds captured amount")
-
 // SettleRefund marks a pending refund succeeded/failed and, when refunds now
 // cover the full amount, flips the payment to refunded (derived -> stored).
 func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error {
@@ -273,7 +256,7 @@ func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, st
 		WHERE id = $1 AND status = 'pending' RETURNING payment_id`,
 		refundID, status, providerRefundID).Scan(&paymentID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return domain.ErrNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("settle refund: %w", err)

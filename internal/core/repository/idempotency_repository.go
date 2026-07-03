@@ -8,46 +8,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/duynhlab/payment-service/internal/core/domain"
 )
-
-// Recovery points for the multi-phase idempotent flow.
-// The provider call happens OUTSIDE any DB transaction; a crash between
-// checkpoints is recovered by re-entering at the recorded phase, and the
-// provider-side idempotency key makes the re-driven call safe to repeat.
-const (
-	RecoveryStarted        = "started"
-	RecoveryProviderCalled = "provider_called"
-	RecoveryFinished       = "finished"
-)
-
-// IdempotencyKey is one claimed request: its identity, progress, and (once
-// finished) the cached response that replays verbatim.
-type IdempotencyKey struct {
-	ID            int64
-	UserID        int64
-	Key           string
-	RequestMethod string
-	RequestPath   string
-	RequestHash   string
-	LockedAt      time.Time
-	RecoveryPoint string
-	PaymentID     *int64
-	ResponseCode  *int
-	ResponseBody  []byte
-	CreatedAt     time.Time
-}
-
-// Finished reports whether the key holds a cached response ready to replay.
-func (k *IdempotencyKey) Finished() bool { return k.ResponseCode != nil }
-
-// ErrKeyConflict is returned when the same key arrives with a different
-// request hash — a key identifies one request, not one endpoint. Maps to
-// 409 IDEMPOTENCY_CONFLICT.
-var ErrKeyConflict = errors.New("idempotency key reused with a different request")
-
-// ErrKeyLocked is returned while another attempt with the same key is
-// in-flight and not yet stale. Maps to 409 + Retry-After.
-var ErrKeyLocked = errors.New("idempotency key locked by an in-flight request")
 
 // IdempotencyRepository persists idempotency keys. The UNIQUE(user_id, idem_key)
 // index is the race-free claim: INSERT ... ON CONFLICT DO NOTHING, and
@@ -66,13 +29,13 @@ func NewIdempotencyRepository(pool *pgxpool.Pool, lockTakeover time.Duration) *I
 const idemColumns = `id, user_id, idem_key, request_method, request_path, request_hash,
 	locked_at, recovery_point, payment_id, response_code, response_body, created_at`
 
-func scanKey(row pgx.Row) (*IdempotencyKey, error) {
-	var k IdempotencyKey
+func scanKey(row pgx.Row) (*domain.IdempotencyKey, error) {
+	var k domain.IdempotencyKey
 	err := row.Scan(&k.ID, &k.UserID, &k.Key, &k.RequestMethod, &k.RequestPath,
 		&k.RequestHash, &k.LockedAt, &k.RecoveryPoint, &k.PaymentID,
 		&k.ResponseCode, &k.ResponseBody, &k.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
+		return nil, domain.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("scan idempotency key: %w", err)
@@ -87,7 +50,7 @@ func scanKey(row pgx.Row) (*IdempotencyKey, error) {
 //   - in-flight, fresh lock     -> ErrKeyLocked
 //   - in-flight, stale lock     -> (key, true, nil): TAKEOVER — caller re-drives
 //     from the recorded RecoveryPoint (provider-side key makes that safe)
-func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*IdempotencyKey, bool, error) {
+func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
 	tag, err := r.pool.Exec(ctx, `
 		INSERT INTO idempotency_keys (user_id, idem_key, request_method, request_path, request_hash)
 		VALUES ($1, $2, $3, $4, $5)
@@ -113,7 +76,7 @@ func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, me
 	// a create-payment key from ever answering a refund (or any future
 	// endpoint whose body shape happens to collide).
 	if existing.RequestHash != hash || existing.RequestPath != path || existing.RequestMethod != method {
-		return nil, false, ErrKeyConflict
+		return nil, false, domain.ErrKeyConflict
 	}
 	if existing.Finished() {
 		return existing, false, nil // replay
@@ -121,15 +84,15 @@ func (r *IdempotencyRepository) Claim(ctx context.Context, userID int64, key, me
 
 	// In-flight: fresh lock waits; stale lock is taken over.
 	if time.Since(existing.LockedAt) < r.lockTakeover {
-		return nil, false, ErrKeyLocked
+		return nil, false, domain.ErrKeyLocked
 	}
 	took, err := scanKey(r.pool.QueryRow(ctx, `
 		UPDATE idempotency_keys SET locked_at = now()
 		WHERE id = $1 AND locked_at = $2 AND response_code IS NULL
 		RETURNING `+idemColumns,
 		existing.ID, existing.LockedAt))
-	if errors.Is(err, ErrNotFound) {
-		return nil, false, ErrKeyLocked // someone else took it over first
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil, false, domain.ErrKeyLocked // someone else took it over first
 	}
 	if err != nil {
 		return nil, false, err
@@ -169,7 +132,7 @@ func (r *IdempotencyRepository) Release(ctx context.Context, id int64) error {
 func (r *IdempotencyRepository) Finish(ctx context.Context, id int64, code int, body []byte) error {
 	_, err := r.pool.Exec(ctx, `
 		UPDATE idempotency_keys SET recovery_point = $2, response_code = $3, response_body = $4::jsonb
-		WHERE id = $1`, id, RecoveryFinished, code, string(body))
+		WHERE id = $1`, id, domain.RecoveryFinished, code, string(body))
 	if err != nil {
 		return fmt.Errorf("finish idempotency key: %w", err)
 	}

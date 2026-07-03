@@ -14,7 +14,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/httpx"
@@ -284,7 +283,7 @@ func TestCreatePayment(t *testing.T) {
 			userID:     "42",
 			headers:    idemHeader(),
 			body:       `{"amount_minor":2000,"order_id":9,"payment_method":"tok_visa"}`,
-			fake:       &fakeLogic{createErr: repository.ErrPaymentExists},
+			fake:       &fakeLogic{createErr: domain.ErrPaymentExists},
 			wantStatus: http.StatusConflict,
 			wantCode:   httpx.CodePaymentExists,
 		},
@@ -395,7 +394,7 @@ func TestGetPayment(t *testing.T) {
 			name:       "not found 404",
 			userID:     "42",
 			target:     "/payment/v1/private/payments/999",
-			fake:       &fakeLogic{getErr: repository.ErrNotFound},
+			fake:       &fakeLogic{getErr: domain.ErrNotFound},
 			wantStatus: http.StatusNotFound,
 			wantCode:   httpx.CodeNotFound,
 		},
@@ -597,7 +596,7 @@ func TestCreateRefund(t *testing.T) {
 			target:     "/payment/v1/internal/payments/7/refunds",
 			headers:    idemHeader(),
 			body:       `{"amount_minor":999999}`,
-			fake:       &fakeLogic{refundErr: repository.ErrRefundRejected},
+			fake:       &fakeLogic{refundErr: domain.ErrRefundRejected},
 			wantStatus: http.StatusConflict,
 			wantCode:   httpx.CodeRefundExceedsCapture,
 		},
@@ -606,7 +605,7 @@ func TestCreateRefund(t *testing.T) {
 			target:     "/payment/v1/internal/payments/999/refunds",
 			headers:    idemHeader(),
 			body:       `{"amount_minor":500}`,
-			fake:       &fakeLogic{refundErr: repository.ErrNotFound},
+			fake:       &fakeLogic{refundErr: domain.ErrNotFound},
 			wantStatus: http.StatusNotFound,
 			wantCode:   httpx.CodeNotFound,
 		},
@@ -652,25 +651,25 @@ func TestTranslateError(t *testing.T) {
 	}{
 		{
 			name:       "not found",
-			err:        repository.ErrNotFound,
+			err:        domain.ErrNotFound,
 			wantStatus: http.StatusNotFound,
 			wantCode:   httpx.CodeNotFound,
 		},
 		{
 			name:       "payment exists",
-			err:        repository.ErrPaymentExists,
+			err:        domain.ErrPaymentExists,
 			wantStatus: http.StatusConflict,
 			wantCode:   httpx.CodePaymentExists,
 		},
 		{
 			name:       "key conflict",
-			err:        repository.ErrKeyConflict,
+			err:        domain.ErrKeyConflict,
 			wantStatus: http.StatusConflict,
 			wantCode:   httpx.CodeIdempotencyConflict,
 		},
 		{
 			name:           "key locked",
-			err:            repository.ErrKeyLocked,
+			err:            domain.ErrKeyLocked,
 			wantStatus:     http.StatusConflict,
 			wantCode:       httpx.CodeIdempotencyConflict,
 			wantMessage:    "in flight",
@@ -678,7 +677,7 @@ func TestTranslateError(t *testing.T) {
 		},
 		{
 			name:       "refund rejected",
-			err:        repository.ErrRefundRejected,
+			err:        domain.ErrRefundRejected,
 			wantStatus: http.StatusConflict,
 			wantCode:   httpx.CodeRefundExceedsCapture,
 		},

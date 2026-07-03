@@ -17,7 +17,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/payment-service/middleware"
 	"github.com/duynhlab/pkg/authmw"
@@ -125,17 +124,17 @@ func pathID(c *gin.Context) (int64, bool) {
 // Anything unrecognized becomes an opaque 500 — internals never leak.
 func translateError(c *gin.Context, err error) {
 	switch {
-	case errors.Is(err, repository.ErrNotFound):
+	case errors.Is(err, domain.ErrNotFound):
 		httpx.RespondError(c, http.StatusNotFound, httpx.CodeNotFound, "Payment not found")
-	case errors.Is(err, repository.ErrPaymentExists):
+	case errors.Is(err, domain.ErrPaymentExists):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodePaymentExists, "Order already has a payment")
-	case errors.Is(err, repository.ErrKeyConflict):
+	case errors.Is(err, domain.ErrKeyConflict):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeIdempotencyConflict,
 			"Idempotency-Key reused with a different request")
-	case errors.Is(err, repository.ErrKeyLocked):
+	case errors.Is(err, domain.ErrKeyLocked):
 		c.Header("Retry-After", "1")
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeIdempotencyConflict, "in flight")
-	case errors.Is(err, repository.ErrRefundRejected):
+	case errors.Is(err, domain.ErrRefundRejected):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeRefundExceedsCapture,
 			"Refund rejected: not refundable or exceeds captured amount")
 	case errors.Is(err, domain.ErrInvalidTransition):

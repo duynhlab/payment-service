@@ -9,7 +9,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 )
 
 var errBoom = errors.New("boom")
@@ -23,7 +22,7 @@ type erroringIdem struct {
 	advanceHook func(point string) error
 }
 
-func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*repository.IdempotencyKey, bool, error) {
+func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
 	if e.claimErr != nil {
 		return nil, false, e.claimErr
 	}
@@ -143,7 +142,7 @@ func TestCreateRefund_ClaimError(t *testing.T) {
 func TestCreateRefund_PaymentLookupError(t *testing.T) {
 	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour)
 
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, repository.ErrNotFound) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("missing payment must surface ErrNotFound, got %v", err)
 	}
 }
@@ -217,7 +216,7 @@ func TestCreateIntent_ProviderCalledAdvanceErrorPropagates(t *testing.T) {
 	// Let the first Advance (RecoveryStarted) succeed, fail the second one
 	// (RecoveryProviderCalled) — flip the flag after the create checkpoint.
 	ei.advanceHook = func(point string) error {
-		if point == repository.RecoveryProviderCalled {
+		if point == domain.RecoveryProviderCalled {
 			return errBoom
 		}
 		return nil
@@ -262,7 +261,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	pid := int64(123)
 	fi.mu.Lock()
 	fi.seq++
-	fi.keys["k-re"] = &repository.IdempotencyKey{
+	fi.keys["k-re"] = &domain.IdempotencyKey{
 		ID: fi.seq, UserID: 7, Key: "k-re",
 		RequestMethod: "POST", RequestPath: "/payment/v1/private/payments",
 		RequestHash: hashJSON(intent(2000)),
@@ -324,7 +323,7 @@ func TestReloadAfterRace_FindError(t *testing.T) {
 	res, _ := svc.CreateIntent(context.Background(), "k-rr", intent(2000))
 	// Force the CAS to lose while the status is in fact unchanged (still
 	// authorized): reloadAfterRace must report the conflict, not succeed.
-	ep.transitionErr = repository.ErrStaleTransition
+	ep.transitionErr = domain.ErrStaleTransition
 	pay, err := svc.Capture(context.Background(), res.Payment.ID, 7)
 	if err == nil || pay != nil {
 		t.Fatalf("stale CAS with unchanged state must conflict, got pay=%v err=%v", pay, err)

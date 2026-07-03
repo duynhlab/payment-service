@@ -10,7 +10,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 )
 
 // failingProvider wraps the stub to force specific provider outcomes.
@@ -91,7 +90,7 @@ func TestCreateRefund_RejectedByState(t *testing.T) {
 			svc, _, _, _ := newTestService()
 			id := setup(t, svc)
 			_, _, err := svc.CreateRefund(context.Background(), "rk-"+name, id, 7, 500, "")
-			if !errors.Is(err, repository.ErrRefundRejected) {
+			if !errors.Is(err, domain.ErrRefundRejected) {
 				t.Fatalf("refund on %s must be rejected, got %v", name, err)
 			}
 		})
@@ -140,7 +139,7 @@ func TestVoid_ProviderFailureRollsBackToAuthorized(t *testing.T) {
 
 func TestVoid_NotFound(t *testing.T) {
 	svc, _, _, _ := newTestService()
-	if _, err := svc.Void(context.Background(), 999, 7); !errors.Is(err, repository.ErrNotFound) {
+	if _, err := svc.Void(context.Background(), 999, 7); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("voiding a missing payment must return ErrNotFound, got %v", err)
 	}
 }
@@ -172,7 +171,7 @@ func TestConcurrentCaptureAndVoid_OnlyOneWins(t *testing.T) {
 
 func TestCapture_NotFound(t *testing.T) {
 	svc, _, _, _ := newTestService()
-	if _, err := svc.Capture(context.Background(), 999, 7); !errors.Is(err, repository.ErrNotFound) {
+	if _, err := svc.Capture(context.Background(), 999, 7); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("capturing a missing payment must return ErrNotFound, got %v", err)
 	}
 }
@@ -180,7 +179,7 @@ func TestCapture_NotFound(t *testing.T) {
 func TestGet_ForeignUserScoped(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "k-owner", intent(2000))
-	if _, err := svc.Get(context.Background(), res.Payment.ID, 8); !errors.Is(err, repository.ErrNotFound) {
+	if _, err := svc.Get(context.Background(), res.Payment.ID, 8); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("a foreign user must not see the payment, got %v", err)
 	}
 }
@@ -225,7 +224,7 @@ func TestReapIdempotencyKeys_DelegatesTTLAndCount(t *testing.T) {
 
 func TestReplayResult_CorruptCache(t *testing.T) {
 	code := 201
-	if _, err := replayResult(&repository.IdempotencyKey{ResponseCode: &code, ResponseBody: []byte("{not json")}); err == nil {
+	if _, err := replayResult(&domain.IdempotencyKey{ResponseCode: &code, ResponseBody: []byte("{not json")}); err == nil {
 		t.Fatal("corrupt cache must error")
 	}
 }
@@ -334,7 +333,7 @@ func TestCreateIntent_AdoptFailedOrderReturns422NoRecharge(t *testing.T) {
 // but the row is not authorized/captured — driveCharge must reject, never
 // cache a bogus 201.
 func TestCreateIntent_ChargeSucceededButRowNotAuthorizedRejects(t *testing.T) {
-	ep := &erroringPayments{fakePayments: newFakePayments(), transitionErr: repository.ErrStaleTransition}
+	ep := &erroringPayments{fakePayments: newFakePayments(), transitionErr: domain.ErrStaleTransition}
 	svc := NewService(ep, newFakeIdem(), provider.NewStub(), 168*time.Hour)
 
 	_, err := svc.CreateIntent(context.Background(), "k-exp", intent(2000))
@@ -360,7 +359,7 @@ func TestCreateIntent_ReentryUsesExistingPayment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fi.Advance(context.Background(), key.ID, repository.RecoveryStarted, &pay.ID); err != nil {
+	if err := fi.Advance(context.Background(), key.ID, domain.RecoveryStarted, &pay.ID); err != nil {
 		t.Fatal(err)
 	}
 	// Age the lock past takeover.

@@ -131,7 +131,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if p.Status != domain.StatusPending || p.Currency != "USD" {
 			t.Fatalf("unexpected payment %+v", p)
 		}
-		if _, err := repo.FindByID(ctx, p.ID, 8); !errors.Is(err, ErrNotFound) {
+		if _, err := repo.FindByID(ctx, p.ID, 8); !errors.Is(err, domain.ErrNotFound) {
 			t.Fatalf("foreign user must not see it: %v", err)
 		}
 		got, err := repo.FindByID(ctx, p.ID, 7)
@@ -144,7 +144,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		order := int64(101)
 		createPending(t, repo, 7, &order, 2000)
 		if _, err := repo.Create(ctx, &domain.Payment{UserID: 7, OrderID: &order, AmountMinor: 900,
-			Currency: "USD", CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa"}); !errors.Is(err, ErrPaymentExists) {
+			Currency: "USD", CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa"}); !errors.Is(err, domain.ErrPaymentExists) {
 			t.Fatalf("duplicate order payment: %v", err)
 		}
 		got, err := repo.FindByOrderID(ctx, order)
@@ -179,7 +179,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			switch {
 			case err == nil:
 				wins++
-			case errors.Is(err, ErrStaleTransition):
+			case errors.Is(err, domain.ErrStaleTransition):
 				stales++
 			default:
 				t.Fatalf("unexpected transition error: %v", err)
@@ -219,7 +219,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			t.Fatalf("partial refund: %v", err)
 		}
 		// Pending refunds count against the cap: 1600 > 2000-500.
-		if _, err := repo.CreateRefund(ctx, p.ID, 1600, "", "gk-1600"); !errors.Is(err, ErrRefundRejected) {
+		if _, err := repo.CreateRefund(ctx, p.ID, 1600, "", "gk-1600"); !errors.Is(err, domain.ErrRefundRejected) {
 			t.Fatalf("oversubscribe with pending refund: %v", err)
 		}
 		if err := repo.SettleRefund(ctx, r1.ID, domain.RefundSucceeded, "re_1"); err != nil {
@@ -242,7 +242,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			t.Fatalf("after full refund status=%s, want refunded", got.Status)
 		}
 		// Terminal: further refunds rejected.
-		if _, err := repo.CreateRefund(ctx, p.ID, 1, "", "gk-1"); !errors.Is(err, ErrRefundRejected) {
+		if _, err := repo.CreateRefund(ctx, p.ID, 1, "", "gk-1"); !errors.Is(err, domain.ErrRefundRejected) {
 			t.Fatalf("refund on refunded payment: %v", err)
 		}
 	})
@@ -272,7 +272,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 			switch {
 			case err == nil:
 				ok++
-			case errors.Is(err, ErrRefundRejected):
+			case errors.Is(err, domain.ErrRefundRejected):
 				rejected++
 			default:
 				t.Fatalf("unexpected refund error: %v", err)
@@ -384,7 +384,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("same key different hash conflicts", func(t *testing.T) {
-		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-B"); !errors.Is(err, ErrKeyConflict) {
+		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-B"); !errors.Is(err, domain.ErrKeyConflict) {
 			t.Fatalf("want ErrKeyConflict, got %v", err)
 		}
 	})
@@ -392,10 +392,10 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 	t.Run("same key different path or method conflicts", func(t *testing.T) {
 		// A key identifies one request: reusing it on another endpoint (even
 		// with the identical body hash) must conflict, never cross-replay.
-		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/other", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/other", "hash-a"); !errors.Is(err, domain.ErrKeyConflict) {
 			t.Fatalf("different path: want ErrKeyConflict, got %v", err)
 		}
-		if _, _, err := repo.Claim(ctx, 7, "k1", "DELETE", "/p", "hash-a"); !errors.Is(err, ErrKeyConflict) {
+		if _, _, err := repo.Claim(ctx, 7, "k1", "DELETE", "/p", "hash-a"); !errors.Is(err, domain.ErrKeyConflict) {
 			t.Fatalf("different method: want ErrKeyConflict, got %v", err)
 		}
 	})
@@ -425,7 +425,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 			switch {
 			case errs[i] == nil && proceeds[i]:
 				winners++
-			case errors.Is(errs[i], ErrKeyLocked):
+			case errors.Is(errs[i], domain.ErrKeyLocked):
 				locked++
 			case errs[i] != nil:
 				t.Fatalf("unexpected claim error: %v", errs[i])
@@ -448,7 +448,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.Advance(ctx, k.ID, RecoveryProviderCalled, &pay.ID); err != nil {
+		if err := repo.Advance(ctx, k.ID, domain.RecoveryProviderCalled, &pay.ID); err != nil {
 			t.Fatal(err)
 		}
 		// Age the lock beyond the takeover threshold.
@@ -460,7 +460,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		if err != nil || !proceed {
 			t.Fatalf("takeover: %v proceed=%v", err, proceed)
 		}
-		if took.RecoveryPoint != RecoveryProviderCalled || took.PaymentID == nil || *took.PaymentID != pay.ID {
+		if took.RecoveryPoint != domain.RecoveryProviderCalled || took.PaymentID == nil || *took.PaymentID != pay.ID {
 			t.Fatalf("takeover must surface checkpoint, got %+v", took)
 		}
 	})
@@ -484,7 +484,7 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Fresh lock: a second claim would normally be ErrKeyLocked.
-		if _, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r"); !errors.Is(err, ErrKeyLocked) {
+		if _, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r"); !errors.Is(err, domain.ErrKeyLocked) {
 			t.Fatalf("fresh lock should block, got %v", err)
 		}
 		// Release ages the lock; the next claim takes over (proceed=true).
