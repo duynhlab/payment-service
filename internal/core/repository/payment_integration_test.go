@@ -55,7 +55,15 @@ func newTestDB(t *testing.T) *pgxpool.Pool {
 	}
 	applyMigrations(t, ctx, dsn)
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// Mirror production: the service pool runs the simple query protocol (for
+	// PgBouncer/PgDog compatibility), which encodes parameters differently
+	// from the extended protocol — e.g. []byte into jsonb breaks only there.
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	poolCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		t.Fatalf("new pool: %v", err)
 	}

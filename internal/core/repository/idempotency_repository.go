@@ -146,11 +146,14 @@ func (r *IdempotencyRepository) Advance(ctx context.Context, id int64, point str
 }
 
 // Finish stores the cached response and marks the key finished. It is the
-// final checkpoint and the replay source for every later duplicate.
+// final checkpoint and the replay source for every later duplicate. The body
+// binds as text with an explicit ::jsonb cast — under the simple query
+// protocol (PgBouncer/PgDog pools) a raw []byte parameter is sent as a bytea
+// hex literal, which jsonb rejects.
 func (r *IdempotencyRepository) Finish(ctx context.Context, id int64, code int, body []byte) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE idempotency_keys SET recovery_point = $2, response_code = $3, response_body = $4
-		WHERE id = $1`, id, RecoveryFinished, code, body)
+		UPDATE idempotency_keys SET recovery_point = $2, response_code = $3, response_body = $4::jsonb
+		WHERE id = $1`, id, RecoveryFinished, code, string(body))
 	if err != nil {
 		return fmt.Errorf("finish idempotency key: %w", err)
 	}
