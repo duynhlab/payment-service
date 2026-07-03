@@ -17,6 +17,9 @@ import (
 	"github.com/duynhlab/payment-service/config"
 	migrations "github.com/duynhlab/payment-service/db/migrations"
 	database "github.com/duynhlab/payment-service/internal/core/database"
+	"github.com/duynhlab/payment-service/internal/core/provider"
+	"github.com/duynhlab/payment-service/internal/core/repository"
+	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	v1 "github.com/duynhlab/payment-service/internal/web/v1"
 	"github.com/duynhlab/payment-service/middleware"
 	"github.com/duynhlab/pkg/authmw"
@@ -76,7 +79,12 @@ func main() {
 		return
 	}
 
-	paymentHandler := &v1.Handler{}
+	// Repositories + provider + logic. P1 runs the in-memory provider stub;
+	// the real mockpay HTTP client lands in P2 behind the same interface.
+	paymentRepo := repository.NewPaymentRepository(pool)
+	idemRepo := repository.NewIdempotencyRepository(pool, cfg.Payment.IdempotencyLockTakeover)
+	paymentService := logicv1.NewService(paymentRepo, idemRepo, provider.NewStub(), cfg.Payment.AuthHoldTTL)
+	paymentHandler := v1.NewHandler(paymentService)
 
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, verifier, paymentHandler, &isShuttingDown)
@@ -183,12 +191,9 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	// Payment v1 routes — all private (JWT required). Variant A edge naming.
-	// RegisterRoutes is a stub until the P1 web layer lands in the next commit;
-	// the private group carries the edge JWT gate its handlers mount on.
-	v1.RegisterRoutes(r, paymentHandler)
-	privatePayments := r.Group("/payment/v1/private")
-	privatePayments.Use(authmw.MiddlewareJWT(verifier))
+	// Payment v1 routes — private (JWT required) + internal (cluster-only,
+	// NetworkPolicy is the fence). Variant A edge naming.
+	v1.RegisterRoutes(r, paymentHandler, verifier)
 
 	return &http.Server{
 		Addr:              ":" + cfg.Service.Port,

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -129,20 +130,21 @@ func (r *PaymentRepository) ListByUser(ctx context.Context, userID int64, limit,
 // lifecycle columns for the target state. Zero rows affected means the
 // expected state was gone — ErrStaleTransition.
 func (r *PaymentRepository) TransitionStatus(ctx context.Context, id int64, from, to domain.Status, set map[string]any) error {
-	q := `UPDATE payments SET status = $1, updated_at = now()`
+	var q strings.Builder
+	q.WriteString(`UPDATE payments SET status = $1, updated_at = now()`)
 	args := []any{to}
 	i := 2
 	for _, col := range []string{"provider_payment_id", "decline_code", "authorized_at", "expires_at", "captured_at"} {
 		if v, ok := set[col]; ok {
-			q += fmt.Sprintf(", %s = $%d", col, i)
+			fmt.Fprintf(&q, ", %s = $%d", col, i)
 			args = append(args, v)
 			i++
 		}
 	}
-	q += fmt.Sprintf(" WHERE id = $%d AND status = $%d", i, i+1)
+	fmt.Fprintf(&q, " WHERE id = $%d AND status = $%d", i, i+1)
 	args = append(args, id, from)
 
-	tag, err := r.pool.Exec(ctx, q, args...)
+	tag, err := r.pool.Exec(ctx, q.String(), args...)
 	if err != nil {
 		return fmt.Errorf("transition %s->%s: %w", from, to, err)
 	}
@@ -170,10 +172,10 @@ func (r *PaymentRepository) ExpireStaleAuthorizations(ctx context.Context, now t
 func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason string) (*domain.Refund, error) {
 	row := r.pool.QueryRow(ctx, `
 		INSERT INTO refunds (payment_id, amount_minor, reason)
-		SELECT p.id, $2, $3 FROM payments p
+		SELECT p.id, $2::bigint, $3::text FROM payments p
 		WHERE p.id = $1 AND p.status IN ('captured','refunded')
-		  AND $2 + COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
-		                     WHERE r.payment_id = p.id AND r.status IN ('pending','succeeded')), 0)
+		  AND $2::bigint + COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
+		                             WHERE r.payment_id = p.id AND r.status IN ('pending','succeeded')), 0)
 		      <= p.amount_minor
 		RETURNING id, payment_id, amount_minor, status, COALESCE(provider_refund_id,''),
 		          COALESCE(reason,''), created_at, updated_at`,

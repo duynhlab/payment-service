@@ -21,12 +21,12 @@ const (
 	DeclineProcessing   = "processing_error"   // amount_minor % 100 == 19 (transient — retry succeeds)
 )
 
-// ErrDeclined carries the provider's decline code; callers map it to
+// DeclinedError carries the provider's decline code; callers map it to
 // 422 PAYMENT_DECLINED. Transient processing errors are returned as plain
 // errors so retry policies treat them as retryable.
-type ErrDeclined struct{ Code string }
+type DeclinedError struct{ Code string }
 
-func (e *ErrDeclined) Error() string { return "provider declined: " + e.Code }
+func (e *DeclinedError) Error() string { return "provider declined: " + e.Code }
 
 // ErrTransient marks a retryable provider failure (processing_error trigger).
 var ErrTransient = errors.New("provider transient processing error")
@@ -84,9 +84,9 @@ func (s *Stub) Charge(_ context.Context, req ChargeRequest) (*Charge, error) {
 
 	switch req.AmountMinor % 100 {
 	case 2:
-		return nil, &ErrDeclined{Code: DeclineGeneric}
+		return nil, &DeclinedError{Code: DeclineGeneric}
 	case 95:
-		return nil, &ErrDeclined{Code: DeclineInsufficient}
+		return nil, &DeclinedError{Code: DeclineInsufficient}
 	case 19:
 		if !s.transientSeen[req.IdempotencyKey] {
 			s.transientSeen[req.IdempotencyKey] = true
