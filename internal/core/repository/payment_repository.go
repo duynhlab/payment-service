@@ -149,6 +149,68 @@ func (r *PaymentRepository) TransitionStatus(ctx context.Context, id int64, from
 	return nil
 }
 
+// CaptureWithLedger flips an authorized hold to captured and posts the balanced
+// capture ledger transaction (debit customer_funds / credit merchant_revenue)
+// in the SAME transaction, so the row and the ledger can never disagree. The
+// posting rides the CAS: zero rows affected means the hold was already
+// captured/gone (re-entry or race) — ErrStaleTransition, nothing is posted, so
+// the ledger stays idempotent without a uniqueness index.
+func (r *PaymentRepository) CaptureWithLedger(ctx context.Context, id int64, capturedAt time.Time) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("capture: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var amount int64
+	var providerRef string
+	err = tx.QueryRow(ctx, `
+		UPDATE payments SET status = 'captured', captured_at = $2, updated_at = now()
+		WHERE id = $1 AND status = 'authorized'
+		RETURNING amount_minor, COALESCE(provider_payment_id,'')`,
+		id, capturedAt).Scan(&amount, &providerRef)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrStaleTransition
+	}
+	if err != nil {
+		return fmt.Errorf("capture: %w", err)
+	}
+	if err := postLedger(ctx, tx, ledgerCapture, id, providerRef, captureEntries(amount)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReverseCapture compensates a capture whose provider call failed: it flips
+// captured back to authorized (clearing captured_at) and posts a balanced
+// reversal ledger transaction (the capture legs mirrored) in the same tx, so
+// the ledger nets back to zero without ever editing a posted entry.
+func (r *PaymentRepository) ReverseCapture(ctx context.Context, id int64) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("reverse capture: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var amount int64
+	var providerRef string
+	err = tx.QueryRow(ctx, `
+		UPDATE payments SET status = 'authorized', captured_at = NULL, updated_at = now()
+		WHERE id = $1 AND status = 'captured'
+		RETURNING amount_minor, COALESCE(provider_payment_id,'')`,
+		id).Scan(&amount, &providerRef)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrStaleTransition
+	}
+	if err != nil {
+		return fmt.Errorf("reverse capture: %w", err)
+	}
+	if err := postLedger(ctx, tx, ledgerReversal, id, providerRef, reverseCaptureEntries(amount)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ExpireStaleAuthorizations flips authorized holds whose TTL passed —
 // the expiry job's single query. Returns the number of holds expired.
 func (r *PaymentRepository) ExpireStaleAuthorizations(ctx context.Context, now time.Time) (int64, error) {
@@ -250,11 +312,11 @@ func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, st
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var paymentID int64
+	var paymentID, amount int64
 	err = tx.QueryRow(ctx, `
 		UPDATE refunds SET status = $2, provider_refund_id = NULLIF($3,''), updated_at = now()
-		WHERE id = $1 AND status = 'pending' RETURNING payment_id`,
-		refundID, status, providerRefundID).Scan(&paymentID)
+		WHERE id = $1 AND status = 'pending' RETURNING payment_id, amount_minor`,
+		refundID, status, providerRefundID).Scan(&paymentID, &amount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrNotFound
 	}
@@ -263,6 +325,12 @@ func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, st
 	}
 
 	if status == domain.RefundSucceeded {
+		// Post the refund ledger (money returned to the customer) in the same tx
+		// as the settle — it rides the pending->succeeded CAS above, so a
+		// re-settle finds no pending row and never double-posts.
+		if err := postLedger(ctx, tx, ledgerRefund, paymentID, providerRefundID, reverseCaptureEntries(amount)); err != nil {
+			return err
+		}
 		// Flip captured -> refunded only when succeeded refunds reach 100%.
 		if _, err := tx.Exec(ctx, `
 			UPDATE payments p SET status = 'refunded', updated_at = now()

@@ -25,6 +25,8 @@ type PaymentRepo interface {
 	FindByOrderID(ctx context.Context, orderID int64) (*domain.Payment, error)
 	ListByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Payment, int, error)
 	TransitionStatus(ctx context.Context, id int64, from, to domain.Status, set map[string]any) error
+	CaptureWithLedger(ctx context.Context, id int64, capturedAt time.Time) error
+	ReverseCapture(ctx context.Context, id int64) error
 	ExpireStaleAuthorizations(ctx context.Context, now time.Time) (int64, error)
 	CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason, idemKey string) (*domain.Refund, error)
 	SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error
@@ -198,8 +200,10 @@ func (s *Service) driveCharge(ctx context.Context, key *domain.IdempotencyKey, i
 		return nil, err // stale = re-entry already applied it; verified below
 	}
 	if in.CaptureMethod == domain.CaptureAutomatic {
-		if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusAuthorized, domain.StatusCaptured,
-			map[string]any{"captured_at": s.now()}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
+		// Auto-capture also moves money, so it posts the capture ledger. The
+		// posting rides the CAS inside CaptureWithLedger: a re-driven charge
+		// finds the row already captured (stale) and posts nothing.
+		if err := s.payments.CaptureWithLedger(ctx, pay.ID, s.now()); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
 			return nil, err
 		}
 	}
@@ -253,20 +257,24 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 	}
 	// CAS FIRST, provider second: winning the row before moving money means a
 	// concurrent void/expiry can never leave the provider captured while the
-	// row says otherwise. If the provider then fails, compensate the row back
-	// (deliberately bypassing the whitelist — this is a rollback, not a
-	// business transition).
-	if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusAuthorized, domain.StatusCaptured,
-		map[string]any{"captured_at": s.now()}); err != nil {
+	// row says otherwise. The CAS and the balanced capture ledger posting
+	// commit together (CaptureWithLedger), so the row and the ledger can never
+	// disagree. If the provider then fails, compensate both with a reversal.
+	//
+	// Known gap (reconciliation phase): a crash between this commit and a
+	// confirmed provider capture leaves the ledger asserting revenue the
+	// provider never collected. It is internally balanced, so Imbalance() will
+	// not flag it — only a provider-vs-ledger reconciliation sweep will.
+	if err := s.payments.CaptureWithLedger(ctx, pay.ID, s.now()); err != nil {
 		if errors.Is(err, domain.ErrStaleTransition) {
 			return s.reloadAfterRace(ctx, pay.ID, domain.StatusCaptured)
 		}
 		return nil, err
 	}
 	if err := s.prov.Capture(ctx, pay.ProviderPaymentID); err != nil {
-		// Roll the row back and clear the captured_at stamp we just set.
-		if rbErr := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusCaptured, domain.StatusAuthorized,
-			map[string]any{"captured_at": nil}); rbErr != nil {
+		// Reverse the row back to authorized and post a compensating reversal
+		// ledger transaction (append-only — never edit the capture entry).
+		if rbErr := s.payments.ReverseCapture(ctx, pay.ID); rbErr != nil {
 			return nil, fmt.Errorf("provider capture failed (%w) and rollback failed: %w", err, rbErr)
 		}
 		return nil, err

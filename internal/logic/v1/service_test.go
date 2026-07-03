@@ -21,6 +21,11 @@ type fakePayments struct {
 	byOrd  map[int64]int64
 	refSeq int64
 	refs   map[int64]*domain.Refund
+	// ledgerPosts / reversals count successful capture / reversal postings —
+	// the fake posts nothing real, but rides the same CAS, so the counters
+	// prove the logic layer's ledger idempotency without a DB.
+	ledgerPosts int
+	reversals   int
 }
 
 func newFakePayments() *fakePayments {
@@ -108,6 +113,32 @@ func (f *fakePayments) TransitionStatus(_ context.Context, id int64, from, to do
 		t := v.(time.Time)
 		p.ExpiresAt = &t
 	}
+	return nil
+}
+
+func (f *fakePayments) CaptureWithLedger(_ context.Context, id int64, capturedAt time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.items[id]
+	if !ok || p.Status != domain.StatusAuthorized {
+		return domain.ErrStaleTransition
+	}
+	p.Status = domain.StatusCaptured
+	p.CapturedAt = &capturedAt
+	f.ledgerPosts++
+	return nil
+}
+
+func (f *fakePayments) ReverseCapture(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.items[id]
+	if !ok || p.Status != domain.StatusCaptured {
+		return domain.ErrStaleTransition
+	}
+	p.Status = domain.StatusAuthorized
+	p.CapturedAt = nil
+	f.reversals++
 	return nil
 }
 
