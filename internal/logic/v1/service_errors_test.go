@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,9 @@ func (e *erroringIdem) Finish(ctx context.Context, id int64, code int, body []by
 type erroringPayments struct {
 	*fakePayments
 	createErr, findErr, transitionErr error
+	// transitionHook, when set, decides the error per (from,to) — nil = fall
+	// through to the real fake — so a test can fail only the rollback CAS.
+	transitionHook func(from, to domain.Status) error
 }
 
 func (e *erroringPayments) Create(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
@@ -78,6 +82,11 @@ func (e *erroringPayments) FindByID(ctx context.Context, id, userID int64) (*dom
 func (e *erroringPayments) TransitionStatus(ctx context.Context, id int64, from, to domain.Status, set map[string]any) error {
 	if e.transitionErr != nil {
 		return e.transitionErr
+	}
+	if e.transitionHook != nil {
+		if err := e.transitionHook(from, to); err != nil {
+			return err
+		}
 	}
 	return e.fakePayments.TransitionStatus(ctx, id, from, to, set)
 }
@@ -264,6 +273,46 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	ep.findErr = errBoom
 	if _, err := svc.CreateIntent(context.Background(), "k-re", intent(2000)); !errors.Is(err, errBoom) {
 		t.Fatalf("re-entry find error must propagate, got %v", err)
+	}
+}
+
+// When the provider fails AND the compensating rollback also fails, both
+// errors must surface wrapped — the row is left captured/voided and the
+// operator needs to see both failures.
+func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
+	ep := &erroringPayments{fakePayments: newFakePayments()}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
+	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-cf", intent(2000))
+	// Fail only the captured→authorized rollback.
+	ep.transitionHook = func(from, to domain.Status) error {
+		if from == domain.StatusCaptured && to == domain.StatusAuthorized {
+			return errBoom
+		}
+		return nil
+	}
+	_, err := svc.Capture(context.Background(), res.Payment.ID, 7)
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") || !errors.Is(err, errBoom) {
+		t.Fatalf("want wrapped rollback-failed error, got %v", err)
+	}
+}
+
+func TestVoid_ProviderFailAndRollbackFail(t *testing.T) {
+	ep := &erroringPayments{fakePayments: newFakePayments()}
+	prov := &failingProvider{Stub: provider.NewStub(), voidErr: errors.New("void down")}
+	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-vf", intent(2000))
+	ep.transitionHook = func(from, to domain.Status) error {
+		if from == domain.StatusVoided && to == domain.StatusAuthorized {
+			return errBoom
+		}
+		return nil
+	}
+	_, err := svc.Void(context.Background(), res.Payment.ID, 7)
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") || !errors.Is(err, errBoom) {
+		t.Fatalf("want wrapped rollback-failed error, got %v", err)
 	}
 }
 

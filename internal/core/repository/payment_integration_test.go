@@ -430,6 +430,19 @@ func TestIdempotencyRepository_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("CreateRefund surfaces a transaction begin error", func(t *testing.T) {
+		// A closed pool makes Begin fail — exercises the tx error path without
+		// a live fault-injection harness.
+		dead, err := pgxpool.New(ctx, pool.Config().ConnString())
+		if err != nil {
+			t.Fatal(err)
+		}
+		dead.Close()
+		if _, err := NewPaymentRepository(dead).CreateRefund(ctx, 1, 100, ""); err == nil {
+			t.Fatal("CreateRefund on a closed pool must error")
+		}
+	})
+
 	t.Run("release ages the lock so an immediate retry takes over", func(t *testing.T) {
 		k, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
 		if err != nil {
