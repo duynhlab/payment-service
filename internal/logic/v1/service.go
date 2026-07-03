@@ -15,7 +15,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 )
 
 // PaymentRepo is the persistence port the logic layer needs (implemented by
@@ -34,8 +33,8 @@ type PaymentRepo interface {
 // IdemRepo is the idempotency-key port (implemented by
 // repository.IdempotencyRepository).
 type IdemRepo interface {
-	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*repository.IdempotencyKey, bool, error)
-	Advance(ctx context.Context, id int64, point string, paymentID *int64) error
+	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error)
+	Checkpoint(ctx context.Context, id int64, paymentID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
 	Reap(ctx context.Context, ttl time.Duration) (int64, error)
@@ -117,13 +116,13 @@ func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateInt
 		CaptureMethod: in.CaptureMethod,
 		PaymentMethod: in.PaymentMethod,
 	})
-	if errors.Is(err, repository.ErrPaymentExists) && in.OrderID != nil {
+	if errors.Is(err, domain.ErrPaymentExists) && in.OrderID != nil {
 		return s.adoptExistingOrderPayment(ctx, key, in, err)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := s.idem.Advance(ctx, key.ID, repository.RecoveryStarted, &pay.ID); err != nil {
+	if err := s.idem.Checkpoint(ctx, key.ID, &pay.ID); err != nil {
 		return nil, err
 	}
 	return s.driveCharge(ctx, key, in, pay)
@@ -135,7 +134,7 @@ func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateInt
 // amount mismatch is a real conflict (createErr, → 409). A payment already
 // past pending was charged on the first attempt, so it finishes idempotently
 // by its current state and NEVER charges again.
-func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *repository.IdempotencyKey, in CreateIntentInput, createErr error) (*IntentResult, error) {
+func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *domain.IdempotencyKey, in CreateIntentInput, createErr error) (*IntentResult, error) {
 	existing, findErr := s.payments.FindByOrderID(ctx, *in.OrderID)
 	if findErr != nil || existing.UserID != in.UserID || existing.AmountMinor != in.AmountMinor {
 		return nil, createErr
@@ -147,7 +146,7 @@ func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *repository
 		}
 		return s.finishIntent(ctx, key.ID, code, existing.ID)
 	}
-	if err := s.idem.Advance(ctx, key.ID, repository.RecoveryStarted, &existing.ID); err != nil {
+	if err := s.idem.Checkpoint(ctx, key.ID, &existing.ID); err != nil {
 		return nil, err
 	}
 	return s.driveCharge(ctx, key, in, existing)
@@ -155,7 +154,7 @@ func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *repository
 
 // driveCharge runs the provider call and applies the resulting state
 // transitions for a pending payment, caching the outcome on the key.
-func (s *Service) driveCharge(ctx context.Context, key *repository.IdempotencyKey, in CreateIntentInput, pay *domain.Payment) (*IntentResult, error) {
+func (s *Service) driveCharge(ctx context.Context, key *domain.IdempotencyKey, in CreateIntentInput, pay *domain.Payment) (*IntentResult, error) {
 	// Provider call — outside any transaction; the shared idempotency key
 	// makes a re-driven call replay instead of double-charging.
 	charge, chErr := s.prov.Charge(ctx, provider.ChargeRequest{
@@ -172,7 +171,7 @@ func (s *Service) driveCharge(ctx context.Context, key *repository.IdempotencyKe
 		// A re-driven decline hits an already-failed row: stale is fine here —
 		// the outcome is identical, only the cache write remains.
 		if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusFailed,
-			map[string]any{"decline_code": declined.Code}); err != nil && !errors.Is(err, repository.ErrStaleTransition) {
+			map[string]any{"decline_code": declined.Code}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
 			return nil, err
 		}
 		return s.finishIntent(ctx, key.ID, 422, pay.ID)
@@ -188,10 +187,6 @@ func (s *Service) driveCharge(ctx context.Context, key *repository.IdempotencyKe
 		return nil, chErr
 	}
 
-	if err := s.idem.Advance(ctx, key.ID, repository.RecoveryProviderCalled, nil); err != nil {
-		return nil, err
-	}
-
 	// Apply the successful outcome through the whitelisted transitions.
 	expires := s.now().Add(s.holdTTL)
 	if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusAuthorized,
@@ -199,12 +194,12 @@ func (s *Service) driveCharge(ctx context.Context, key *repository.IdempotencyKe
 			"provider_payment_id": charge.ProviderPaymentID,
 			"authorized_at":       s.now(),
 			"expires_at":          expires,
-		}); err != nil && !errors.Is(err, repository.ErrStaleTransition) {
+		}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
 		return nil, err // stale = re-entry already applied it; verified below
 	}
 	if in.CaptureMethod == domain.CaptureAutomatic {
 		if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusAuthorized, domain.StatusCaptured,
-			map[string]any{"captured_at": s.now()}); err != nil && !errors.Is(err, repository.ErrStaleTransition) {
+			map[string]any{"captured_at": s.now()}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
 			return nil, err
 		}
 	}
@@ -235,7 +230,7 @@ func (s *Service) finishIntent(ctx context.Context, keyID int64, code int, payme
 	return &IntentResult{Code: code, Payment: pay}, nil
 }
 
-func replayResult(key *repository.IdempotencyKey) (*IntentResult, error) {
+func replayResult(key *domain.IdempotencyKey) (*IntentResult, error) {
 	var pay domain.Payment
 	if err := json.Unmarshal(key.ResponseBody, &pay); err != nil {
 		return nil, fmt.Errorf("corrupt idempotency cache: %w", err)
@@ -263,7 +258,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 	// business transition).
 	if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusAuthorized, domain.StatusCaptured,
 		map[string]any{"captured_at": s.now()}); err != nil {
-		if errors.Is(err, repository.ErrStaleTransition) {
+		if errors.Is(err, domain.ErrStaleTransition) {
 			return s.reloadAfterRace(ctx, pay.ID, domain.StatusCaptured)
 		}
 		return nil, err
@@ -293,7 +288,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 	}
 	// Same ordering rationale as Capture: win the row, then touch the provider.
 	if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusAuthorized, domain.StatusVoided, nil); err != nil {
-		if errors.Is(err, repository.ErrStaleTransition) {
+		if errors.Is(err, domain.ErrStaleTransition) {
 			return s.reloadAfterRace(ctx, pay.ID, domain.StatusVoided)
 		}
 		return nil, err
@@ -353,7 +348,7 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	scopedKey := fmt.Sprintf("%d:%s", userID, idemKey)
 	ref, err := s.payments.CreateRefund(ctx, pay.ID, amountMinor, reason, scopedKey)
 	if err != nil {
-		return nil, false, err // incl. repository.ErrRefundRejected
+		return nil, false, err // incl. domain.ErrRefundRejected
 	}
 
 	// An adopted refund that already settled (crash after settle, before finish)

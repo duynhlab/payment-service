@@ -9,7 +9,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 )
 
 var errBoom = errors.New("boom")
@@ -17,29 +16,21 @@ var errBoom = errors.New("boom")
 // erroringIdem injects failures into individual idem operations.
 type erroringIdem struct {
 	*fakeIdem
-	claimErr, advanceErr, finishErr, releaseErr error
-	// advanceHook, when set, decides the error per recovery point (nil = ok),
-	// letting a test fail only a specific checkpoint.
-	advanceHook func(point string) error
+	claimErr, checkpointErr, finishErr, releaseErr error
 }
 
-func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*repository.IdempotencyKey, bool, error) {
+func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
 	if e.claimErr != nil {
 		return nil, false, e.claimErr
 	}
 	return e.fakeIdem.Claim(ctx, userID, key, method, path, hash)
 }
 
-func (e *erroringIdem) Advance(ctx context.Context, id int64, point string, paymentID *int64) error {
-	if e.advanceErr != nil {
-		return e.advanceErr
+func (e *erroringIdem) Checkpoint(ctx context.Context, id int64, paymentID *int64) error {
+	if e.checkpointErr != nil {
+		return e.checkpointErr
 	}
-	if e.advanceHook != nil {
-		if err := e.advanceHook(point); err != nil {
-			return err
-		}
-	}
-	return e.fakeIdem.Advance(ctx, id, point, paymentID)
+	return e.fakeIdem.Checkpoint(ctx, id, paymentID)
 }
 
 func (e *erroringIdem) Release(ctx context.Context, id int64) error {
@@ -98,7 +89,7 @@ func TestCreateIntent_RepoErrorPropagation(t *testing.T) {
 	}{
 		{"claim fails", func(_ *erroringPayments, ei *erroringIdem) { ei.claimErr = errBoom }},
 		{"create fails", func(ep *erroringPayments, _ *erroringIdem) { ep.createErr = errBoom }},
-		{"advance fails", func(_ *erroringPayments, ei *erroringIdem) { ei.advanceErr = errBoom }},
+		{"checkpoint fails", func(_ *erroringPayments, ei *erroringIdem) { ei.checkpointErr = errBoom }},
 		{"transition fails", func(ep *erroringPayments, _ *erroringIdem) { ep.transitionErr = errBoom }},
 		{"finish fails", func(_ *erroringPayments, ei *erroringIdem) { ei.finishErr = errBoom }},
 	}
@@ -143,7 +134,7 @@ func TestCreateRefund_ClaimError(t *testing.T) {
 func TestCreateRefund_PaymentLookupError(t *testing.T) {
 	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour)
 
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, repository.ErrNotFound) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("missing payment must surface ErrNotFound, got %v", err)
 	}
 }
@@ -207,29 +198,20 @@ func TestCreateIntent_AdoptPendingOrderCompletesCharge(t *testing.T) {
 	}
 }
 
-func TestCreateIntent_ProviderCalledAdvanceErrorPropagates(t *testing.T) {
-	// The checkpoint after a successful charge (RecoveryProviderCalled) must
-	// propagate its error rather than proceed to the state transitions.
-	ep := &erroringPayments{fakePayments: newFakePayments()}
-	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+func TestCreateIntent_CheckpointErrorPropagates(t *testing.T) {
+	// The payment-id checkpoint after Create must propagate its error rather
+	// than proceed to the provider charge.
+	ei := &erroringIdem{fakeIdem: newFakeIdem(), checkpointErr: errBoom}
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
 
-	// Let the first Advance (RecoveryStarted) succeed, fail the second one
-	// (RecoveryProviderCalled) — flip the flag after the create checkpoint.
-	ei.advanceHook = func(point string) error {
-		if point == repository.RecoveryProviderCalled {
-			return errBoom
-		}
-		return nil
-	}
-	if _, err := svc.CreateIntent(context.Background(), "k-pc", intent(2000)); !errors.Is(err, errBoom) {
-		t.Fatalf("provider-called advance error must propagate, got %v", err)
+	if _, err := svc.CreateIntent(context.Background(), "k-cp", intent(2000)); !errors.Is(err, errBoom) {
+		t.Fatalf("checkpoint error must propagate, got %v", err)
 	}
 }
 
-func TestCreateIntent_AdoptAdvanceErrorPropagates(t *testing.T) {
-	// Adoption of an existing pending order-payment must propagate an Advance
-	// (checkpoint) failure rather than silently charging.
+func TestCreateIntent_AdoptCheckpointErrorPropagates(t *testing.T) {
+	// Adoption of an existing pending order-payment must propagate a checkpoint
+	// failure rather than silently charging.
 	ep := &erroringPayments{fakePayments: newFakePayments()}
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
 	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
@@ -242,11 +224,11 @@ func TestCreateIntent_AdoptAdvanceErrorPropagates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	ei.advanceErr = errBoom
+	ei.checkpointErr = errBoom
 	in := intent(2000)
 	in.OrderID = &order
 	if _, err := svc.CreateIntent(context.Background(), "k-adopt", in); !errors.Is(err, errBoom) {
-		t.Fatalf("adopt advance error must propagate, got %v", err)
+		t.Fatalf("adopt checkpoint error must propagate, got %v", err)
 	}
 }
 
@@ -262,7 +244,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	pid := int64(123)
 	fi.mu.Lock()
 	fi.seq++
-	fi.keys["k-re"] = &repository.IdempotencyKey{
+	fi.keys["k-re"] = &domain.IdempotencyKey{
 		ID: fi.seq, UserID: 7, Key: "k-re",
 		RequestMethod: "POST", RequestPath: "/payment/v1/private/payments",
 		RequestHash: hashJSON(intent(2000)),
@@ -324,7 +306,7 @@ func TestReloadAfterRace_FindError(t *testing.T) {
 	res, _ := svc.CreateIntent(context.Background(), "k-rr", intent(2000))
 	// Force the CAS to lose while the status is in fact unchanged (still
 	// authorized): reloadAfterRace must report the conflict, not succeed.
-	ep.transitionErr = repository.ErrStaleTransition
+	ep.transitionErr = domain.ErrStaleTransition
 	pay, err := svc.Capture(context.Background(), res.Payment.ID, 7)
 	if err == nil || pay != nil {
 		t.Fatalf("stale CAS with unchanged state must conflict, got pay=%v err=%v", pay, err)

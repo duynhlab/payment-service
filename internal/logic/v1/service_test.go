@@ -10,7 +10,6 @@ import (
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
-	"github.com/duynhlab/payment-service/internal/core/repository"
 )
 
 // ---- in-memory fakes -------------------------------------------------------
@@ -33,7 +32,7 @@ func (f *fakePayments) Create(_ context.Context, p *domain.Payment) (*domain.Pay
 	defer f.mu.Unlock()
 	if p.OrderID != nil {
 		if _, dup := f.byOrd[*p.OrderID]; dup {
-			return nil, repository.ErrPaymentExists
+			return nil, domain.ErrPaymentExists
 		}
 	}
 	f.seq++
@@ -54,7 +53,7 @@ func (f *fakePayments) FindByID(_ context.Context, id, userID int64) (*domain.Pa
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
 	if !ok || (userID != 0 && p.UserID != userID) {
-		return nil, repository.ErrNotFound
+		return nil, domain.ErrNotFound
 	}
 	p.RefundedMinor = f.refundedLocked(id)
 	out := *p
@@ -66,7 +65,7 @@ func (f *fakePayments) FindByOrderID(_ context.Context, orderID int64) (*domain.
 	id, ok := f.byOrd[orderID]
 	f.mu.Unlock()
 	if !ok {
-		return nil, repository.ErrNotFound
+		return nil, domain.ErrNotFound
 	}
 	return f.FindByID(context.Background(), id, 0)
 }
@@ -96,7 +95,7 @@ func (f *fakePayments) TransitionStatus(_ context.Context, id int64, from, to do
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
 	if !ok || p.Status != from {
-		return repository.ErrStaleTransition
+		return domain.ErrStaleTransition
 	}
 	p.Status = to
 	if v, ok := set["provider_payment_id"]; ok {
@@ -150,10 +149,10 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 	}
 	p, ok := f.items[paymentID]
 	if !ok || (p.Status != domain.StatusCaptured && p.Status != domain.StatusRefunded) {
-		return nil, repository.ErrRefundRejected
+		return nil, domain.ErrRefundRejected
 	}
 	if amountMinor+f.refundedLocked(paymentID) > p.AmountMinor {
-		return nil, repository.ErrRefundRejected
+		return nil, domain.ErrRefundRejected
 	}
 	f.refSeq++
 	r := &domain.Refund{ID: f.refSeq, PaymentID: paymentID, AmountMinor: amountMinor, Status: domain.RefundPending, Reason: reason, IdempotencyKey: idemKey}
@@ -167,7 +166,7 @@ func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status do
 	defer f.mu.Unlock()
 	r, ok := f.refs[refundID]
 	if !ok {
-		return repository.ErrNotFound
+		return domain.ErrNotFound
 	}
 	r.Status = status
 	r.ProviderRefundID = providerRefundID
@@ -183,7 +182,7 @@ func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status do
 type fakeIdem struct {
 	mu   sync.Mutex
 	seq  int64
-	keys map[string]*repository.IdempotencyKey
+	keys map[string]*domain.IdempotencyKey
 	take time.Duration
 	// reapTTL/reapCount record the last Reap call so tests can assert the
 	// service delegates the configured TTL and surfaces the returned count.
@@ -192,10 +191,10 @@ type fakeIdem struct {
 }
 
 func newFakeIdem() *fakeIdem {
-	return &fakeIdem{keys: map[string]*repository.IdempotencyKey{}, take: 90 * time.Second}
+	return &fakeIdem{keys: map[string]*domain.IdempotencyKey{}, take: 90 * time.Second}
 }
 
-func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, hash string) (*repository.IdempotencyKey, bool, error) {
+func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := key
@@ -203,34 +202,33 @@ func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, has
 		// Mirror the real repository: a key identifies ONE request — same key
 		// with a different body, path, or method is a conflict, never a replay.
 		if k.RequestHash != hash || k.RequestPath != path || k.RequestMethod != method {
-			return nil, false, repository.ErrKeyConflict
+			return nil, false, domain.ErrKeyConflict
 		}
 		if k.Finished() {
 			cp := *k
 			return &cp, false, nil
 		}
 		if time.Since(k.LockedAt) < f.take {
-			return nil, false, repository.ErrKeyLocked
+			return nil, false, domain.ErrKeyLocked
 		}
 		k.LockedAt = time.Now()
 		cp := *k
 		return &cp, true, nil
 	}
 	f.seq++
-	k := &repository.IdempotencyKey{ID: f.seq, UserID: userID, Key: key,
+	k := &domain.IdempotencyKey{ID: f.seq, UserID: userID, Key: key,
 		RequestMethod: method, RequestPath: path, RequestHash: hash,
-		LockedAt: time.Now(), RecoveryPoint: repository.RecoveryStarted}
+		LockedAt: time.Now()}
 	f.keys[id] = k
 	cp := *k
 	return &cp, true, nil
 }
 
-func (f *fakeIdem) Advance(_ context.Context, id int64, point string, paymentID *int64) error {
+func (f *fakeIdem) Checkpoint(_ context.Context, id int64, paymentID *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, k := range f.keys {
 		if k.ID == id {
-			k.RecoveryPoint = point
 			if paymentID != nil {
 				k.PaymentID = paymentID
 			}
@@ -256,7 +254,6 @@ func (f *fakeIdem) Finish(_ context.Context, id int64, code int, body []byte) er
 	defer f.mu.Unlock()
 	for _, k := range f.keys {
 		if k.ID == id {
-			k.RecoveryPoint = repository.RecoveryFinished
 			k.ResponseCode = &code
 			k.ResponseBody = body
 		}
@@ -339,7 +336,7 @@ func TestCreateIntent_SameKeyDifferentBody(t *testing.T) {
 		t.Fatalf("first: %v", err)
 	}
 	_, err := svc.CreateIntent(context.Background(), "key-3", intent(3000))
-	if !errors.Is(err, repository.ErrKeyConflict) {
+	if !errors.Is(err, domain.ErrKeyConflict) {
 		t.Fatalf("different body must conflict, got %v", err)
 	}
 }
@@ -400,7 +397,7 @@ func TestCreateIntent_InFlightLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = svc.CreateIntent(context.Background(), "key-6", intent(2000))
-	if !errors.Is(err, repository.ErrKeyLocked) {
+	if !errors.Is(err, domain.ErrKeyLocked) {
 		t.Fatalf("in-flight duplicate must be locked, got %v", err)
 	}
 }
@@ -444,7 +441,7 @@ func TestCreateIntent_OrderIdempotencyAndSquatProtection(t *testing.T) {
 	// A DIFFERENT amount on the same order is a real conflict (squat / mismatch).
 	mismatch := intent(9999)
 	mismatch.OrderID = &order
-	if _, err := svc.CreateIntent(context.Background(), "key-9", mismatch); !errors.Is(err, repository.ErrPaymentExists) {
+	if _, err := svc.CreateIntent(context.Background(), "key-9", mismatch); !errors.Is(err, domain.ErrPaymentExists) {
 		t.Fatalf("amount mismatch on existing order must reject, got %v", err)
 	}
 
@@ -452,7 +449,7 @@ func TestCreateIntent_OrderIdempotencyAndSquatProtection(t *testing.T) {
 	foreign := intent(2000)
 	foreign.OrderID = &order
 	foreign.UserID = 99
-	if _, err := svc.CreateIntent(context.Background(), "key-10", foreign); !errors.Is(err, repository.ErrPaymentExists) {
+	if _, err := svc.CreateIntent(context.Background(), "key-10", foreign); !errors.Is(err, domain.ErrPaymentExists) {
 		t.Fatalf("foreign user on existing order must reject, got %v", err)
 	}
 }
@@ -511,7 +508,7 @@ func TestRefund_PartialThenFullFlipsStatus(t *testing.T) {
 	}
 
 	// Over-refund must be rejected: 500 refunded, 2000 total, 1600 > remaining.
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-2", res.Payment.ID, 7, 1600, ""); !errors.Is(err, repository.ErrRefundRejected) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-2", res.Payment.ID, 7, 1600, ""); !errors.Is(err, domain.ErrRefundRejected) {
 		t.Fatalf("over-refund must reject, got %v", err)
 	}
 
@@ -547,7 +544,7 @@ func TestReplayCache_RoundTripsJSON(t *testing.T) {
 	p := &domain.Payment{ID: 1, Status: domain.StatusAuthorized, AmountMinor: 2000}
 	body, _ := json.Marshal(p)
 	code := 201
-	res, err := replayResult(&repository.IdempotencyKey{ResponseCode: &code, ResponseBody: body})
+	res, err := replayResult(&domain.IdempotencyKey{ResponseCode: &code, ResponseBody: body})
 	if err != nil || res.Payment.ID != 1 || !res.Replayed {
 		t.Fatalf("replay round-trip: %v %+v", err, res)
 	}
