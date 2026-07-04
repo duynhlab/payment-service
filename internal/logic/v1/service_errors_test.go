@@ -51,9 +51,26 @@ func (e *erroringIdem) Finish(ctx context.Context, id int64, code int, body []by
 type erroringPayments struct {
 	*fakePayments
 	createErr, findErr, transitionErr error
+	// captureErr / reverseErr poison the capture CAS+ledger and its reversal
+	// (Capture no longer routes through TransitionStatus). nil = fall through.
+	captureErr, reverseErr error
 	// transitionHook, when set, decides the error per (from,to) — nil = fall
 	// through to the real fake — so a test can fail only the rollback CAS.
 	transitionHook func(from, to domain.Status) error
+}
+
+func (e *erroringPayments) CaptureWithLedger(ctx context.Context, id int64, capturedAt time.Time) error {
+	if e.captureErr != nil {
+		return e.captureErr
+	}
+	return e.fakePayments.CaptureWithLedger(ctx, id, capturedAt)
+}
+
+func (e *erroringPayments) ReverseCapture(ctx context.Context, id int64) error {
+	if e.reverseErr != nil {
+		return e.reverseErr
+	}
+	return e.fakePayments.ReverseCapture(ctx, id)
 }
 
 func (e *erroringPayments) Create(ctx context.Context, p *domain.Payment) (*domain.Payment, error) {
@@ -267,13 +284,8 @@ func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cf", intent(2000))
-	// Fail only the captured→authorized rollback.
-	ep.transitionHook = func(from, to domain.Status) error {
-		if from == domain.StatusCaptured && to == domain.StatusAuthorized {
-			return errBoom
-		}
-		return nil
-	}
+	// Fail only the captured→authorized reversal.
+	ep.reverseErr = errBoom
 	_, err := svc.Capture(context.Background(), res.Payment.ID, 7)
 	if err == nil || !strings.Contains(err.Error(), "rollback failed") || !errors.Is(err, errBoom) {
 		t.Fatalf("want wrapped rollback-failed error, got %v", err)
@@ -306,7 +318,7 @@ func TestReloadAfterRace_FindError(t *testing.T) {
 	res, _ := svc.CreateIntent(context.Background(), "k-rr", intent(2000))
 	// Force the CAS to lose while the status is in fact unchanged (still
 	// authorized): reloadAfterRace must report the conflict, not succeed.
-	ep.transitionErr = domain.ErrStaleTransition
+	ep.captureErr = domain.ErrStaleTransition
 	pay, err := svc.Capture(context.Background(), res.Payment.ID, 7)
 	if err == nil || pay != nil {
 		t.Fatalf("stale CAS with unchanged state must conflict, got pay=%v err=%v", pay, err)

@@ -27,3 +27,8 @@ var ErrKeyConflict = errors.New("idempotency key reused with a different request
 // ErrKeyLocked is returned while another attempt with the same key is
 // in-flight and not yet stale. Maps to 409 + Retry-After.
 var ErrKeyLocked = errors.New("idempotency key locked by an in-flight request")
+
+// ErrLedgerImbalance is returned when a ledger posting would violate
+// double-entry (legs do not net to zero, or an amount is non-positive). It is
+// an internal invariant breach, never a client error.
+var ErrLedgerImbalance = errors.New("ledger transaction does not balance")
