@@ -23,6 +23,58 @@ func newClient(t *testing.T) *provider.HTTPClient {
 	return provider.NewHTTPClient(ts.URL)
 }
 
+func TestHTTPClient_GetTransactions(t *testing.T) {
+	c := newClient(t)
+	ctx := context.Background()
+	if _, err := c.Charge(ctx, provider.ChargeRequest{AmountMinor: 1000, Currency: "USD", PaymentMethod: "tok_visa", AutoCapture: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Charge(ctx, provider.ChargeRequest{AmountMinor: 2000, Currency: "USD", PaymentMethod: "tok_visa"}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := c.GetTransactions(ctx, 1, 50)
+	if err != nil {
+		t.Fatalf("get transactions: %v", err)
+	}
+	if page.Total != 2 || len(page.Transactions) != 2 {
+		t.Fatalf("page = total %d len %d, want 2/2", page.Total, len(page.Transactions))
+	}
+	byAmt := map[int64]string{}
+	for _, tx := range page.Transactions {
+		byAmt[tx.AmountMinor] = tx.Status
+	}
+	if byAmt[1000] != provider.TxnCaptured || byAmt[2000] != provider.TxnAuthorized {
+		t.Fatalf("statuses = %v, want 1000:captured 2000:authorized", byAmt)
+	}
+}
+
+func TestHTTPClient_GetTransactions_Errors(t *testing.T) {
+	ctx := context.Background()
+
+	// Transport failure (unreachable) → error.
+	if _, err := provider.NewHTTPClient("http://127.0.0.1:1").GetTransactions(ctx, 1, 50); err == nil {
+		t.Error("want error on unreachable provider")
+	}
+
+	// Non-200 → error.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+	if _, err := provider.NewHTTPClient(ts.URL).GetTransactions(ctx, 1, 50); err == nil {
+		t.Error("want error on non-200")
+	}
+
+	// Malformed JSON body → error.
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer ts2.Close()
+	if _, err := provider.NewHTTPClient(ts2.URL).GetTransactions(ctx, 1, 50); err == nil {
+		t.Error("want error on malformed body")
+	}
+}
+
 func TestHTTPClient_ChargeAutoCapture(t *testing.T) {
 	c := newClient(t)
 	got, err := c.Charge(context.Background(), provider.ChargeRequest{

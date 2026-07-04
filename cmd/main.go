@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -50,6 +51,8 @@ const fieldPort = "port"
 const (
 	outboxRelayInterval = 10 * time.Second
 	outboxRelayBatch    = 100
+	reconcileInterval   = 5 * time.Minute
+	reconcilePageSize   = 100
 	// Published events are pruned after this window; the durable audit trail is
 	// the ledger, so the outbox only needs a short replay buffer.
 	outboxPublishedRetention = 7 * 24 * time.Hour
@@ -133,8 +136,11 @@ func run() error {
 	// the real mockpay HTTP client lands in P2 behind the same interface.
 	paymentRepo := repository.NewPaymentRepository(pool)
 	idemRepo := idempotency.New(pool, cfg.Payment.IdempotencyLockTakeover)
-	paymentService := logicv1.NewService(paymentRepo, idemRepo, selectProvider(cfg, logger), cfg.Payment.AuthHoldTTL)
+	prov := selectProvider(cfg, logger)
+	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
+
+	reconciler := buildReconciler(prov, pool)
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
 	// A bind failure is fatal: the pod must not report healthy on HTTP while its
@@ -159,7 +165,7 @@ func run() error {
 	jobsWG.Add(1)
 	go func() {
 		defer jobsWG.Done()
-		runBackgroundJobs(jobsCtx, paymentService, outboxRelay, cfg, logger)
+		runBackgroundJobs(jobsCtx, paymentService, outboxRelay, reconciler, cfg, logger)
 	}()
 
 	// Stop the background loops and wait for the in-flight tick to finish
@@ -183,7 +189,7 @@ func run() error {
 // window (hourly; the window itself is 24h, so cadence is not critical), and
 // relaying the transactional outbox (every 10s — event latency). The first two
 // are single-statement queries; the relay delivers to its sink.
-func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, cfg *config.Config, logger *zap.Logger) {
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, recon *logicv1.Reconciler, cfg *config.Config, logger *zap.Logger) {
 	expiry := time.NewTicker(time.Minute)
 	reap := time.NewTicker(time.Hour)
 	outbox := time.NewTicker(outboxRelayInterval)
@@ -191,10 +197,24 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 	defer reap.Stop()
 	defer outbox.Stop()
 
+	// Reconciliation only ticks when a provider ledger is available (recon != nil).
+	// A nil channel blocks forever, so the select arm is simply never taken.
+	var reconcile <-chan time.Time
+	if recon != nil {
+		rt := time.NewTicker(reconcileInterval)
+		defer rt.Stop()
+		reconcile = rt.C
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-reconcile:
+			runJob(ctx, "Reconcile payments vs provider", logger, func(jctx context.Context) (int64, error) {
+				_, found, err := recon.Run(jctx, reconcilePageSize)
+				return int64(found), err
+			})
 		case <-expiry.C:
 			runJob(ctx, "Expire stale authorizations", logger, func(jctx context.Context) (int64, error) {
 				return svc.ExpireHolds(jctx)
@@ -232,6 +252,18 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 
 // selectProvider returns the mockpay HTTP client when MOCKPAY_URL is set, else
 // the in-memory stub (unit tests and stub-only local runs).
+// buildReconciler wires the reconciler only when the provider exposes a ledger
+// to page — the real mockpay HTTP client; the in-process stub has nothing to
+// reconcile against, so it returns nil (recon is then skipped). v1 is
+// detect-only: it records drift, never heals.
+func buildReconciler(prov provider.Provider, pool *pgxpool.Pool) *logicv1.Reconciler {
+	ledger, ok := prov.(logicv1.ProviderLedger)
+	if !ok {
+		return nil
+	}
+	return logicv1.NewReconciler(repository.NewReconciliationRepository(pool), ledger)
+}
+
 func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
 	if cfg.Payment.ProviderURL != "" {
 		logger.Info("Using mockpay HTTP provider", zap.String("url", cfg.Payment.ProviderURL))
