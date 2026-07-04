@@ -19,6 +19,7 @@ import (
 	"github.com/duynhlab/payment-service/config"
 	migrations "github.com/duynhlab/payment-service/db/migrations"
 	database "github.com/duynhlab/payment-service/internal/core/database"
+	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/core/repository"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
@@ -32,6 +33,29 @@ import (
 
 // fieldStatus is the JSON key for the health/ready probe responses.
 const fieldStatus = "status"
+
+// Outbox relay cadence and batch size. The relay is a log sink in P2, so a
+// modest interval keeps event latency low without a tight poll.
+const (
+	outboxRelayInterval = 10 * time.Second
+	outboxRelayBatch    = 100
+	// Published events are pruned after this window; the durable audit trail is
+	// the ledger, so the outbox only needs a short replay buffer.
+	outboxPublishedRetention = 7 * 24 * time.Hour
+)
+
+// outboxLogPublisher is the P2 delivery sink: it logs each event. A real broker
+// replaces it behind logicv1.Publisher with no relay change.
+type outboxLogPublisher struct{ logger *zap.Logger }
+
+func (p outboxLogPublisher) Publish(_ context.Context, e domain.OutboxEvent) error {
+	p.logger.Info("Outbox event published",
+		zap.Int64("outbox_id", e.ID),
+		zap.String("event_type", e.EventType),
+		zap.ByteString("payload", e.Payload),
+	)
+	return nil
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -101,12 +125,16 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, provider.NewStub(), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
+	// Outbox relay: drains events written in the money-movement transactions and
+	// delivers them to the P2 log sink.
+	outboxRelay := logicv1.NewOutboxRelay(repository.NewOutboxRepository(pool), outboxLogPublisher{logger: logger})
+
 	jobsCtx, stopJobs := context.WithCancel(context.Background())
 	var jobsWG sync.WaitGroup
 	jobsWG.Add(1)
 	go func() {
 		defer jobsWG.Done()
-		runBackgroundJobs(jobsCtx, paymentService, cfg, logger)
+		runBackgroundJobs(jobsCtx, paymentService, outboxRelay, cfg, logger)
 	}()
 
 	// Stop the background loops and wait for the in-flight tick to finish
@@ -123,16 +151,19 @@ func run() error {
 	return nil
 }
 
-// runBackgroundJobs drives the two periodic maintenance loops: expiring
-// authorized holds whose TTL passed (every minute — an expired hold must stop
-// being capturable promptly) and reaping idempotency keys older than their
-// retention window (hourly; the window itself is 24h, so cadence is not
-// critical). Both are single-statement queries, safe to run on every replica.
-func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, cfg *config.Config, logger *zap.Logger) {
+// runBackgroundJobs drives the periodic maintenance loops: expiring authorized
+// holds whose TTL passed (every minute — an expired hold must stop being
+// capturable promptly), reaping idempotency keys older than their retention
+// window (hourly; the window itself is 24h, so cadence is not critical), and
+// relaying the transactional outbox (every 10s — event latency). The first two
+// are single-statement queries; the relay delivers to its sink.
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, cfg *config.Config, logger *zap.Logger) {
 	expiry := time.NewTicker(time.Minute)
 	reap := time.NewTicker(time.Hour)
+	outbox := time.NewTicker(outboxRelayInterval)
 	defer expiry.Stop()
 	defer reap.Stop()
+	defer outbox.Stop()
 
 	for {
 		select {
@@ -146,6 +177,13 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, cfg *config.Co
 			runJob(ctx, "Reap idempotency keys", logger, func(jctx context.Context) (int64, error) {
 				return svc.ReapIdempotencyKeys(jctx, cfg.Payment.IdempotencyKeyTTL)
 			})
+			runJob(ctx, "Reap published outbox events", logger, func(jctx context.Context) (int64, error) {
+				return relay.ReapPublished(jctx, outboxPublishedRetention)
+			})
+		case <-outbox.C:
+			runJob(ctx, "Relay outbox events", logger, func(jctx context.Context) (int64, error) {
+				return relay.Relay(jctx, outboxRelayBatch)
+			})
 		}
 	}
 }
@@ -158,7 +196,9 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 	n, err := fn(jctx)
 	switch {
 	case err != nil:
-		logger.Error(name+" failed", zap.Error(err))
+		// Include count: a job can partially succeed (e.g. the relay delivered
+		// some events before the sink failed) — hiding it loses that signal.
+		logger.Error(name+" failed", zap.Int64("count", n), zap.Error(err))
 	case n > 0:
 		logger.Info(name+" completed", zap.Int64("count", n))
 	}
