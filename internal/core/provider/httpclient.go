@@ -98,6 +98,24 @@ func (c *HTTPClient) Capture(ctx context.Context, providerPaymentID string) erro
 	return c.mutate(ctx, "/charges/"+url.PathEscape(providerPaymentID)+"/capture")
 }
 
+// GetTransactions pages the provider's ledger (GET /transactions) — the food
+// source for reconciliation. Returns one page; the caller pages to exhaustion.
+func (c *HTTPClient) GetTransactions(ctx context.Context, page, pageSize int) (*TransactionsPage, error) {
+	path := fmt.Sprintf("/transactions?page=%d&page_size=%d", page, pageSize)
+	status, body, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("mockpay transactions: unexpected status %d", status)
+	}
+	var p TransactionsPage
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, fmt.Errorf("mockpay decode transactions: %w", err)
+	}
+	return &p, nil
+}
+
 // Void releases a hold via POST /charges/{id}/void.
 func (c *HTTPClient) Void(ctx context.Context, providerPaymentID string) error {
 	return c.mutate(ctx, "/charges/"+url.PathEscape(providerPaymentID)+"/void")
