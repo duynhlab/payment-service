@@ -32,19 +32,65 @@ func (e *DeclinedError) Error() string { return "provider declined: " + e.Code }
 // ErrTransient marks a retryable provider failure (processing_error trigger).
 var ErrTransient = errors.New("provider transient processing error")
 
-// ChargeRequest asks the provider to place (and optionally capture) a hold.
+// ChargeRequest asks the provider to place (and optionally capture) a hold. The
+// json tags are the wire body for POST /charges (mockpay HTTP contract).
 type ChargeRequest struct {
-	IdempotencyKey string // passed through — the provider replays its first answer
-	AmountMinor    int64
-	Currency       string
-	PaymentMethod  string // opaque token, never PAN-like data
-	AutoCapture    bool
+	IdempotencyKey string `json:"idempotency_key"` // passed through — the provider replays its first answer
+	AmountMinor    int64  `json:"amount_minor"`
+	Currency       string `json:"currency"`
+	PaymentMethod  string `json:"payment_method"` // opaque token, never PAN-like data
+	AutoCapture    bool   `json:"auto_capture"`
 }
 
-// Charge is the provider's record of a hold/charge.
+// Charge is the provider's record of a hold/charge (and the POST /charges
+// response body).
 type Charge struct {
-	ProviderPaymentID string
-	Captured          bool
+	ProviderPaymentID string `json:"provider_payment_id"`
+	Captured          bool   `json:"captured"`
+}
+
+// RefundRequest is the POST /refunds body.
+type RefundRequest struct {
+	ProviderPaymentID string `json:"provider_payment_id"`
+	AmountMinor       int64  `json:"amount_minor"`
+	IdempotencyKey    string `json:"idempotency_key"`
+}
+
+// RefundResponse is the POST /refunds response body.
+type RefundResponse struct {
+	ProviderRefundID string `json:"provider_refund_id"`
+}
+
+// ErrorResponse is the mockpay error envelope (declines carry a Code).
+type ErrorResponse struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
+// Outcome classifies an amount against the deterministic magic-amount triggers.
+type Outcome int
+
+const (
+	OutcomeOK Outcome = iota
+	OutcomeGenericDecline
+	OutcomeInsufficient
+	OutcomeTransient
+)
+
+// Classify maps an amount's minor-unit suffix to its magic outcome. Shared by
+// the in-memory Stub and the mockpay server so both honour identical triggers;
+// each tracks its own transient-retry state separately.
+func Classify(amountMinor int64) Outcome {
+	switch amountMinor % 100 {
+	case 2:
+		return OutcomeGenericDecline
+	case 95:
+		return OutcomeInsufficient
+	case 19:
+		return OutcomeTransient
+	default:
+		return OutcomeOK
+	}
 }
 
 // Provider is the outbound port to the payment provider.
@@ -63,6 +109,7 @@ type Stub struct {
 	seq      int64              // guarded by mu
 	byKey    map[string]*Charge // idempotency replay
 	captured map[string]bool
+	voided   map[string]bool // voided ids — makes Void idempotent under retry
 	// transientSeen tracks which idempotency keys have already hit the
 	// processing_error trigger once, so the next attempt with the same key
 	// succeeds — used to test transient-then-recover retries.
@@ -71,7 +118,12 @@ type Stub struct {
 
 // NewStub returns an empty in-memory provider.
 func NewStub() *Stub {
-	return &Stub{byKey: map[string]*Charge{}, captured: map[string]bool{}, transientSeen: map[string]bool{}}
+	return &Stub{
+		byKey:         map[string]*Charge{},
+		captured:      map[string]bool{},
+		voided:        map[string]bool{},
+		transientSeen: map[string]bool{},
+	}
 }
 
 // Charges returns how many NEW charges the stub has minted (replays excluded).
@@ -92,17 +144,18 @@ func (s *Stub) Charge(_ context.Context, req ChargeRequest) (*Charge, error) {
 		return c, nil // provider-side idempotent replay
 	}
 
-	switch req.AmountMinor % 100 {
-	case 2:
+	switch Classify(req.AmountMinor) {
+	case OutcomeGenericDecline:
 		return nil, &DeclinedError{Code: DeclineGeneric}
-	case 95:
+	case OutcomeInsufficient:
 		return nil, &DeclinedError{Code: DeclineInsufficient}
-	case 19:
+	case OutcomeTransient:
 		if !s.transientSeen[req.IdempotencyKey] {
 			s.transientSeen[req.IdempotencyKey] = true
 			return nil, ErrTransient
 		}
 		// second attempt with the same key succeeds
+	case OutcomeOK:
 	}
 
 	s.seq++
@@ -128,14 +181,19 @@ func (s *Stub) Capture(_ context.Context, id string) error {
 	return nil
 }
 
-// Void releases a hold; voiding twice is a no-op.
+// Void releases a hold. Idempotent: voiding an already-voided id is a no-op
+// (a lost 200 must be safely retryable), while a never-issued id is an error.
 func (s *Stub) Void(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.voided[id] {
+		return nil
+	}
 	if _, ok := s.captured[id]; !ok {
 		return fmt.Errorf(errUnknownProviderPayment, id)
 	}
 	delete(s.captured, id)
+	s.voided[id] = true
 	return nil
 }
 

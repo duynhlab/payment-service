@@ -23,6 +23,7 @@ import (
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/core/repository"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
+	"github.com/duynhlab/payment-service/internal/mockpay"
 	v1 "github.com/duynhlab/payment-service/internal/web/v1"
 	"github.com/duynhlab/payment-service/middleware"
 	"github.com/duynhlab/pkg/authmw"
@@ -33,6 +34,9 @@ import (
 
 // fieldStatus is the JSON key for the health/ready probe responses.
 const fieldStatus = "status"
+
+// fieldPort is the log-field key for the listen port.
+const fieldPort = "port"
 
 // Outbox relay cadence and batch size. The relay is a log sink in P2, so a
 // modest interval keeps event latency low without a tight poll.
@@ -92,7 +96,7 @@ func run() error {
 		zap.String("service", cfg.Service.Name),
 		zap.String("version", cfg.Service.Version),
 		zap.String("env", cfg.Service.Env),
-		zap.String("port", cfg.Service.Port),
+		zap.String(fieldPort, cfg.Service.Port),
 	)
 
 	tp := initTracing(cfg, logger)
@@ -122,7 +126,7 @@ func run() error {
 	// the real mockpay HTTP client lands in P2 behind the same interface.
 	paymentRepo := repository.NewPaymentRepository(pool)
 	idemRepo := repository.NewIdempotencyRepository(pool, cfg.Payment.IdempotencyLockTakeover)
-	paymentService := logicv1.NewService(paymentRepo, idemRepo, provider.NewStub(), cfg.Payment.AuthHoldTTL)
+	paymentService := logicv1.NewService(paymentRepo, idemRepo, selectProvider(cfg, logger), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
 	// Outbox relay: drains events written in the money-movement transactions and
@@ -204,13 +208,24 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 	}
 }
 
-// maybeRunSubcommand handles the `migrate` subcommand, reporting whether it
-// handled one (caller then exits). It needs only DB config, so it runs before
-// cfg.Validate().
+// selectProvider returns the mockpay HTTP client when MOCKPAY_URL is set, else
+// the in-memory stub (unit tests and stub-only local runs).
+func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
+	if cfg.Payment.ProviderURL != "" {
+		logger.Info("Using mockpay HTTP provider", zap.String("url", cfg.Payment.ProviderURL))
+		return provider.NewHTTPClient(cfg.Payment.ProviderURL)
+	}
+	logger.Info("Using in-memory provider stub")
+	return provider.NewStub()
+}
+
+// maybeRunSubcommand handles the `migrate` and `mockpay` subcommands, reporting
+// whether it handled one (caller then exits/returns). Both need only base
+// config, so they run before cfg.Validate().
 //
-// `migrate` applies the versioned schema migrations and runs in every
-// environment (init container, direct DB host). Payment has no `seed`
-// subcommand — the service holds no demo data.
+// `migrate` applies the versioned schema migrations (one-shot). `mockpay` runs
+// the mock payment provider — a second deployment of this binary, mirroring the
+// order-worker pattern. Payment has no `seed` subcommand (no demo data).
 func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
 	if len(os.Args) <= 1 {
 		return false
@@ -222,9 +237,41 @@ func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
 		}
 		logger.Info("Schema migrations applied")
 		return true
+	case "mockpay":
+		runMockpay(cfg, logger)
+		return true
 	default:
 		return false
 	}
+}
+
+// runMockpay serves the mock provider until SIGTERM/SIGINT, then drains.
+func runMockpay(cfg *config.Config, logger *zap.Logger) {
+	srv := &http.Server{
+		Addr:              ":" + cfg.Service.Port,
+		Handler:           mockpay.New(logger).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	go func() {
+		logger.Info("mockpay listening", zap.String(fieldPort, cfg.Service.Port))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("mockpay server error", zap.Error(err))
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	<-ctx.Done()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("mockpay shutdown error", zap.Error(err))
+	}
+	logger.Info("mockpay shutdown complete")
 }
 
 // initMetrics installs the shared obsx OTel→Prometheus metrics bridge so any
@@ -325,7 +372,7 @@ func runGracefulShutdown(
 	beforePoolClose func(),
 ) {
 	go func() {
-		logger.Info("Starting payment service", zap.String("port", cfg.Service.Port))
+		logger.Info("Starting payment service", zap.String(fieldPort, cfg.Service.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Failed to start server", zap.Error(err))
 		}
