@@ -76,6 +76,10 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 	}
 
 	if ferr := r.repo.FinishRun(ctx, runID, scanned, len(discrepancies), domain.ReconRunCompleted); ferr != nil {
+		// The caller's context may itself be why the write failed (an aborted
+		// trigger request, a shutdown); retry the close detached so the run can
+		// never stay 'running' — the invariant is that every run is closed.
+		r.finish(ctx, runID, scanned, len(discrepancies), domain.ReconRunCompleted)
 		return runID, len(discrepancies), fmt.Errorf("finish reconciliation run: %w", ferr)
 	}
 	return runID, len(discrepancies), nil

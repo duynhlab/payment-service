@@ -72,6 +72,9 @@ type fakeReconRepo struct {
 	listErr   error
 	createErr error
 	saveErr   error
+
+	finishErrOnce bool // fail the first FinishRun (e.g. a cancelled caller ctx)
+	finishCalls   int
 }
 
 func (f *fakeReconRepo) ListReconcilable(context.Context) ([]domain.ReconRow, error) {
@@ -83,6 +86,11 @@ func (f *fakeReconRepo) SaveDiscrepancies(_ context.Context, _ int64, ds []domai
 	return f.saveErr
 }
 func (f *fakeReconRepo) FinishRun(_ context.Context, _ int64, scanned, found int, status domain.ReconRunStatus) error {
+	f.finishCalls++
+	if f.finishErrOnce {
+		f.finishErrOnce = false
+		return errBoom
+	}
 	f.scanned, f.found, f.finished = scanned, found, status
 	return nil
 }
@@ -242,6 +250,31 @@ func TestReconciler_Run_PagesPastStaleTotal(t *testing.T) {
 	}
 	if found != 0 {
 		t.Fatalf("a stale Total must not drop page 2 (mp_3) → want 0 discrepancies, got %d: %+v", found, repo.saved)
+	}
+}
+
+// TestReconciler_Run_CompletedCloseRetriesDetached pins the "every run is
+// closed" invariant: when the success-path FinishRun fails on the caller's
+// context (e.g. an aborted trigger request), the close is retried detached so
+// the run never stays 'running'.
+func TestReconciler_Run_CompletedCloseRetriesDetached(t *testing.T) {
+	repo := &fakeReconRepo{
+		runID:         5,
+		finishErrOnce: true,
+		rows:          []domain.ReconRow{{ProviderPaymentID: "mp_1", AmountMinor: 100, Status: domain.StatusCaptured}},
+	}
+	ledger := &fakeLedger{page: &provider.TransactionsPage{Total: 1, Transactions: []provider.Transaction{
+		{ProviderPaymentID: "mp_1", AmountMinor: 100, Status: provider.TxnCaptured},
+	}}}
+	_, _, err := NewReconciler(repo, ledger).Run(context.Background(), 100)
+	if err == nil {
+		t.Fatal("the FinishRun failure must still surface as an error")
+	}
+	if repo.finishCalls != 2 {
+		t.Fatalf("finish calls = %d, want 2 (failed caller-ctx close + detached retry)", repo.finishCalls)
+	}
+	if repo.finished != domain.ReconRunCompleted {
+		t.Fatalf("run closed as %q, want completed (the detached retry)", repo.finished)
 	}
 }
 
