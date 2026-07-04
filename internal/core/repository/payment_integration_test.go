@@ -28,6 +28,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 )
 
@@ -376,158 +378,38 @@ func mustTransition(t *testing.T, repo *PaymentRepository, id int64, from, to do
 	}
 }
 
-func TestIdempotencyRepository_Integration(t *testing.T) {
+// TestPaymentIdempotencyAdoption_Integration re-covers two behaviors that moved
+// or were dropped when payment adopted pkg/idempotency: the subject_id FK to
+// payments (migration 000007), and CreateRefund's tx-begin error path.
+func TestPaymentIdempotencyAdoption_Integration(t *testing.T) {
 	pool := newTestDB(t)
-	repo := NewIdempotencyRepository(pool, 90*time.Second)
+	repo := NewPaymentRepository(pool)
 	ctx := context.Background()
+	idem := idempotency.New(pool, 90*time.Second)
 
-	t.Run("claim, finish, replay", func(t *testing.T) {
-		k, proceed, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-a")
-		if err != nil || !proceed {
-			t.Fatalf("fresh claim: %v proceed=%v", err, proceed)
-		}
-		if err := repo.Finish(ctx, k.ID, 201, []byte(`{"id":1}`)); err != nil {
-			t.Fatal(err)
-		}
-		k2, proceed, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-a")
-		if err != nil || proceed || !k2.Finished() || *k2.ResponseCode != 201 {
-			t.Fatalf("replay: err=%v proceed=%v key=%+v", err, proceed, k2)
-		}
-	})
-
-	t.Run("same key different hash conflicts", func(t *testing.T) {
-		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/p", "hash-B"); !errors.Is(err, domain.ErrKeyConflict) {
-			t.Fatalf("want ErrKeyConflict, got %v", err)
-		}
-	})
-
-	t.Run("same key different path or method conflicts", func(t *testing.T) {
-		// A key identifies one request: reusing it on another endpoint (even
-		// with the identical body hash) must conflict, never cross-replay.
-		if _, _, err := repo.Claim(ctx, 7, "k1", "POST", "/other", "hash-a"); !errors.Is(err, domain.ErrKeyConflict) {
-			t.Fatalf("different path: want ErrKeyConflict, got %v", err)
-		}
-		if _, _, err := repo.Claim(ctx, 7, "k1", "DELETE", "/p", "hash-a"); !errors.Is(err, domain.ErrKeyConflict) {
-			t.Fatalf("different method: want ErrKeyConflict, got %v", err)
-		}
-	})
-
-	t.Run("per-user key namespaces", func(t *testing.T) {
-		_, proceed, err := repo.Claim(ctx, 8, "k1", "POST", "/p", "hash-a")
-		if err != nil || !proceed {
-			t.Fatalf("another user's same key must claim fresh: %v proceed=%v", err, proceed)
-		}
-	})
-
-	t.Run("concurrent claims: one winner", func(t *testing.T) {
-		var wg sync.WaitGroup
-		proceeds := make([]bool, 8)
-		errs := make([]error, 8)
-		for i := 0; i < 8; i++ {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				_, p, err := repo.Claim(ctx, 9, "k-race", "POST", "/p", "hash-r")
-				proceeds[i], errs[i] = p, err
-			}(i)
-		}
-		wg.Wait()
-		winners, locked := 0, 0
-		for i := range proceeds {
-			switch {
-			case errs[i] == nil && proceeds[i]:
-				winners++
-			case errors.Is(errs[i], domain.ErrKeyLocked):
-				locked++
-			case errs[i] != nil:
-				t.Fatalf("unexpected claim error: %v", errs[i])
-			}
-		}
-		if winners != 1 || locked != 7 {
-			t.Fatalf("want 1 winner / 7 locked, got %d / %d", winners, locked)
-		}
-	})
-
-	t.Run("stale lock takeover surfaces the checkpointed payment", func(t *testing.T) {
-		k, _, err := repo.Claim(ctx, 10, "k-stale", "POST", "/p", "hash-s")
+	t.Run("subject_id FK to payments is enforced", func(t *testing.T) {
+		pay := createPending(t, repo, 7, nil, 2000)
+		rec, _, err := idem.Claim(ctx, 7, "k-fk", "POST", "/pay", "h")
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The checkpointed subject must be a real payment (FK).
-		payRepo := NewPaymentRepository(pool)
-		pay, err := payRepo.Create(ctx, &domain.Payment{UserID: 10, AmountMinor: 1000,
-			Currency: "USD", CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa"})
-		if err != nil {
-			t.Fatal(err)
+		// A real payment id satisfies the FK.
+		if err := idem.Checkpoint(ctx, rec.ID, &pay.ID); err != nil {
+			t.Fatalf("checkpoint with a real payment id: %v", err)
 		}
-		if err := repo.Checkpoint(ctx, k.ID, &pay.ID); err != nil {
-			t.Fatal(err)
-		}
-		// Age the lock beyond the takeover threshold.
-		if _, err := pool.Exec(ctx,
-			`UPDATE idempotency_keys SET locked_at = now() - interval '5 minutes' WHERE id = $1`, k.ID); err != nil {
-			t.Fatal(err)
-		}
-		took, proceed, err := repo.Claim(ctx, 10, "k-stale", "POST", "/p", "hash-s")
-		if err != nil || !proceed {
-			t.Fatalf("takeover: %v proceed=%v", err, proceed)
-		}
-		if took.PaymentID == nil || *took.PaymentID != pay.ID {
-			t.Fatalf("takeover must surface the checkpointed payment, got %+v", took)
+		// A non-existent subject id violates the payments FK preserved by the rename.
+		bogus := int64(9_999_999)
+		if err := idem.Checkpoint(ctx, rec.ID, &bogus); err == nil {
+			t.Fatal("checkpoint with a bogus subject_id must violate the payments FK")
 		}
 	})
 
-	t.Run("CreateRefund surfaces a transaction begin error", func(t *testing.T) {
-		// A closed pool makes Begin fail — exercises the tx error path without
-		// a live fault-injection harness.
-		dead, err := pgxpool.New(ctx, pool.Config().ConnString())
-		if err != nil {
-			t.Fatal(err)
-		}
-		dead.Close()
-		if _, err := NewPaymentRepository(dead).CreateRefund(ctx, 1, 100, "", "dead-key"); err == nil {
-			t.Fatal("CreateRefund on a closed pool must error")
-		}
-	})
-
-	t.Run("release ages the lock so an immediate retry takes over", func(t *testing.T) {
-		k, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Fresh lock: a second claim would normally be ErrKeyLocked.
-		if _, _, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r"); !errors.Is(err, domain.ErrKeyLocked) {
-			t.Fatalf("fresh lock should block, got %v", err)
-		}
-		// Release ages the lock; the next claim takes over (proceed=true).
-		if err := repo.Release(ctx, k.ID); err != nil {
-			t.Fatalf("release: %v", err)
-		}
-		_, proceed, err := repo.Claim(ctx, 12, "k-rel", "POST", "/p", "hash-r")
-		if err != nil || !proceed {
-			t.Fatalf("after release, retry must take over: proceed=%v err=%v", proceed, err)
-		}
-		// Release on a finished key is a no-op (guarded by response_code IS NULL).
-		if err := repo.Finish(ctx, k.ID, 201, []byte(`{"ok":true}`)); err != nil {
-			t.Fatal(err)
-		}
-		if err := repo.Release(ctx, k.ID); err != nil {
-			t.Fatalf("release on finished key must be a harmless no-op, got %v", err)
-		}
-	})
-
-	t.Run("reap removes old keys", func(t *testing.T) {
-		k, _, err := repo.Claim(ctx, 11, "k-old", "POST", "/p", "h")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx,
-			`UPDATE idempotency_keys SET created_at = now() - interval '2 days' WHERE id = $1`, k.ID); err != nil {
-			t.Fatal(err)
-		}
-		n, err := repo.Reap(ctx, 24*time.Hour)
-		if err != nil || n < 1 {
-			t.Fatalf("reap: n=%d err=%v", n, err)
+	t.Run("CreateRefund surfaces a tx-begin error", func(t *testing.T) {
+		p := authorizeCaptured(t, repo, 1000)
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if _, err := repo.CreateRefund(canceled, p.ID, 100, "x", "k-cancel"); err == nil {
+			t.Fatal("CreateRefund on a canceled context must error")
 		}
 	})
 }

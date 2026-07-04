@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -19,18 +21,18 @@ type erroringIdem struct {
 	claimErr, checkpointErr, finishErr, releaseErr error
 }
 
-func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
+func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error) {
 	if e.claimErr != nil {
 		return nil, false, e.claimErr
 	}
 	return e.fakeIdem.Claim(ctx, userID, key, method, path, hash)
 }
 
-func (e *erroringIdem) Checkpoint(ctx context.Context, id int64, paymentID *int64) error {
+func (e *erroringIdem) Checkpoint(ctx context.Context, id int64, subjectID *int64) error {
 	if e.checkpointErr != nil {
 		return e.checkpointErr
 	}
-	return e.fakeIdem.Checkpoint(ctx, id, paymentID)
+	return e.fakeIdem.Checkpoint(ctx, id, subjectID)
 }
 
 func (e *erroringIdem) Release(ctx context.Context, id int64) error {
@@ -136,6 +138,38 @@ func TestFinishIntent_FindErrorPropagates(t *testing.T) {
 	ep.findErr = errBoom
 	if _, err := svc.Get(context.Background(), res.Payment.ID, 7); !errors.Is(err, errBoom) {
 		t.Fatalf("find error must propagate, got %v", err)
+	}
+}
+
+// The store returns the shared pkg's sentinels; the service must translate them
+// to the payment domain's so the web layer maps them to 409 (not 500).
+func TestCreateIntent_MapsIdempotencySentinels(t *testing.T) {
+	tests := []struct {
+		name     string
+		claimErr error
+		want     error
+	}{
+		{"conflict", idempotency.ErrConflict, domain.ErrKeyConflict},
+		{"locked", idempotency.ErrLocked, domain.ErrKeyLocked},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: tt.claimErr}
+			svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+			if _, err := svc.CreateIntent(context.Background(), "k", intent(2000)); !errors.Is(err, tt.want) {
+				t.Fatalf("want %v, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+// CreateRefund must translate the store's sentinels too (symmetric with the
+// CreateIntent mapping — guards a future divergent call site).
+func TestCreateRefund_MapsIdempotencySentinels(t *testing.T) {
+	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: idempotency.ErrLocked}
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, domain.ErrKeyLocked) {
+		t.Fatalf("want domain.ErrKeyLocked, got %v", err)
 	}
 }
 
@@ -261,11 +295,11 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	pid := int64(123)
 	fi.mu.Lock()
 	fi.seq++
-	fi.keys["k-re"] = &domain.IdempotencyKey{
+	fi.keys["k-re"] = &idempotency.Record{
 		ID: fi.seq, UserID: 7, Key: "k-re",
 		RequestMethod: "POST", RequestPath: "/payment/v1/private/payments",
 		RequestHash: hashJSON(intent(2000)),
-		LockedAt:    time.Unix(0, 0), PaymentID: &pid,
+		LockedAt:    time.Unix(0, 0), SubjectID: &pid,
 	}
 	fi.mu.Unlock()
 

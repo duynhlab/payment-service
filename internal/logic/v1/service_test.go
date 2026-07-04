@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -213,7 +215,7 @@ func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status do
 type fakeIdem struct {
 	mu   sync.Mutex
 	seq  int64
-	keys map[string]*domain.IdempotencyKey
+	keys map[string]*idempotency.Record
 	take time.Duration
 	// reapTTL/reapCount record the last Reap call so tests can assert the
 	// service delegates the configured TTL and surfaces the returned count.
@@ -222,10 +224,10 @@ type fakeIdem struct {
 }
 
 func newFakeIdem() *fakeIdem {
-	return &fakeIdem{keys: map[string]*domain.IdempotencyKey{}, take: 90 * time.Second}
+	return &fakeIdem{keys: map[string]*idempotency.Record{}, take: 90 * time.Second}
 }
 
-func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error) {
+func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := key
@@ -233,21 +235,21 @@ func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, has
 		// Mirror the real repository: a key identifies ONE request — same key
 		// with a different body, path, or method is a conflict, never a replay.
 		if k.RequestHash != hash || k.RequestPath != path || k.RequestMethod != method {
-			return nil, false, domain.ErrKeyConflict
+			return nil, false, idempotency.ErrConflict
 		}
 		if k.Finished() {
 			cp := *k
 			return &cp, false, nil
 		}
 		if time.Since(k.LockedAt) < f.take {
-			return nil, false, domain.ErrKeyLocked
+			return nil, false, idempotency.ErrLocked
 		}
 		k.LockedAt = time.Now()
 		cp := *k
 		return &cp, true, nil
 	}
 	f.seq++
-	k := &domain.IdempotencyKey{ID: f.seq, UserID: userID, Key: key,
+	k := &idempotency.Record{ID: f.seq, UserID: userID, Key: key,
 		RequestMethod: method, RequestPath: path, RequestHash: hash,
 		LockedAt: time.Now()}
 	f.keys[id] = k
@@ -255,13 +257,13 @@ func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, has
 	return &cp, true, nil
 }
 
-func (f *fakeIdem) Checkpoint(_ context.Context, id int64, paymentID *int64) error {
+func (f *fakeIdem) Checkpoint(_ context.Context, id int64, subjectID *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, k := range f.keys {
 		if k.ID == id {
-			if paymentID != nil {
-				k.PaymentID = paymentID
+			if subjectID != nil {
+				k.SubjectID = subjectID
 			}
 			k.LockedAt = time.Now()
 		}
@@ -367,6 +369,8 @@ func TestCreateIntent_SameKeyDifferentBody(t *testing.T) {
 		t.Fatalf("first: %v", err)
 	}
 	_, err := svc.CreateIntent(context.Background(), "key-3", intent(3000))
+	// The store returns idempotency.ErrConflict; the service maps it to the
+	// domain sentinel so the web layer answers 409 (not 500).
 	if !errors.Is(err, domain.ErrKeyConflict) {
 		t.Fatalf("different body must conflict, got %v", err)
 	}
@@ -575,7 +579,7 @@ func TestReplayCache_RoundTripsJSON(t *testing.T) {
 	p := &domain.Payment{ID: 1, Status: domain.StatusAuthorized, AmountMinor: 2000}
 	body, _ := json.Marshal(p)
 	code := 201
-	res, err := replayResult(&domain.IdempotencyKey{ResponseCode: &code, ResponseBody: body})
+	res, err := replayResult(&idempotency.Record{ResponseCode: &code, ResponseBody: body})
 	if err != nil || res.Payment.ID != 1 || !res.Replayed {
 		t.Fatalf("replay round-trip: %v %+v", err, res)
 	}

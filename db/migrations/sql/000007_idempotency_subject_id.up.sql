@@ -1,0 +1,13 @@
+-- V7__idempotency_subject_id.sql
+-- Adopt the shared pkg/idempotency store, which references the claimed subject by
+-- the generic column subject_id. Rename payment_id -> subject_id; the existing FK
+-- to payments(id) follows the rename (payment keeps it — the generic package
+-- leaves the FK to each caller).
+--
+-- Deploy note: a column rename is NOT rolling-safe — an old replica still
+-- querying payment_id would error until it is replaced. Payment runs
+-- single-replica with recreate-style deploys (and is not yet cluster-deployed —
+-- RFC-0010 P5), so old/new pods never overlap on this schema. When it does go
+-- multi-replica, this must move to expand/contract (add subject_id, backfill,
+-- dual-read, drop payment_id later).
+ALTER TABLE idempotency_keys RENAME COLUMN payment_id TO subject_id;
