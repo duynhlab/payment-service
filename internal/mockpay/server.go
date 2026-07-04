@@ -30,11 +30,13 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 
 // Server is the in-memory mock provider. Safe for concurrent requests.
 type Server struct {
-	logger *zap.Logger
+	logger  *zap.Logger
+	emitter Emitter // webhook emitter; nil disables emission
 
 	mu            sync.Mutex
 	seq           int64                      // provider_payment_id sequence
 	refundSeq     int64                      // provider_refund_id sequence
+	eventSeq      int64                      // webhook event_id sequence
 	byKey         map[string]provider.Charge // charge idempotency replay
 	captured      map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
 	voided        map[string]bool            // voided ids — makes void idempotent under retry
@@ -42,16 +44,32 @@ type Server struct {
 	transientSeen map[string]bool            // charge keys that already hit the transient trigger once
 }
 
-// New builds an empty mock provider.
-func New(logger *zap.Logger) *Server {
+// New builds an empty mock provider. emitter may be nil (emission disabled).
+func New(logger *zap.Logger, emitter Emitter) *Server {
 	return &Server{
 		logger:        logger,
+		emitter:       emitter,
 		byKey:         map[string]provider.Charge{},
 		captured:      map[string]bool{},
 		voided:        map[string]bool{},
 		refundsByKey:  map[string]string{},
 		transientSeen: map[string]bool{},
 	}
+}
+
+// emit assigns a fresh event_id and hands the event to the emitter. The caller
+// holds s.mu (for eventSeq); Emit itself is async and touches no server state.
+func (s *Server) emit(eventType, providerPaymentID string, amount int64) {
+	if s.emitter == nil {
+		return
+	}
+	s.eventSeq++
+	s.emitter.Emit(provider.WebhookEvent{
+		EventID:           fmt.Sprintf("evt_%d", s.eventSeq),
+		Type:              eventType,
+		ProviderPaymentID: providerPaymentID,
+		AmountMinor:       amount,
+	})
 }
 
 // Handler wires the routes (Go 1.22+ method+wildcard patterns).
@@ -118,6 +136,11 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 	s.captured[c.ProviderPaymentID] = req.AutoCapture
 	s.logger.Info("charge", zap.String("id", c.ProviderPaymentID),
 		zap.Int64("amount_minor", req.AmountMinor), zap.Bool("captured", c.Captured))
+	eventType := "charge.authorized"
+	if c.Captured {
+		eventType = "charge.captured"
+	}
+	s.emit(eventType, c.ProviderPaymentID, req.AmountMinor)
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -131,6 +154,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 	s.captured[id] = true
 	s.logger.Info("capture", zap.String("id", id))
+	s.emit("charge.captured", id, 0)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -149,6 +173,7 @@ func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	delete(s.captured, id)
 	s.voided[id] = true
 	s.logger.Info("void", zap.String("id", id))
+	s.emit("charge.voided", id, 0)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -179,5 +204,6 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logger.Info("refund", zap.String("id", refundID),
 		zap.String("charge", req.ProviderPaymentID), zap.Int64("amount_minor", req.AmountMinor))
+	s.emit("refund.succeeded", req.ProviderPaymentID, req.AmountMinor)
 	writeJSON(w, http.StatusOK, provider.RefundResponse{ProviderRefundID: refundID})
 }

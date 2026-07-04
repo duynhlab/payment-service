@@ -253,9 +253,19 @@ func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
 
 // runMockpay serves the mock provider until SIGTERM/SIGINT, then drains.
 func runMockpay(cfg *config.Config, logger *zap.Logger) {
+	var emitter mockpay.Emitter
+	switch {
+	case cfg.Payment.WebhookURL == "":
+		logger.Info("mockpay webhook emission disabled (MOCKPAY_WEBHOOK_URL empty)")
+	case cfg.Payment.WebhookSecret == "":
+		logger.Error("MOCKPAY_WEBHOOK_URL set but MOCKPAY_WEBHOOK_SECRET empty; emission disabled")
+	default:
+		emitter = mockpay.NewWebhookEmitter(cfg.Payment.WebhookURL, cfg.Payment.WebhookSecret, logger)
+		logger.Info("mockpay webhook emission enabled", zap.String("url", cfg.Payment.WebhookURL))
+	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Service.Port,
-		Handler:           mockpay.New(logger).Handler(),
+		Handler:           mockpay.New(logger, emitter).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
