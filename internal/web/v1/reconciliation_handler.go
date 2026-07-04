@@ -1,0 +1,157 @@
+package v1
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/duynhlab/payment-service/internal/core/domain"
+	"github.com/duynhlab/pkg/httpx"
+)
+
+// reconRunTimeout bounds a synchronously-triggered run — parity with the
+// background ticker's per-job timeout, and the ceiling on what one POST can
+// cost. Without it a slow pass (or a client that never reads the response)
+// would hold the goroutine, the ledger snapshot, and a pool connection open
+// indefinitely.
+const reconRunTimeout = 30 * time.Second
+
+// fieldRun is the JSON key wrapping the run resource in API responses.
+const fieldRun = "run"
+
+// msgInternalError is the opaque 500 message — internals never leak.
+const msgInternalError = "Internal server error"
+
+// msgRunFailed is the log/error message for a failed reconciliation pass.
+const msgRunFailed = "Reconciliation run failed"
+
+// Shared JSON/log field keys.
+const (
+	fieldRunID         = "run_id"
+	fieldDiscrepancies = "discrepancies"
+)
+
+// ReconRunner triggers one reconciliation pass. *logicv1.Reconciler satisfies
+// it. The handler holds a nil runner when reconciliation is disabled (the
+// in-process provider stub has no ledger to reconcile against).
+type ReconRunner interface {
+	Run(ctx context.Context, pageSize int) (runID int64, found int, err error)
+}
+
+// reconReader is the report side: the persisted run + its discrepancies.
+// *repository.ReconciliationRepository satisfies it.
+type reconReader interface {
+	GetRun(ctx context.Context, id int64) (*domain.ReconRun, error)
+	ListDiscrepancies(ctx context.Context, runID int64) ([]domain.Discrepancy, error)
+}
+
+// ReconciliationHandler serves the internal reconciliation API: trigger a run,
+// read a run's report. Internal audience — cluster-only, NetworkPolicy is the
+// fence, never routed through the gateway.
+type ReconciliationHandler struct {
+	runner ReconRunner // nil = reconciliation disabled
+	reader reconReader
+	// running single-flights the trigger endpoint: one pass costs a full table
+	// scan plus paging the whole provider ledger, so concurrent POSTs answer 409
+	// instead of multiplying that load (the 5-minute ticker covers freshness).
+	running atomic.Bool
+}
+
+// NewReconciliationHandler wires the handler. runner may be nil (stub provider);
+// the trigger endpoint then answers 503 instead of running.
+func NewReconciliationHandler(runner ReconRunner, reader reconReader) *ReconciliationHandler {
+	return &ReconciliationHandler{runner: runner, reader: reader}
+}
+
+// RegisterReconciliationRoutes mounts the internal reconciliation routes.
+func RegisterReconciliationRoutes(r *gin.Engine, h *ReconciliationHandler) {
+	internal := r.Group("/payment/v1/internal/reconciliation")
+	{
+		internal.POST("/runs", h.TriggerRun)
+		internal.GET("/runs/:id", h.GetRun)
+	}
+}
+
+// TriggerRun handles POST /payment/v1/internal/reconciliation/runs — runs one
+// reconciliation pass synchronously (a pass is seconds at this volume) and
+// returns the finished run resource, 201.
+func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
+	ctx, span, log := beginRequest(c)
+	defer span.End()
+
+	if h.runner == nil {
+		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal,
+			"Reconciliation is unavailable: no provider ledger configured")
+		return
+	}
+
+	if !h.running.CompareAndSwap(false, true) {
+		httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict,
+			"A reconciliation run is already in progress")
+		return
+	}
+	defer h.running.Store(false)
+
+	runCtx, cancel := context.WithTimeout(ctx, reconRunTimeout)
+	defer cancel()
+	// Page size 0 → the reconciler's own default; one source of truth.
+	runID, found, err := h.runner.Run(runCtx, 0)
+	if err != nil {
+		span.RecordError(err)
+		log.Error(msgRunFailed, zap.Int64(fieldRunID, runID), zap.Error(err))
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgRunFailed)
+		return
+	}
+
+	run, err := h.reader.GetRun(ctx, runID)
+	if err != nil {
+		span.RecordError(err)
+		log.Error("Reconciliation run lookup after trigger failed", zap.Int64(fieldRunID, runID), zap.Error(err))
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
+		return
+	}
+	log.Info("Reconciliation run triggered", zap.Int64(fieldRunID, runID), zap.Int(fieldDiscrepancies, found))
+	c.Header("Location", c.Request.URL.Path+"/"+strconv.FormatInt(runID, 10))
+	c.JSON(http.StatusCreated, gin.H{fieldRun: run})
+}
+
+// GetRun handles GET /payment/v1/internal/reconciliation/runs/:id — the run
+// resource plus its full discrepancy report.
+func (h *ReconciliationHandler) GetRun(c *gin.Context) {
+	ctx, span, log := beginRequest(c)
+	defer span.End()
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "run id must be a positive integer")
+		return
+	}
+
+	run, err := h.reader.GetRun(ctx, id)
+	if errors.Is(err, domain.ErrNotFound) {
+		httpx.RespondError(c, http.StatusNotFound, httpx.CodeNotFound, "Reconciliation run not found")
+		return
+	}
+	if err != nil {
+		span.RecordError(err)
+		log.Error("Reconciliation run lookup failed", zap.Int64(fieldRunID, id), zap.Error(err))
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
+		return
+	}
+
+	discrepancies, err := h.reader.ListDiscrepancies(ctx, id)
+	if err != nil {
+		span.RecordError(err)
+		log.Error("Discrepancy list failed", zap.Int64(fieldRunID, id), zap.Error(err))
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{fieldRun: run, fieldDiscrepancies: discrepancies})
+}

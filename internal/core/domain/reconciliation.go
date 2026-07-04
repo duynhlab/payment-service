@@ -1,5 +1,7 @@
 package domain
 
+import "time"
+
 // Reconciliation compares the payment service's own record of a charge (the
 // `payments` table + ledger) against the provider's record (mockpay's
 // GET /transactions), matched by provider_payment_id — the shared identifier
@@ -58,15 +60,27 @@ type ReconRow struct {
 	Status        Status
 }
 
+// ReconRun is one reconciliation pass as reported by the internal API: its
+// lifecycle status plus the scan/discrepancy counts. FinishedAt is nil while
+// the run is still in progress.
+type ReconRun struct {
+	ID                  int64          `json:"id"`
+	Status              ReconRunStatus `json:"status"`
+	TransactionsScanned int            `json:"transactions_scanned"`
+	DiscrepanciesFound  int            `json:"discrepancies_found"`
+	StartedAt           time.Time      `json:"started_at"`
+	FinishedAt          *time.Time     `json:"finished_at,omitempty"`
+}
+
 // Discrepancy is one detected payment↔provider mismatch. In v1 it is persisted
 // to reconciliation_discrepancies and surfaced via the internal API + metrics,
 // and nothing else — no side effect on money.
 type Discrepancy struct {
-	ProviderPaymentID string
-	Class             DiscrepancyClass
-	InternalAmount    int64  // 0 when the internal side is absent
-	ProviderAmount    int64  // 0 when the provider side is absent
-	InternalStatus    string // "" when the internal side is absent
-	ProviderStatus    string // "" when the provider side is absent
-	Detail            string // human-readable summary for the report
+	ProviderPaymentID string           `json:"provider_payment_id"`
+	Class             DiscrepancyClass `json:"class"`
+	InternalAmount    int64            `json:"internal_amount_minor"` // 0 when the internal side is absent
+	ProviderAmount    int64            `json:"provider_amount_minor"` // 0 when the provider side is absent
+	InternalStatus    string           `json:"internal_status"`       // "" when the internal side is absent
+	ProviderStatus    string           `json:"provider_status"`       // "" when the provider side is absent
+	Detail            string           `json:"detail"`                // human-readable summary for the report
 }

@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
@@ -86,6 +88,49 @@ func (r *ReconciliationRepository) SaveDiscrepancies(ctx context.Context, runID 
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// GetRun returns one reconciliation run, or domain.ErrNotFound.
+func (r *ReconciliationRepository) GetRun(ctx context.Context, id int64) (*domain.ReconRun, error) {
+	var run domain.ReconRun
+	var status string
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, status, transactions_scanned, discrepancies_found, started_at, finished_at
+		FROM reconciliation_runs WHERE id = $1`, id).
+		Scan(&run.ID, &status, &run.TransactionsScanned, &run.DiscrepanciesFound, &run.StartedAt, &run.FinishedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get reconciliation run %d: %w", id, err)
+	}
+	run.Status = domain.ReconRunStatus(status)
+	return &run, nil
+}
+
+// ListDiscrepancies returns a run's discrepancies in insertion order.
+func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID int64) ([]domain.Discrepancy, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT provider_payment_id, class, internal_amount_minor, provider_amount_minor,
+		       internal_status, provider_status, detail
+		FROM reconciliation_discrepancies WHERE run_id = $1 ORDER BY id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list discrepancies for run %d: %w", runID, err)
+	}
+	defer rows.Close()
+
+	out := []domain.Discrepancy{}
+	for rows.Next() {
+		var d domain.Discrepancy
+		var class string
+		if err := rows.Scan(&d.ProviderPaymentID, &class, &d.InternalAmount, &d.ProviderAmount,
+			&d.InternalStatus, &d.ProviderStatus, &d.Detail); err != nil {
+			return nil, fmt.Errorf("scan discrepancy: %w", err)
+		}
+		d.Class = domain.DiscrepancyClass(class)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 // FinishRun closes a run with its terminal status and counts.
