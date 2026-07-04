@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
@@ -14,6 +15,10 @@ const (
 	// maxReconTransactions bounds one pass against a provider that returns full
 	// pages indefinitely (a bug, or an inflated Total from a hostile provider).
 	maxReconTransactions = 1_000_000
+	// finishGrace bounds the FinishRun write. It runs on a context detached from
+	// the caller's (see finish) so a cancelled trigger request or a shutdown
+	// can't strand the run row in 'running' forever.
+	finishGrace = 5 * time.Second
 )
 
 // ProviderLedger is the provider-side food source reconciliation pages through
@@ -59,13 +64,13 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 
 	discrepancies, scanned, err := r.detect(ctx, pageSize)
 	if err != nil {
-		_ = r.repo.FinishRun(ctx, runID, scanned, 0, domain.ReconRunFailed)
+		r.finish(ctx, runID, scanned, 0, domain.ReconRunFailed)
 		return runID, 0, fmt.Errorf("detect discrepancies: %w", err)
 	}
 
 	if len(discrepancies) > 0 {
 		if serr := r.repo.SaveDiscrepancies(ctx, runID, discrepancies); serr != nil {
-			_ = r.repo.FinishRun(ctx, runID, scanned, 0, domain.ReconRunFailed)
+			r.finish(ctx, runID, scanned, 0, domain.ReconRunFailed)
 			return runID, 0, fmt.Errorf("save discrepancies: %w", serr)
 		}
 	}
@@ -74,6 +79,17 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 		return runID, len(discrepancies), fmt.Errorf("finish reconciliation run: %w", ferr)
 	}
 	return runID, len(discrepancies), nil
+}
+
+// finish closes a run on a context detached from the caller's cancellation
+// (bounded by finishGrace). The failure paths reach here precisely when ctx may
+// already be cancelled — a client that aborted the triggering request, or a
+// shutdown mid-pass — and closing the run with the same dead context would fail
+// too, stranding the row in 'running' with no terminal status.
+func (r *Reconciler) finish(ctx context.Context, runID int64, scanned, found int, status domain.ReconRunStatus) {
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finishGrace)
+	defer cancel()
+	_ = r.repo.FinishRun(fctx, runID, scanned, found, status)
 }
 
 // detect loads the internal rows, pages the full provider ledger, and classifies

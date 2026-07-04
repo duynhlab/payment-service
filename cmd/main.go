@@ -140,7 +140,7 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
-	reconciler := buildReconciler(prov, pool)
+	reconciler, reconHandler := buildReconciliation(prov, pool)
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
 	// A bind failure is fatal: the pod must not report healthy on HTTP while its
@@ -178,7 +178,7 @@ func run() error {
 	}
 
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, logger, verifier, paymentHandler, webhookHandler, &isShuttingDown)
+	srv := setupServer(cfg, logger, verifier, paymentHandler, webhookHandler, reconHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
 	return nil
 }
@@ -252,16 +252,23 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 
 // selectProvider returns the mockpay HTTP client when MOCKPAY_URL is set, else
 // the in-memory stub (unit tests and stub-only local runs).
-// buildReconciler wires the reconciler only when the provider exposes a ledger
-// to page — the real mockpay HTTP client; the in-process stub has nothing to
-// reconcile against, so it returns nil (recon is then skipped). v1 is
-// detect-only: it records drift, never heals.
-func buildReconciler(prov provider.Provider, pool *pgxpool.Pool) *logicv1.Reconciler {
+// buildReconciliation wires the reconciler and its internal API handler. The
+// reconciler exists only when the provider exposes a ledger to page — the real
+// mockpay HTTP client; the in-process stub has nothing to reconcile against, so
+// the reconciler is nil (the ticker is skipped and the trigger endpoint answers
+// 503). v1 is detect-only: it records drift, never heals.
+//
+// The handler's runner stays a nil interface when reconciliation is disabled —
+// assigning a nil *Reconciler directly would make the interface non-nil (typed
+// nil) and defeat the handler's disabled check.
+func buildReconciliation(prov provider.Provider, pool *pgxpool.Pool) (*logicv1.Reconciler, *v1.ReconciliationHandler) {
+	reconRepo := repository.NewReconciliationRepository(pool)
 	ledger, ok := prov.(logicv1.ProviderLedger)
 	if !ok {
-		return nil
+		return nil, v1.NewReconciliationHandler(nil, reconRepo)
 	}
-	return logicv1.NewReconciler(repository.NewReconciliationRepository(pool), ledger)
+	reconciler := logicv1.NewReconciler(reconRepo, ledger)
+	return reconciler, v1.NewReconciliationHandler(reconciler, reconRepo)
 }
 
 func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
@@ -415,7 +422,7 @@ func initProfiling(cfg *config.Config, logger *zap.Logger) func() {
 	}
 }
 
-func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, paymentHandler *v1.Handler, webhookHandler *v1.WebhookHandler, isShuttingDown *atomic.Bool) *http.Server {
+func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, paymentHandler *v1.Handler, webhookHandler *v1.WebhookHandler, reconHandler *v1.ReconciliationHandler, isShuttingDown *atomic.Bool) *http.Server {
 	r := gin.Default()
 
 	r.Use(middleware.TracingMiddleware())
@@ -439,6 +446,9 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 	v1.RegisterRoutes(r, paymentHandler, verifier)
 	// Public webhook route — no JWT; the HMAC signature is the credential.
 	v1.RegisterWebhookRoutes(r, webhookHandler)
+	// Internal reconciliation API — cluster-only (NetworkPolicy is the fence),
+	// never routed through the gateway.
+	v1.RegisterReconciliationRoutes(r, reconHandler)
 
 	return &http.Server{
 		Addr:              ":" + cfg.Service.Port,

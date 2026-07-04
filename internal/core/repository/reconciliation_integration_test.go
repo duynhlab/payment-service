@@ -8,8 +8,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 )
@@ -97,5 +99,27 @@ func TestReconciliation_Integration(t *testing.T) {
 	}
 	if _, ok := classes["mp_1"]; ok {
 		t.Errorf("mp_1 matched exactly — must have no discrepancy")
+	}
+
+	// Read side (the internal API's report): GetRun + ListDiscrepancies.
+	repo := NewReconciliationRepository(pool)
+	run, err := repo.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if run.Status != "completed" || run.DiscrepanciesFound != 4 || run.FinishedAt == nil {
+		t.Fatalf("GetRun = %+v, want completed/4/finished", run)
+	}
+	ds, err := repo.ListDiscrepancies(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListDiscrepancies: %v", err)
+	}
+	if len(ds) != 4 {
+		t.Fatalf("ListDiscrepancies len = %d, want 4", len(ds))
+	}
+	// The not-found contract is what the handler's 404 depends on: a missing row
+	// must surface as domain.ErrNotFound, not a raw pgx error (which would 500).
+	if _, err := repo.GetRun(ctx, runID+999); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("GetRun(unknown) = %v, want domain.ErrNotFound", err)
 	}
 }
