@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 
 	"github.com/duynhlab/payment-service/config"
 	migrations "github.com/duynhlab/payment-service/db/migrations"
@@ -22,11 +24,15 @@ import (
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/core/repository"
+	grpcv1 "github.com/duynhlab/payment-service/internal/grpc/v1"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/payment-service/internal/mockpay"
 	v1 "github.com/duynhlab/payment-service/internal/web/v1"
 	"github.com/duynhlab/payment-service/middleware"
+	paymentv1 "github.com/duynhlab/pkg/proto/payment/v1"
+
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/grpcx"
 	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
@@ -130,6 +136,14 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, selectProvider(cfg, logger), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
+	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
+	// A bind failure is fatal: the pod must not report healthy on HTTP while its
+	// primary east-west (money) transport is silently absent.
+	grpcSrv, err := startGRPC(cfg, logger, paymentService)
+	if err != nil {
+		return err
+	}
+
 	// Inbound webhook receiver (public route; HMAC-verified in the handler).
 	webhookHandler := v1.NewWebhookHandler(
 		logicv1.NewWebhookProcessor(repository.NewWebhookRepository(pool)),
@@ -152,6 +166,7 @@ func run() error {
 	// before the pool is closed — otherwise a tick landing after pool.Close()
 	// acquires from a closed pool and logs a spurious error.
 	stopJobsAndWait := func() {
+		grpcSrv.GracefulStop() // drain in-flight RPCs before the pool closes
 		stopJobs()
 		jobsWG.Wait()
 	}
@@ -250,6 +265,25 @@ func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
 	default:
 		return false
 	}
+}
+
+// startGRPC serves the internal PaymentService on :9090 (east-west, saga-only).
+// Returns the server so shutdown can GracefulStop it before the pool closes.
+func startGRPC(cfg *config.Config, logger *zap.Logger, svc *logicv1.Service) (*grpc.Server, error) {
+	lc := net.ListenConfig{}
+	lis, err := lc.Listen(context.Background(), "tcp", ":"+cfg.GRPC.Port)
+	if err != nil {
+		return nil, fmt.Errorf("listen gRPC :%s: %w", cfg.GRPC.Port, err)
+	}
+	grpcSrv, _ := grpcx.NewServer()
+	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcv1.NewServer(svc))
+	go func() {
+		logger.Info("Starting gRPC server", zap.String(fieldPort, cfg.GRPC.Port))
+		if err := grpcSrv.Serve(lis); err != nil {
+			logger.Error("gRPC server error", zap.Error(err))
+		}
+	}()
+	return grpcSrv, nil
 }
 
 // runMockpay serves the mock provider until SIGTERM/SIGINT, then drains.
