@@ -31,6 +31,12 @@ const msgInternalError = "Internal server error"
 // msgRunFailed is the log/error message for a failed reconciliation pass.
 const msgRunFailed = "Reconciliation run failed"
 
+// reconRunsPath is the canonical runs collection path — used both to mount the
+// routes and to build the Location header from a constant. The header must
+// never be derived from the request URL: reflecting user-controlled input into
+// a response header is a header-injection sink.
+const reconRunsPath = "/payment/v1/internal/reconciliation/runs"
+
 // Shared JSON/log field keys.
 const (
 	fieldRunID         = "run_id"
@@ -71,11 +77,8 @@ func NewReconciliationHandler(runner ReconRunner, reader reconReader) *Reconcili
 
 // RegisterReconciliationRoutes mounts the internal reconciliation routes.
 func RegisterReconciliationRoutes(r *gin.Engine, h *ReconciliationHandler) {
-	internal := r.Group("/payment/v1/internal/reconciliation")
-	{
-		internal.POST("/runs", h.TriggerRun)
-		internal.GET("/runs/:id", h.GetRun)
-	}
+	r.POST(reconRunsPath, h.TriggerRun)
+	r.GET(reconRunsPath+"/:id", h.GetRun)
 }
 
 // TriggerRun handles POST /payment/v1/internal/reconciliation/runs — runs one
@@ -117,7 +120,7 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 		return
 	}
 	log.Info("Reconciliation run triggered", zap.Int64(fieldRunID, runID), zap.Int(fieldDiscrepancies, found))
-	c.Header("Location", c.Request.URL.Path+"/"+strconv.FormatInt(runID, 10))
+	c.Header("Location", reconRunsPath+"/"+strconv.FormatInt(runID, 10))
 	c.JSON(http.StatusCreated, gin.H{fieldRun: run})
 }
 
