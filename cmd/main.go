@@ -27,6 +27,7 @@ import (
 	v1 "github.com/duynhlab/payment-service/internal/web/v1"
 	"github.com/duynhlab/payment-service/middleware"
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
@@ -125,7 +126,7 @@ func run() error {
 	// Repositories + provider + logic. P1 runs the in-memory provider stub;
 	// the real mockpay HTTP client lands in P2 behind the same interface.
 	paymentRepo := repository.NewPaymentRepository(pool)
-	idemRepo := repository.NewIdempotencyRepository(pool, cfg.Payment.IdempotencyLockTakeover)
+	idemRepo := idempotency.New(pool, cfg.Payment.IdempotencyLockTakeover)
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, selectProvider(cfg, logger), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 

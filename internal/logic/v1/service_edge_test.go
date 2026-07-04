@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -224,7 +226,7 @@ func TestReapIdempotencyKeys_DelegatesTTLAndCount(t *testing.T) {
 
 func TestReplayResult_CorruptCache(t *testing.T) {
 	code := 201
-	if _, err := replayResult(&domain.IdempotencyKey{ResponseCode: &code, ResponseBody: []byte("{not json")}); err == nil {
+	if _, err := replayResult(&idempotency.Record{ResponseCode: &code, ResponseBody: []byte("{not json")}); err == nil {
 		t.Fatal("corrupt cache must error")
 	}
 }

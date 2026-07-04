@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/duynhlab/pkg/idempotency"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -32,11 +34,11 @@ type PaymentRepo interface {
 	SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error
 }
 
-// IdemRepo is the idempotency-key port (implemented by
-// repository.IdempotencyRepository).
+// IdemRepo is the idempotency-key port (implemented by *idempotency.Repository
+// from the shared pkg). The claimed subject is the payment id.
 type IdemRepo interface {
-	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*domain.IdempotencyKey, bool, error)
-	Checkpoint(ctx context.Context, id int64, paymentID *int64) error
+	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error)
+	Checkpoint(ctx context.Context, id int64, subjectID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
 	Reap(ctx context.Context, ttl time.Duration) (int64, error)
@@ -76,6 +78,20 @@ type IntentResult struct {
 	Replayed bool
 }
 
+// mapClaimErr translates the shared idempotency package's sentinels into the
+// payment domain's, so the web layer keeps one stable error vocabulary and a
+// future pkg rename can never silently leak into HTTP status codes.
+func mapClaimErr(err error) error {
+	switch {
+	case errors.Is(err, idempotency.ErrConflict):
+		return domain.ErrKeyConflict
+	case errors.Is(err, idempotency.ErrLocked):
+		return domain.ErrKeyLocked
+	default:
+		return err
+	}
+}
+
 // hashJSON canonicalizes a request struct (marshal → sha256 → hex) for
 // same-key-different-body idempotency detection.
 func hashJSON(v any) string {
@@ -95,15 +111,15 @@ func hashJSON(v any) string {
 func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateIntentInput) (*IntentResult, error) {
 	key, proceed, err := s.idem.Claim(ctx, in.UserID, idemKey, "POST", "/payment/v1/private/payments", hashJSON(in))
 	if err != nil {
-		return nil, err
+		return nil, mapClaimErr(err)
 	}
 	if !proceed {
 		return replayResult(key)
 	}
 
 	// Checkpoint 1: ensure the payment row exists (re-entry reuses it).
-	if key.PaymentID != nil {
-		pay, err := s.payments.FindByID(ctx, *key.PaymentID, 0)
+	if key.SubjectID != nil {
+		pay, err := s.payments.FindByID(ctx, *key.SubjectID, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -136,7 +152,7 @@ func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateInt
 // amount mismatch is a real conflict (createErr, → 409). A payment already
 // past pending was charged on the first attempt, so it finishes idempotently
 // by its current state and NEVER charges again.
-func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *domain.IdempotencyKey, in CreateIntentInput, createErr error) (*IntentResult, error) {
+func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *idempotency.Record, in CreateIntentInput, createErr error) (*IntentResult, error) {
 	existing, findErr := s.payments.FindByOrderID(ctx, *in.OrderID)
 	if findErr != nil || existing.UserID != in.UserID || existing.AmountMinor != in.AmountMinor {
 		return nil, createErr
@@ -156,7 +172,7 @@ func (s *Service) adoptExistingOrderPayment(ctx context.Context, key *domain.Ide
 
 // driveCharge runs the provider call and applies the resulting state
 // transitions for a pending payment, caching the outcome on the key.
-func (s *Service) driveCharge(ctx context.Context, key *domain.IdempotencyKey, in CreateIntentInput, pay *domain.Payment) (*IntentResult, error) {
+func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in CreateIntentInput, pay *domain.Payment) (*IntentResult, error) {
 	// Provider call — outside any transaction; the shared idempotency key
 	// makes a re-driven call replay instead of double-charging.
 	charge, chErr := s.prov.Charge(ctx, provider.ChargeRequest{
@@ -234,7 +250,7 @@ func (s *Service) finishIntent(ctx context.Context, keyID int64, code int, payme
 	return &IntentResult{Code: code, Payment: pay}, nil
 }
 
-func replayResult(key *domain.IdempotencyKey) (*IntentResult, error) {
+func replayResult(key *idempotency.Record) (*IntentResult, error) {
 	var pay domain.Payment
 	if err := json.Unmarshal(key.ResponseBody, &pay); err != nil {
 		return nil, fmt.Errorf("corrupt idempotency cache: %w", err)
@@ -337,7 +353,7 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	key, proceed, err := s.idem.Claim(ctx, userID, idemKey, "POST",
 		fmt.Sprintf("/payment/v1/internal/payments/%d/refunds", paymentID), hashJSON(in))
 	if err != nil {
-		return nil, false, err
+		return nil, false, mapClaimErr(err)
 	}
 	if !proceed {
 		var ref domain.Refund
