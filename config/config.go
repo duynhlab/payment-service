@@ -43,6 +43,7 @@ type Config struct {
 	Metrics         MetricsConfig   // Prometheus metrics
 	Database        DatabaseConfig  // PostgreSQL database configuration
 	Payment         PaymentConfig   // Payment domain settings (auth holds, idempotency, provider)
+	GRPC            GRPCConfig      // Internal gRPC server (east-west: order-fulfillment saga)
 	ShutdownTimeout int             // Graceful shutdown timeout in seconds - from SHUTDOWN_TIMEOUT env (default: 10)
 	// ReadinessDrainDelay: delay after failing readiness before shutting down the HTTP server.
 	// This gives Kubernetes/Service routing time to stop sending new traffic.
@@ -62,6 +63,12 @@ type PaymentConfig struct {
 	ProviderURL             string        // Mock payment provider base URL - from MOCKPAY_URL env (P1 uses the in-memory stub when empty)
 	WebhookSecret           string        // Shared HMAC secret for mockpay webhook signatures - from MOCKPAY_WEBHOOK_SECRET env
 	WebhookURL              string        // Where mockpay POSTs signed webhooks - from MOCKPAY_WEBHOOK_URL env (empty = mockpay emits nothing)
+}
+
+// GRPCConfig defines the internal gRPC server (east-west only). gRPC is the
+// official transport for the order-fulfillment saga's Authorize/Capture/Void/Refund.
+type GRPCConfig struct {
+	Port string // GRPC_PORT (default "9090")
 }
 
 // ServiceConfig defines basic service configuration
@@ -179,6 +186,7 @@ func Load() *Config {
 			WebhookSecret:           getEnv("MOCKPAY_WEBHOOK_SECRET", ""),
 			WebhookURL:              getEnv("MOCKPAY_WEBHOOK_URL", ""),
 		},
+		GRPC:                GRPCConfig{Port: getEnv("GRPC_PORT", "9090")},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),
 		ReadinessDrainDelay: getEnvDurationSecondsWithMax("READINESS_DRAIN_DELAY", 5, 30),
 		JWKSURL:             getEnv("AUTH_JWKS_URL", "http://auth.auth.svc.cluster.local:8080/auth/v1/public/jwks"),

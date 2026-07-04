@@ -402,6 +402,12 @@ func (s *Service) Get(ctx context.Context, id, userID int64) (*domain.Payment, e
 	return s.payments.FindByID(ctx, id, userID)
 }
 
+// GetByOrderID returns the payment attached to an order — the saga's lookup key
+// for capture/void/refund (which it knows by order, not payment id).
+func (s *Service) GetByOrderID(ctx context.Context, orderID int64) (*domain.Payment, error) {
+	return s.payments.FindByOrderID(ctx, orderID)
+}
+
 // List returns a page of the user's payments and the total count.
 func (s *Service) List(ctx context.Context, userID int64, page, pageSize int) ([]domain.Payment, int, error) {
 	return s.payments.ListByUser(ctx, userID, pageSize, (page-1)*pageSize)

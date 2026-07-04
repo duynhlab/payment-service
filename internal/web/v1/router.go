@@ -8,7 +8,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
@@ -163,14 +162,14 @@ func (r *createPaymentRequest) toInput(userID int64) (logicv1.CreateIntentInput,
 	if r.AmountMinor <= 0 {
 		return in, "amount_minor must be a positive integer (minor units)"
 	}
-	if r.AmountMinor > maxAmountMinor {
+	if r.AmountMinor > logicv1.MaxAmountMinor {
 		return in, "amount_minor exceeds the maximum accepted amount"
 	}
 	currency := r.Currency
 	if currency == "" {
 		currency = "USD"
 	}
-	if !isCurrency(currency) {
+	if !logicv1.IsCurrency(currency) {
 		return in, "currency must be a 3-letter uppercase code (e.g. USD)"
 	}
 	capture := domain.CaptureMethod(r.CaptureMethod)
@@ -180,7 +179,7 @@ func (r *createPaymentRequest) toInput(userID int64) (logicv1.CreateIntentInput,
 	if capture != domain.CaptureManual && capture != domain.CaptureAutomatic {
 		return in, `capture_method must be "manual" or "automatic"`
 	}
-	if !isTestToken(r.PaymentMethod) {
+	if !logicv1.IsTestToken(r.PaymentMethod) {
 		return in, `payment_method must be an opaque "tok_" token (letters/digits/_, max 64 chars, no card-number-like digit runs)`
 	}
 	return logicv1.CreateIntentInput{
@@ -193,54 +192,8 @@ func (r *createPaymentRequest) toInput(userID int64) (logicv1.CreateIntentInput,
 	}, ""
 }
 
-// maxAmountMinor caps a single payment at $100M (in minor units) — a sanity
-// ceiling that keeps absurd values out of the ledger, metrics, and the
-// bigint refund arithmetic. Reject rather than clamp.
-const (
-	maxAmountMinor    int64 = 100_000_000_00 // $100M ceiling per payment (minor units)
-	logFieldPaymentID       = "payment_id"
-)
-
-// isCurrency reports whether s is exactly three uppercase ASCII letters.
-func isCurrency(s string) bool {
-	if len(s) != 3 {
-		return false
-	}
-	for _, r := range s {
-		if r < 'A' || r > 'Z' {
-			return false
-		}
-	}
-	return true
-}
-
-// isTestToken enforces PCI discipline on payment_method: a short opaque token
-// (`tok_` + [A-Za-z0-9_], ≤ 64 chars) with no card-number-like digit run.
-// Real payment tokens are short IDs; a pasted PAN must never be accepted,
-// stored, or echoed.
-func isTestToken(s string) bool {
-	if !strings.HasPrefix(s, "tok_") || len(s) > 64 {
-		return false
-	}
-	// Count TOTAL digits, not the longest contiguous run: separators like `_`
-	// must not let a grouped PAN ("tok_4111_1111_1111_1111") slip through.
-	// Real opaque tokens are short alnum IDs, not digit-dense.
-	digits := 0
-	for _, r := range s {
-		switch {
-		case r >= '0' && r <= '9':
-			digits++
-			if digits >= 12 { // a card number is 13–19 digits
-				return false
-			}
-		case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_':
-			// allowed
-		default:
-			return false
-		}
-	}
-	return true
-}
+// logFieldPaymentID is the structured-log key for a payment id.
+const logFieldPaymentID = "payment_id"
 
 // CreatePayment handles POST /payment/v1/private/payments — the idempotent
 // authorize (and optionally capture) flow. 201 on success, 422 with the
@@ -368,7 +321,7 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Invalid request body")
 		return
 	}
-	if req.AmountMinor <= 0 || req.AmountMinor > maxAmountMinor {
+	if req.AmountMinor <= 0 || req.AmountMinor > logicv1.MaxAmountMinor {
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation,
 			"amount_minor must be a positive integer within the accepted range (minor units)")
 		return
