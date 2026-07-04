@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"go.uber.org/zap"
@@ -15,9 +16,27 @@ import (
 	"github.com/duynhlab/payment-service/internal/mockpay"
 )
 
+// recordingEmitter captures the events the server emits (synchronously).
+type recordingEmitter struct {
+	mu     sync.Mutex
+	events []provider.WebhookEvent
+}
+
+func (r *recordingEmitter) Emit(ev provider.WebhookEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, ev)
+}
+
+func (r *recordingEmitter) snapshot() []provider.WebhookEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]provider.WebhookEvent(nil), r.events...)
+}
+
 func newServer(t *testing.T) string {
 	t.Helper()
-	ts := httptest.NewServer(mockpay.New(zap.NewNop()).Handler())
+	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
 	t.Cleanup(ts.Close)
 	return ts.URL
 }
@@ -153,6 +172,41 @@ func TestServer_VoidIsIdempotent(t *testing.T) {
 	}
 	if st, _ := post(t, base+"/charges/mp_nope/void", nil); st != http.StatusNotFound {
 		t.Fatalf("unknown void status %d", st)
+	}
+}
+
+func TestServer_EmitsWebhooks(t *testing.T) {
+	em := &recordingEmitter{}
+	ts := httptest.NewServer(mockpay.New(zap.NewNop(), em).Handler())
+	t.Cleanup(ts.Close)
+
+	// auto-capture → charge.captured
+	st, body := post(t, ts.URL+"/charges", provider.ChargeRequest{IdempotencyKey: "e1", AmountMinor: 5000, Currency: "USD", AutoCapture: true})
+	if st != http.StatusOK {
+		t.Fatalf("charge status %d", st)
+	}
+	id := decodeCharge(t, body).ProviderPaymentID
+
+	// manual charge → charge.authorized
+	post(t, ts.URL+"/charges", provider.ChargeRequest{IdempotencyKey: "e2", AmountMinor: 6000, Currency: "USD"})
+	// refund the captured one → refund.succeeded
+	post(t, ts.URL+"/refunds", provider.RefundRequest{ProviderPaymentID: id, AmountMinor: 1000, IdempotencyKey: "er"})
+
+	events := em.snapshot()
+	if len(events) != 3 {
+		t.Fatalf("want 3 emitted events, got %d", len(events))
+	}
+	types := map[string]bool{}
+	for _, e := range events {
+		types[e.Type] = true
+		if e.EventID == "" {
+			t.Fatal("every emitted event needs an event_id")
+		}
+	}
+	for _, want := range []string{"charge.captured", "charge.authorized", "refund.succeeded"} {
+		if !types[want] {
+			t.Fatalf("missing emitted type %q (got %v)", want, types)
+		}
 	}
 }
 

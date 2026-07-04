@@ -61,6 +61,7 @@ type PaymentConfig struct {
 	IdempotencyLockTakeover time.Duration // Age after which an in-progress idempotency lock may be taken over - from IDEMPOTENCY_LOCK_TAKEOVER env (default: 90s)
 	ProviderURL             string        // Mock payment provider base URL - from MOCKPAY_URL env (P1 uses the in-memory stub when empty)
 	WebhookSecret           string        // Shared HMAC secret for mockpay webhook signatures - from MOCKPAY_WEBHOOK_SECRET env
+	WebhookURL              string        // Where mockpay POSTs signed webhooks - from MOCKPAY_WEBHOOK_URL env (empty = mockpay emits nothing)
 }
 
 // ServiceConfig defines basic service configuration
@@ -176,6 +177,7 @@ func Load() *Config {
 			IdempotencyLockTakeover: getEnvDuration("IDEMPOTENCY_LOCK_TAKEOVER", 90*time.Second),
 			ProviderURL:             getEnv("MOCKPAY_URL", ""),
 			WebhookSecret:           getEnv("MOCKPAY_WEBHOOK_SECRET", ""),
+			WebhookURL:              getEnv("MOCKPAY_WEBHOOK_URL", ""),
 		},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),
 		ReadinessDrainDelay: getEnvDurationSecondsWithMax("READINESS_DRAIN_DELAY", 5, 30),

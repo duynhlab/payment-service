@@ -18,7 +18,7 @@ import (
 // server behaviour end to end (no Docker).
 func newClient(t *testing.T) *provider.HTTPClient {
 	t.Helper()
-	ts := httptest.NewServer(mockpay.New(zap.NewNop()).Handler())
+	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
 	t.Cleanup(ts.Close)
 	return provider.NewHTTPClient(ts.URL)
 }
@@ -167,7 +167,7 @@ func TestHTTPClient_VoidIsIdempotent(t *testing.T) {
 // error so the caller treats it as transient and re-drives (safe via per-key
 // replay) rather than as a decline.
 func TestHTTPClient_TransportErrorIsRetryable(t *testing.T) {
-	ts := httptest.NewServer(mockpay.New(zap.NewNop()).Handler())
+	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
 	ts.Close() // nothing is listening now
 	c := provider.NewHTTPClient(ts.URL)
 
