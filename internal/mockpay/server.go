@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strconv"
 	"sync"
 
 	"go.uber.org/zap"
@@ -40,6 +42,8 @@ type Server struct {
 	byKey         map[string]provider.Charge // charge idempotency replay
 	captured      map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
 	voided        map[string]bool            // voided ids — makes void idempotent under retry
+	refunded      map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
+	amounts       map[string]int64           // provider_payment_id -> amount (for GET /transactions)
 	refundsByKey  map[string]string          // refund idempotency key -> provider_refund_id
 	transientSeen map[string]bool            // charge keys that already hit the transient trigger once
 }
@@ -52,6 +56,8 @@ func New(logger *zap.Logger, emitter Emitter) *Server {
 		byKey:         map[string]provider.Charge{},
 		captured:      map[string]bool{},
 		voided:        map[string]bool{},
+		refunded:      map[string]bool{},
+		amounts:       map[string]int64{},
 		refundsByKey:  map[string]string{},
 		transientSeen: map[string]bool{},
 	}
@@ -79,8 +85,84 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /charges/{id}/capture", s.handleCapture)
 	mux.HandleFunc("POST /charges/{id}/void", s.handleVoid)
 	mux.HandleFunc("POST /refunds", s.handleRefund)
+	mux.HandleFunc("GET /transactions", s.handleTransactions)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	return mux
+}
+
+// transactionStatus derives a charge's provider-side status from the state maps.
+// Precedence: refunded and voided are terminal over the capture flag; the caller
+// holds s.mu.
+func (s *Server) transactionStatus(id string) string {
+	switch {
+	case s.voided[id]:
+		return provider.TxnVoided
+	case s.refunded[id]:
+		return provider.TxnRefunded
+	case s.captured[id]:
+		return provider.TxnCaptured
+	default:
+		return provider.TxnAuthorized
+	}
+}
+
+// handleTransactions serves the paged provider ledger the reconciliation job
+// pages through. Transactions are ordered **lexically** by provider_payment_id —
+// a stable total order so a paged sweep sees every row exactly once (it is not
+// chronological: `mp_10` sorts before `mp_2`). Defaults: page 1, page_size 50
+// (capped at 200).
+func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
+	const maxPage = 1_000_000 // a mock; this many pages is far beyond any test
+	page := atoiDefault(r.URL.Query().Get("page"), 1, 1, maxPage)
+	pageSize := atoiDefault(r.URL.Query().Get("page_size"), 50, 1, 200)
+
+	s.mu.Lock()
+	txns := make([]provider.Transaction, 0, len(s.amounts))
+	for id, amt := range s.amounts {
+		txns = append(txns, provider.Transaction{
+			ProviderPaymentID: id,
+			AmountMinor:       amt,
+			Status:            s.transactionStatus(id),
+		})
+	}
+	s.mu.Unlock()
+
+	sort.Slice(txns, func(i, j int) bool { return txns[i].ProviderPaymentID < txns[j].ProviderPaymentID })
+
+	total := len(txns)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	writeJSON(w, http.StatusOK, provider.TransactionsPage{
+		Transactions: txns[start:end],
+		Page:         page,
+		PageSize:     pageSize,
+		Total:        total,
+	})
+}
+
+// atoiDefault parses s as an int, clamping to [lo, hi]; returns def when empty
+// or unparseable.
+func atoiDefault(s string, def, lo, hi int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	if n < lo {
+		return lo
+	}
+	if n > hi {
+		return hi
+	}
+	return n
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -134,6 +216,7 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 		s.byKey[req.IdempotencyKey] = c
 	}
 	s.captured[c.ProviderPaymentID] = req.AutoCapture
+	s.amounts[c.ProviderPaymentID] = req.AmountMinor
 	s.logger.Info("charge", zap.String("id", c.ProviderPaymentID),
 		zap.Int64("amount_minor", req.AmountMinor), zap.Bool("captured", c.Captured))
 	eventType := "charge.authorized"
@@ -202,6 +285,7 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	if req.IdempotencyKey != "" {
 		s.refundsByKey[req.IdempotencyKey] = refundID
 	}
+	s.refunded[req.ProviderPaymentID] = true
 	s.logger.Info("refund", zap.String("id", refundID),
 		zap.String("charge", req.ProviderPaymentID), zap.Int64("amount_minor", req.AmountMinor))
 	s.emit("refund.succeeded", req.ProviderPaymentID, req.AmountMinor)

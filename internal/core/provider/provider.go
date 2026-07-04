@@ -67,6 +67,32 @@ type ErrorResponse struct {
 	Code  string `json:"code,omitempty"`
 }
 
+// Transaction status values reported by GET /transactions — the provider's view
+// of a charge, which reconciliation compares against the internal payment state.
+const (
+	TxnAuthorized = "authorized"
+	TxnCaptured   = "captured"
+	TxnVoided     = "voided"
+	TxnRefunded   = "refunded"
+)
+
+// Transaction is the provider's record of one charge, matched during
+// reconciliation by ProviderPaymentID (the shared identifier).
+type Transaction struct {
+	ProviderPaymentID string `json:"provider_payment_id"`
+	AmountMinor       int64  `json:"amount_minor"`
+	Status            string `json:"status"`
+}
+
+// TransactionsPage is the paged GET /transactions response — the reconciliation
+// job's food source.
+type TransactionsPage struct {
+	Transactions []Transaction `json:"transactions"`
+	Page         int           `json:"page"`
+	PageSize     int           `json:"page_size"`
+	Total        int           `json:"total"`
+}
+
 // WebhookEvent is the signed body mockpay emits and the payment receiver parses.
 // EventID is the dedup key (delivery is at-least-once); Type names the movement.
 type WebhookEvent struct {
