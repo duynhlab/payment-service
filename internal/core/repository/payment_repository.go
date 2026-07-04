@@ -178,6 +178,9 @@ func (r *PaymentRepository) CaptureWithLedger(ctx context.Context, id int64, cap
 	if err := postLedger(ctx, tx, ledgerCapture, id, providerRef, captureEntries(amount)); err != nil {
 		return err
 	}
+	if err := enqueueOutbox(ctx, tx, domain.EventPaymentCaptured, paymentEventPayload(id, amount)); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -206,6 +209,9 @@ func (r *PaymentRepository) ReverseCapture(ctx context.Context, id int64) error 
 		return fmt.Errorf("reverse capture: %w", err)
 	}
 	if err := postLedger(ctx, tx, ledgerReversal, id, providerRef, reverseCaptureEntries(amount)); err != nil {
+		return err
+	}
+	if err := enqueueOutbox(ctx, tx, domain.EventCaptureReversed, paymentEventPayload(id, amount)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -329,6 +335,9 @@ func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, st
 		// as the settle — it rides the pending->succeeded CAS above, so a
 		// re-settle finds no pending row and never double-posts.
 		if err := postLedger(ctx, tx, ledgerRefund, paymentID, providerRefundID, reverseCaptureEntries(amount)); err != nil {
+			return err
+		}
+		if err := enqueueOutbox(ctx, tx, domain.EventPaymentRefunded, paymentEventPayload(paymentID, amount)); err != nil {
 			return err
 		}
 		// Flip captured -> refunded only when succeeded refunds reach 100%.
