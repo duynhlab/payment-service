@@ -129,6 +129,12 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, selectProvider(cfg, logger), cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
+	// Inbound webhook receiver (public route; HMAC-verified in the handler).
+	webhookHandler := v1.NewWebhookHandler(
+		logicv1.NewWebhookProcessor(repository.NewWebhookRepository(pool)),
+		cfg.Payment.WebhookSecret,
+	)
+
 	// Outbox relay: drains events written in the money-movement transactions and
 	// delivers them to the P2 log sink.
 	outboxRelay := logicv1.NewOutboxRelay(repository.NewOutboxRepository(pool), outboxLogPublisher{logger: logger})
@@ -150,7 +156,7 @@ func run() error {
 	}
 
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, logger, verifier, paymentHandler, &isShuttingDown)
+	srv := setupServer(cfg, logger, verifier, paymentHandler, webhookHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
 	return nil
 }
@@ -332,7 +338,7 @@ func initProfiling(cfg *config.Config, logger *zap.Logger) func() {
 	}
 }
 
-func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, paymentHandler *v1.Handler, isShuttingDown *atomic.Bool) *http.Server {
+func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, paymentHandler *v1.Handler, webhookHandler *v1.WebhookHandler, isShuttingDown *atomic.Bool) *http.Server {
 	r := gin.Default()
 
 	r.Use(middleware.TracingMiddleware())
@@ -354,6 +360,8 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 	// Payment v1 routes — private (JWT required) + internal (cluster-only,
 	// NetworkPolicy is the fence). Variant A edge naming.
 	v1.RegisterRoutes(r, paymentHandler, verifier)
+	// Public webhook route — no JWT; the HMAC signature is the credential.
+	v1.RegisterWebhookRoutes(r, webhookHandler)
 
 	return &http.Server{
 		Addr:              ":" + cfg.Service.Port,

@@ -60,6 +60,7 @@ type PaymentConfig struct {
 	IdempotencyKeyTTL       time.Duration // Retention window for stored idempotency keys - from IDEMPOTENCY_KEY_TTL env (default: 24h)
 	IdempotencyLockTakeover time.Duration // Age after which an in-progress idempotency lock may be taken over - from IDEMPOTENCY_LOCK_TAKEOVER env (default: 90s)
 	ProviderURL             string        // Mock payment provider base URL - from MOCKPAY_URL env (P1 uses the in-memory stub when empty)
+	WebhookSecret           string        // Shared HMAC secret for mockpay webhook signatures - from MOCKPAY_WEBHOOK_SECRET env
 }
 
 // ServiceConfig defines basic service configuration
@@ -174,6 +175,7 @@ func Load() *Config {
 			IdempotencyKeyTTL:       getEnvDuration("IDEMPOTENCY_KEY_TTL", 24*time.Hour),
 			IdempotencyLockTakeover: getEnvDuration("IDEMPOTENCY_LOCK_TAKEOVER", 90*time.Second),
 			ProviderURL:             getEnv("MOCKPAY_URL", ""),
+			WebhookSecret:           getEnv("MOCKPAY_WEBHOOK_SECRET", ""),
 		},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),
 		ReadinessDrainDelay: getEnvDurationSecondsWithMax("READINESS_DRAIN_DELAY", 5, 30),
@@ -300,6 +302,11 @@ func (c *Config) validatePayment() []string {
 	}
 	if c.Payment.IdempotencyLockTakeover <= 0 {
 		errs = append(errs, "IDEMPOTENCY_LOCK_TAKEOVER must be a positive duration (e.g., '90s')")
+	}
+	// The public webhook route is always mounted and the HMAC secret is its only
+	// credential — an empty secret is fail-open, so require it unconditionally.
+	if c.Payment.WebhookSecret == "" {
+		errs = append(errs, "MOCKPAY_WEBHOOK_SECRET is required (public webhook receiver credential)")
 	}
 	return errs
 }

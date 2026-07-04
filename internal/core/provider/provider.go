@@ -67,6 +67,15 @@ type ErrorResponse struct {
 	Code  string `json:"code,omitempty"`
 }
 
+// WebhookEvent is the signed body mockpay emits and the payment receiver parses.
+// EventID is the dedup key (delivery is at-least-once); Type names the movement.
+type WebhookEvent struct {
+	EventID           string `json:"event_id"`
+	Type              string `json:"type"`
+	ProviderPaymentID string `json:"provider_payment_id"`
+	AmountMinor       int64  `json:"amount_minor"`
+}
+
 // Outcome classifies an amount against the deterministic magic-amount triggers.
 type Outcome int
 
