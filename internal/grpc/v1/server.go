@@ -1,9 +1,10 @@
 // Package v1 implements the gRPC transport for payment, version 1. It is a thin
 // adapter over the logic layer (mirroring internal/web/v1) so the gRPC and HTTP
 // paths share the same business logic. It serves the money operations the
-// order-fulfillment saga calls: Authorize (pre-pivot hold), Capture (pre-confirm),
-// and Void/Refund (compensations). Every RPC is keyed by order_id — the saga's
-// natural business key — and idempotent.
+// order-fulfillment saga calls — Authorize (pre-pivot hold), Capture
+// (pre-confirm), Void/Refund (compensations) — plus the GetPayment read the
+// order service uses for details enrichment. Every RPC is keyed by order_id —
+// the saga's natural business key — and the money operations are idempotent.
 package v1
 
 import (
@@ -132,6 +133,17 @@ func (s *Server) Refund(ctx context.Context, req *paymentv1.RefundRequest) (*pay
 	return &paymentv1.RefundResponse{Refund: mapRefund(ref)}, nil
 }
 
+// GetPayment returns the order's payment snapshot (read-only). Owner-scoping is
+// the caller's job — this internal surface carries no end-user identity (the
+// order service owner-scopes the order before asking; NetworkPolicy is the fence).
+func (s *Server) GetPayment(ctx context.Context, req *paymentv1.GetPaymentRequest) (*paymentv1.GetPaymentResponse, error) {
+	pay, err := s.lookup(ctx, req.GetOrderId())
+	if err != nil {
+		return nil, err
+	}
+	return &paymentv1.GetPaymentResponse{Payment: mapPayment(pay)}, nil
+}
+
 // lookup resolves an order_id to its payment, validating the id first.
 func (s *Server) lookup(ctx context.Context, orderID int64) (*domain.Payment, error) {
 	if orderID <= 0 {
@@ -150,12 +162,13 @@ func mapPayment(p *domain.Payment) *paymentv1.Payment {
 		orderID = *p.OrderID
 	}
 	return &paymentv1.Payment{
-		PaymentId:   p.ID,
-		OrderId:     orderID,
-		Status:      string(p.Status),
-		AmountMinor: p.AmountMinor,
-		Currency:    p.Currency,
-		DeclineCode: p.DeclineCode,
+		PaymentId:     p.ID,
+		OrderId:       orderID,
+		Status:        string(p.Status),
+		AmountMinor:   p.AmountMinor,
+		Currency:      p.Currency,
+		DeclineCode:   p.DeclineCode,
+		RefundedMinor: p.RefundedMinor,
 	}
 }
 

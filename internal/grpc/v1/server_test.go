@@ -36,13 +36,15 @@ type fakeLogic struct {
 	// captured call args, to lock the sagaUserID=0 + looked-up-paymentID wiring
 	gotCapPayID, gotCapUserID       int64
 	gotRefundPayID, gotRefundUserID int64
+	gotByOrderID                    int64
 }
 
 func (f *fakeLogic) CreateIntent(_ context.Context, idemKey string, in logicv1.CreateIntentInput) (*logicv1.IntentResult, error) {
 	f.gotIdemKey, f.gotInput = idemKey, in
 	return f.intent, f.intentErr
 }
-func (f *fakeLogic) GetByOrderID(_ context.Context, _ int64) (*domain.Payment, error) {
+func (f *fakeLogic) GetByOrderID(_ context.Context, orderID int64) (*domain.Payment, error) {
+	f.gotByOrderID = orderID
 	return f.byOrder, f.byOrderErr
 }
 func (f *fakeLogic) Capture(_ context.Context, paymentID, userID int64) (*domain.Payment, error) {
@@ -230,6 +232,38 @@ func TestRefund(t *testing.T) {
 			if _, err := NewServer(&fakeLogic{}).Refund(context.Background(), &paymentv1.RefundRequest{OrderId: 42, AmountMinor: amt}); status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("want InvalidArgument for amount %d, got %v", amt, status.Code(err))
 			}
+		}
+	})
+}
+
+func TestGetPayment(t *testing.T) {
+	oid := int64(42)
+	t.Run("ok", func(t *testing.T) {
+		f := &fakeLogic{byOrder: &domain.Payment{ID: 9, OrderID: &oid, Status: domain.StatusCaptured, AmountMinor: 2550, Currency: "USD", RefundedMinor: 500}}
+		resp, err := NewServer(f).GetPayment(context.Background(), &paymentv1.GetPaymentRequest{OrderId: 42})
+		if err != nil {
+			t.Fatalf("get payment: %v", err)
+		}
+		if f.gotByOrderID != 42 {
+			t.Fatalf("must forward order_id 42, got %d", f.gotByOrderID)
+		}
+		p := resp.GetPayment()
+		if p.GetPaymentId() != 9 || p.GetOrderId() != 42 || p.GetStatus() != "captured" || p.GetAmountMinor() != 2550 {
+			t.Fatalf("bad payment %+v", p)
+		}
+		if p.GetCurrency() != "USD" || p.GetRefundedMinor() != 500 {
+			t.Fatalf("currency/refunded = %q/%d, want USD/500 (partial refund must be derivable)", p.GetCurrency(), p.GetRefundedMinor())
+		}
+	})
+	t.Run("no payment → NotFound", func(t *testing.T) {
+		f := &fakeLogic{byOrderErr: domain.ErrNotFound}
+		if _, err := NewServer(f).GetPayment(context.Background(), &paymentv1.GetPaymentRequest{OrderId: 42}); status.Code(err) != codes.NotFound {
+			t.Fatalf("want NotFound, got %v", status.Code(err))
+		}
+	})
+	t.Run("bad order_id → InvalidArgument", func(t *testing.T) {
+		if _, err := NewServer(&fakeLogic{}).GetPayment(context.Background(), &paymentv1.GetPaymentRequest{OrderId: 0}); status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("want InvalidArgument, got %v", status.Code(err))
 		}
 	})
 }
