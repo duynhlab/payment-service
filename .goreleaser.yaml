@@ -1,0 +1,60 @@
+# GoReleaser config — builds the payment-service release binary on `v*` tags.
+# Standard supply-chain layout: tar.gz + combined checksums.txt + cosign keyless
+# signature. Version comes from the git tag (+ ldflags -X main.version).
+version: 2
+
+project_name: payment-service
+
+builds:
+  - id: payment-service
+    main: ./cmd
+    binary: bin/payment-service # keep the bin/ prefix inside the archive
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    # -> payment-service-<version>-linux-amd64.tar.gz (containing bin/payment-service)
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  # Single combined checksum file covering all artifacts (standard layout).
+  name_template: "checksums.txt"
+
+# Keyless cosign signature over checksums.txt (covers every artifact via the
+# checksum). cosign is installed by gha-workflows/goreleaser.yml; the job grants
+# id-token: write for OIDC. cosign v3 uses the Sigstore bundle format (sig + cert
+# + Rekor proof in one file) — the old --output-signature/--output-certificate
+# flags are deprecated/ignored. Verify:
+#   cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+#     --certificate-identity-regexp '.../goreleaser.yml@.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    output: true
+    signature: "${artifact}.sigstore.json" # bundle file goreleaser uploads
+    args:
+      - sign-blob
+      - "--yes"
+      - "--bundle=${signature}"
+      - "${artifact}"
+
+changelog:
+  use: github
+  format: "{{ .SHA }}: {{ .Message }}{{ if .Logins }} ({{ range $i, $l := .Logins }}{{ if $i }}, {{ end }}@{{ $l }}{{ end }}){{ end }}"
+
+release:
+  # owner/repo auto-detected from the git remote.
+  # Survive re-cut tags: overwrite existing assets/notes instead of failing.
+  replace_existing_artifacts: true
+  mode: replace
