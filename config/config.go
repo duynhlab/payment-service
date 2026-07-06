@@ -63,6 +63,7 @@ type PaymentConfig struct {
 	ProviderURL             string        // Mock payment provider base URL - from MOCKPAY_URL env (P1 uses the in-memory stub when empty)
 	WebhookSecret           string        // Shared HMAC secret for mockpay webhook signatures - from MOCKPAY_WEBHOOK_SECRET env
 	WebhookURL              string        // Where mockpay POSTs signed webhooks - from MOCKPAY_WEBHOOK_URL env (empty = mockpay emits nothing)
+	ReconHealEnabled        bool          // Enable reconciliation auto-heal (ADR-012) - from RECON_HEAL_ENABLED env (default false = detect-only)
 }
 
 // GRPCConfig defines the internal gRPC server (east-west only). gRPC is the
@@ -185,6 +186,7 @@ func Load() *Config {
 			ProviderURL:             getEnv("MOCKPAY_URL", ""),
 			WebhookSecret:           getEnv("MOCKPAY_WEBHOOK_SECRET", ""),
 			WebhookURL:              getEnv("MOCKPAY_WEBHOOK_URL", ""),
+			ReconHealEnabled:        getEnvBool("RECON_HEAL_ENABLED", false),
 		},
 		GRPC:                GRPCConfig{Port: getEnv("GRPC_PORT", "9090")},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),

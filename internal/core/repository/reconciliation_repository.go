@@ -34,7 +34,7 @@ func NewReconciliationRepository(pool *pgxpool.Pool) *ReconciliationRepository {
 // relay documents its single-writer assumption.
 func (r *ReconciliationRepository) ListReconcilable(ctx context.Context) ([]domain.ReconRow, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT p.provider_payment_id, p.amount_minor, p.status,
+		SELECT p.id, p.provider_payment_id, p.amount_minor, p.status,
 		       COALESCE((SELECT SUM(rf.amount_minor) FROM refunds rf
 		                 WHERE rf.payment_id = p.id AND rf.status IN ('pending', 'succeeded')), 0) AS refunded_minor
 		FROM payments p
@@ -48,7 +48,7 @@ func (r *ReconciliationRepository) ListReconcilable(ctx context.Context) ([]doma
 	for rows.Next() {
 		var row domain.ReconRow
 		var status string
-		if err := rows.Scan(&row.ProviderPaymentID, &row.AmountMinor, &status, &row.RefundedMinor); err != nil {
+		if err := rows.Scan(&row.ID, &row.ProviderPaymentID, &row.AmountMinor, &status, &row.RefundedMinor); err != nil {
 			return nil, fmt.Errorf("scan reconcilable payment: %w", err)
 		}
 		row.Status = domain.Status(status)
@@ -91,6 +91,21 @@ func (r *ReconciliationRepository) SaveDiscrepancies(ctx context.Context, runID 
 	return tx.Commit(ctx)
 }
 
+// MarkResolved records what a heal pass did about one discrepancy, keyed by
+// (run_id, provider_payment_id) — a run holds at most one discrepancy per charge.
+// resolved_at is stamped only for a heal action (healed/failed/skipped), leaving
+// the detect-only 'detected' rows without a resolution timestamp.
+func (r *ReconciliationRepository) MarkResolved(ctx context.Context, runID int64, providerPaymentID string, res domain.Resolution) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE reconciliation_discrepancies
+		SET resolution = $3, resolved_at = now()
+		WHERE run_id = $1 AND provider_payment_id = $2`,
+		runID, providerPaymentID, string(res)); err != nil {
+		return fmt.Errorf("mark discrepancy resolved: %w", err)
+	}
+	return nil
+}
+
 // GetRun returns one reconciliation run, or domain.ErrNotFound.
 func (r *ReconciliationRepository) GetRun(ctx context.Context, id int64) (*domain.ReconRun, error) {
 	var run domain.ReconRun
@@ -115,7 +130,7 @@ func (r *ReconciliationRepository) GetRun(ctx context.Context, id int64) (*domai
 func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID int64, limit, offset int) ([]domain.Discrepancy, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT provider_payment_id, class, internal_amount_minor, provider_amount_minor,
-		       internal_status, provider_status, detail
+		       internal_status, provider_status, detail, resolution, resolved_at
 		FROM reconciliation_discrepancies WHERE run_id = $1 ORDER BY id
 		LIMIT $2 OFFSET $3`, runID, limit, offset)
 	if err != nil {
@@ -126,12 +141,13 @@ func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID 
 	out := []domain.Discrepancy{}
 	for rows.Next() {
 		var d domain.Discrepancy
-		var class string
+		var class, resolution string
 		if err := rows.Scan(&d.ProviderPaymentID, &class, &d.InternalAmount, &d.ProviderAmount,
-			&d.InternalStatus, &d.ProviderStatus, &d.Detail); err != nil {
+			&d.InternalStatus, &d.ProviderStatus, &d.Detail, &resolution, &d.ResolvedAt); err != nil {
 			return nil, fmt.Errorf("scan discrepancy: %w", err)
 		}
 		d.Class = domain.DiscrepancyClass(class)
+		d.Resolution = domain.Resolution(resolution)
 		out = append(out, d)
 	}
 	return out, rows.Err()

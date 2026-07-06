@@ -63,15 +63,18 @@ func TestClassify(t *testing.T) {
 
 // fakeReconRepo records what the reconciler persists.
 type fakeReconRepo struct {
-	rows      []domain.ReconRow
-	runID     int64
-	saved     []domain.Discrepancy
-	finished  domain.ReconRunStatus
-	scanned   int
-	found     int
-	listErr   error
-	createErr error
-	saveErr   error
+	rows       []domain.ReconRow
+	runID      int64
+	saved      []domain.Discrepancy
+	finished   domain.ReconRunStatus
+	scanned    int
+	found      int
+	listErr    error
+	createErr  error
+	saveErr    error
+	resolveErr error
+
+	resolved map[string]domain.Resolution // provider_payment_id → recorded resolution
 
 	finishErrOnce bool // fail the first FinishRun (e.g. a cancelled caller ctx)
 	finishCalls   int
@@ -84,6 +87,13 @@ func (f *fakeReconRepo) CreateRun(context.Context) (int64, error) { return f.run
 func (f *fakeReconRepo) SaveDiscrepancies(_ context.Context, _ int64, ds []domain.Discrepancy) error {
 	f.saved = ds
 	return f.saveErr
+}
+func (f *fakeReconRepo) MarkResolved(_ context.Context, _ int64, providerPaymentID string, res domain.Resolution) error {
+	if f.resolved == nil {
+		f.resolved = map[string]domain.Resolution{}
+	}
+	f.resolved[providerPaymentID] = res
+	return f.resolveErr
 }
 func (f *fakeReconRepo) FinishRun(_ context.Context, _ int64, scanned, found int, status domain.ReconRunStatus) error {
 	f.finishCalls++
