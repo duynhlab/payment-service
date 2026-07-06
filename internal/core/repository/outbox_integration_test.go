@@ -9,6 +9,7 @@ package repository
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,33 +89,74 @@ func TestOutbox_Integration(t *testing.T) {
 		}
 	})
 
-	t.Run("fetch is FIFO and mark removes from unpublished", func(t *testing.T) {
-		before, err := outbox.FetchUnpublished(ctx, 1000)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(before) == 0 {
-			t.Fatal("expected unpublished events from prior subtests")
-		}
-		// FIFO by id.
-		for i := 1; i < len(before); i++ {
-			if before[i].ID <= before[i-1].ID {
-				t.Fatalf("events not FIFO: %d after %d", before[i].ID, before[i-1].ID)
+	t.Run("claim delivers FIFO and marks published", func(t *testing.T) {
+		var claimed int
+		n, err := outbox.ClaimUnpublished(ctx, 1000, func(events []domain.OutboxEvent) []int64 {
+			if len(events) == 0 {
+				t.Fatal("expected unpublished events from prior subtests")
 			}
-		}
-		ids := make([]int64, len(before))
-		for i, e := range before {
-			ids[i] = e.ID
-		}
-		if err := outbox.MarkPublished(ctx, ids); err != nil {
-			t.Fatal(err)
-		}
-		after, err := outbox.FetchUnpublished(ctx, 1000)
+			ids := make([]int64, 0, len(events))
+			for i, e := range events {
+				if i > 0 && e.ID <= events[i-1].ID {
+					t.Errorf("events not FIFO: %d after %d", e.ID, events[i-1].ID)
+				}
+				ids = append(ids, e.ID)
+			}
+			claimed = len(ids)
+			return ids
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(after) != 0 {
-			t.Fatalf("all events marked published, still see %d unpublished", len(after))
+		if int(n) != claimed || claimed == 0 {
+			t.Fatalf("claim marked %d, delivered %d", n, claimed)
+		}
+		// A second claim finds nothing unpublished.
+		n2, err := outbox.ClaimUnpublished(ctx, 1000, func(e []domain.OutboxEvent) []int64 {
+			ids := make([]int64, len(e))
+			for i, ev := range e {
+				ids[i] = ev.ID
+			}
+			return ids
+		})
+		if err != nil || n2 != 0 {
+			t.Fatalf("all marked published, second claim n=%d err=%v", n2, err)
+		}
+	})
+
+	t.Run("concurrent claims never double-deliver", func(t *testing.T) {
+		// Seed fresh unpublished events (prior subtest published everything).
+		for i := 0; i < 6; i++ {
+			authorizeCaptured(t, repo, int64(1000+i))
+		}
+		var mu sync.Mutex
+		seen := map[int64]int{}
+		claim := func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			_, _ = outbox.ClaimUnpublished(ctx, 100, func(events []domain.OutboxEvent) []int64 {
+				ids := make([]int64, 0, len(events))
+				mu.Lock()
+				for _, e := range events {
+					seen[e.ID]++
+					ids = append(ids, e.ID)
+				}
+				mu.Unlock()
+				time.Sleep(50 * time.Millisecond) // widen the overlap while the tx holds row locks
+				return ids
+			})
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go claim(&wg)
+		go claim(&wg)
+		wg.Wait()
+		if len(seen) != 6 {
+			t.Fatalf("all 6 events must be claimed exactly once across both relays, saw %d", len(seen))
+		}
+		for id, c := range seen {
+			if c != 1 {
+				t.Fatalf("event %d claimed by %d relays — the claim is not exclusive", id, c)
+			}
 		}
 	})
 

@@ -26,28 +26,28 @@ func newFakeOutbox(ids ...int64) *fakeOutbox {
 	return f
 }
 
-func (f *fakeOutbox) FetchUnpublished(_ context.Context, limit int) ([]domain.OutboxEvent, error) {
-	var out []domain.OutboxEvent
+func (f *fakeOutbox) ClaimUnpublished(_ context.Context, limit int, deliver func([]domain.OutboxEvent) []int64) (int64, error) {
+	var batch []domain.OutboxEvent
 	for _, e := range f.events {
 		if f.published[e.ID] {
 			continue
 		}
-		if len(out) == limit {
+		if len(batch) == limit {
 			break
 		}
-		out = append(out, e)
+		batch = append(batch, e)
 	}
-	return out, nil
-}
-
-func (f *fakeOutbox) MarkPublished(_ context.Context, ids []int64) error {
+	if len(batch) == 0 {
+		return 0, nil
+	}
+	delivered := deliver(batch)
 	if f.markErr != nil {
-		return f.markErr
+		return 0, f.markErr // simulate a mark/commit failure: nothing is recorded
 	}
-	for _, id := range ids {
+	for _, id := range delivered {
 		f.published[id] = true
 	}
-	return nil
+	return int64(len(delivered)), nil
 }
 
 func (f *fakeOutbox) ReapPublished(_ context.Context, ttl time.Duration) (int64, error) {
