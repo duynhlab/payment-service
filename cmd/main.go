@@ -143,7 +143,7 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
-	reconciler, reconHandler, reconRepo := buildReconciliation(prov, pool)
+	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
 	// A bind failure is fatal: the pod must not report healthy on HTTP while its
@@ -269,13 +269,23 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 // nil) and defeat the handler's disabled check.
 // Returns the repo too, so the background reaper can prune old runs even when
 // reconciliation itself is disabled (nil reconciler).
-func buildReconciliation(prov provider.Provider, pool *pgxpool.Pool) (*logicv1.Reconciler, *v1.ReconciliationHandler, *repository.ReconciliationRepository) {
+//
+// Auto-heal (ADR-012) is wired only when RECON_HEAL_ENABLED is set: the healer
+// converges the lost-capture-response window through the payment repo's
+// idempotent CaptureWithLedger — the provider is never called. Default off keeps
+// the detect-only behaviour of ADR-011.
+func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpool.Pool, capturer logicv1.LedgerCapturer, logger *zap.Logger) (*logicv1.Reconciler, *v1.ReconciliationHandler, *repository.ReconciliationRepository) {
 	reconRepo := repository.NewReconciliationRepository(pool)
 	ledger, ok := prov.(logicv1.ProviderLedger)
 	if !ok {
 		return nil, v1.NewReconciliationHandler(nil, reconRepo), reconRepo
 	}
-	reconciler := logicv1.NewReconciler(reconRepo, ledger)
+	opts := []logicv1.ReconcilerOption{logicv1.WithLogger(logger)}
+	if cfg.Payment.ReconHealEnabled {
+		opts = append(opts, logicv1.WithHealer(logicv1.NewCaptureHealer(capturer, time.Now)))
+		logger.Info("Reconciliation auto-heal enabled (RECON_HEAL_ENABLED)")
+	}
+	reconciler := logicv1.NewReconciler(reconRepo, ledger, opts...)
 	return reconciler, v1.NewReconciliationHandler(reconciler, reconRepo), reconRepo
 }
 

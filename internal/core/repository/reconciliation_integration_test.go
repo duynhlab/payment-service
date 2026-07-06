@@ -167,3 +167,108 @@ func TestReconciliation_Integration(t *testing.T) {
 		t.Errorf("in-progress run (no finished_at) must survive the reaper, GetRun = %v", err)
 	}
 }
+
+// TestReconciliationHeal_Integration exercises ADR-012 against a real Postgres:
+// a seeded crash-window drift (internal authorized / provider captured) converges
+// through the real capture path when a healer is wired, the row + ledger end
+// consistent, and a re-run is a no-op (the drift is gone).
+func TestReconciliationHeal_Integration(t *testing.T) {
+	pool := newTestDB(t)
+	ctx := context.Background()
+	reconRepo := NewReconciliationRepository(pool)
+	payRepo := NewPaymentRepository(pool)
+	ledgerRepo := NewLedgerRepository(pool)
+
+	// mp_heal: the lost-capture-response window — internal authorized while the
+	// provider already captured. mp_amt: a benign amount_mismatch heal must skip.
+	var healID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO payments (user_id, amount_minor, payment_method, status, provider_payment_id)
+		 VALUES (1, 1000, 'tok_visa', 'authorized', 'mp_heal') RETURNING id`).Scan(&healID); err != nil {
+		t.Fatalf("seed authorized payment: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO payments (user_id, amount_minor, payment_method, status, provider_payment_id)
+		 VALUES (1, 2000, 'tok_visa', 'captured', 'mp_amt')`); err != nil {
+		t.Fatalf("seed captured payment: %v", err)
+	}
+
+	ledger := &fakeLedger{pages: []*provider.TransactionsPage{{
+		Total: 2,
+		Transactions: []provider.Transaction{
+			{ProviderPaymentID: "mp_heal", AmountMinor: 1000, Status: provider.TxnCaptured},
+			{ProviderPaymentID: "mp_amt", AmountMinor: 2001, Status: provider.TxnCaptured}, // amount drift
+		},
+	}}}
+
+	healer := logicv1.NewCaptureHealer(payRepo, time.Now)
+	runID, found, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).Run(ctx, 100)
+	if err != nil {
+		t.Fatalf("run with heal: %v", err)
+	}
+	if found != 2 {
+		t.Fatalf("found = %d, want 2 (status_mismatch + amount_mismatch)", found)
+	}
+
+	// The crash-window payment converged: healed + timestamped; the amount drift
+	// was left for a human (skipped).
+	res := map[string]string{}
+	var healedAt *time.Time
+	rows, err := pool.Query(ctx,
+		`SELECT provider_payment_id, resolution, resolved_at FROM reconciliation_discrepancies WHERE run_id = $1`, runID)
+	if err != nil {
+		t.Fatalf("query resolutions: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pid, resolution string
+		var at *time.Time
+		if err := rows.Scan(&pid, &resolution, &at); err != nil {
+			t.Fatalf("scan resolution: %v", err)
+		}
+		res[pid] = resolution
+		if pid == "mp_heal" {
+			healedAt = at
+		}
+	}
+	if res["mp_heal"] != "healed" || res["mp_amt"] != "skipped" {
+		t.Fatalf("resolutions = %v, want mp_heal=healed mp_amt=skipped", res)
+	}
+	if healedAt == nil {
+		t.Fatal("healed discrepancy must have resolved_at stamped")
+	}
+
+	// The payment row converged to captured and the ledger is balanced.
+	got, err := payRepo.FindByID(ctx, healID, 0)
+	if err != nil {
+		t.Fatalf("find healed payment: %v", err)
+	}
+	if got.Status != domain.StatusCaptured {
+		t.Fatalf("healed payment status = %q, want captured", got.Status)
+	}
+	if n, _ := ledgerRepo.Imbalance(ctx); n != 0 {
+		t.Fatalf("ledger imbalance after heal: %d, want 0", n)
+	}
+
+	// Idempotent: with mp_heal now captured, the drift is gone — a re-run finds
+	// only the amount drift and never re-captures (no double posting).
+	_, found2, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).Run(ctx, 100)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if found2 != 1 {
+		t.Fatalf("second run found = %d, want 1 (only the amount drift remains)", found2)
+	}
+	if n, _ := ledgerRepo.Imbalance(ctx); n != 0 {
+		t.Fatalf("ledger imbalance after re-run: %d, want 0", n)
+	}
+	var captureTxns int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ledger_transactions WHERE payment_id = $1 AND kind = 'capture'`, healID).
+		Scan(&captureTxns); err != nil {
+		t.Fatalf("count capture txns: %v", err)
+	}
+	if captureTxns != 1 {
+		t.Fatalf("heal must post exactly one capture txn, got %d", captureTxns)
+	}
+}

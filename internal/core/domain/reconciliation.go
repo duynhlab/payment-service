@@ -45,11 +45,33 @@ const (
 	ReconRunFailed    ReconRunStatus = "failed"
 )
 
+// Resolution is what a run did about a discrepancy (ADR-012). Detect-only runs
+// leave every discrepancy Detected; a heal pass moves the one healable class to
+// Healed or Failed and records Skipped for the rest.
+type Resolution string
+
+const (
+	// ResolutionDetected: found and recorded, not acted on. The default, and the
+	// only value when RECON_HEAL_ENABLED is off.
+	ResolutionDetected Resolution = "detected"
+	// ResolutionHealed: the lost-capture-response window (internal authorized /
+	// provider captured) converged via the idempotent capture path.
+	ResolutionHealed Resolution = "healed"
+	// ResolutionSkipped: heal ran but this discrepancy is not the healable class.
+	ResolutionSkipped Resolution = "skipped"
+	// ResolutionFailed: heal attempted convergence and the capture path errored
+	// (logged, alertable).
+	ResolutionFailed Resolution = "failed"
+)
+
 // ReconRow is the internal projection of a payment that reconciliation compares
 // against the provider ledger. Only payments that already have a
 // provider_payment_id participate (an unauthorized payment has no provider record
 // to reconcile against yet).
 type ReconRow struct {
+	// ID is the internal payments.id — carried so a heal pass can converge the
+	// row through the CAS capture path (ADR-012). Zero for detect-only use.
+	ID                int64
 	ProviderPaymentID string
 	AmountMinor       int64
 	// RefundedMinor is the sum of applied refunds. It distinguishes a benign
@@ -83,4 +105,8 @@ type Discrepancy struct {
 	InternalStatus    string           `json:"internal_status"`       // "" when the internal side is absent
 	ProviderStatus    string           `json:"provider_status"`       // "" when the provider side is absent
 	Detail            string           `json:"detail"`                // human-readable summary for the report
+	// Resolution is what the run did about this discrepancy (ADR-012). Set at
+	// insert to detected; a heal pass updates it. ResolvedAt stamps a heal action.
+	Resolution Resolution `json:"resolution"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
