@@ -43,6 +43,12 @@ const (
 	fieldDiscrepancies = "discrepancies"
 )
 
+// Discrepancy report paging bounds.
+const (
+	defaultDiscrepancyLimit = 100
+	maxDiscrepancyLimit     = 500
+)
+
 // ReconRunner triggers one reconciliation pass. *logicv1.Reconciler satisfies
 // it. The handler holds a nil runner when reconciliation is disabled (the
 // in-process provider stub has no ledger to reconcile against).
@@ -54,7 +60,7 @@ type ReconRunner interface {
 // *repository.ReconciliationRepository satisfies it.
 type reconReader interface {
 	GetRun(ctx context.Context, id int64) (*domain.ReconRun, error)
-	ListDiscrepancies(ctx context.Context, runID int64) ([]domain.Discrepancy, error)
+	ListDiscrepancies(ctx context.Context, runID int64, limit, offset int) ([]domain.Discrepancy, error)
 }
 
 // ReconciliationHandler serves the internal reconciliation API: trigger a run,
@@ -148,7 +154,8 @@ func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 		return
 	}
 
-	discrepancies, err := h.reader.ListDiscrepancies(ctx, id)
+	limit, offset := discrepancyPage(c)
+	discrepancies, err := h.reader.ListDiscrepancies(ctx, id, limit, offset)
 	if err != nil {
 		span.RecordError(err)
 		log.Error("Discrepancy list failed", zap.Int64(fieldRunID, id), zap.Error(err))
@@ -156,5 +163,28 @@ func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{fieldRun: run, fieldDiscrepancies: discrepancies})
+	// The run row carries the full count (discrepancies_found), so the page
+	// reports total without a second COUNT query.
+	c.JSON(http.StatusOK, gin.H{
+		fieldRun:           run,
+		fieldDiscrepancies: discrepancies,
+		"pagination":       gin.H{"limit": limit, "offset": offset, "total": run.DiscrepanciesFound},
+	})
+}
+
+// discrepancyPage reads the limit/offset query params for the discrepancy report,
+// applying defaults and caps: limit defaults to defaultDiscrepancyLimit, is
+// clamped to [1, maxDiscrepancyLimit]; offset defaults to 0 and floors at 0.
+func discrepancyPage(c *gin.Context) (limit, offset int) {
+	limit = defaultDiscrepancyLimit
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if limit > maxDiscrepancyLimit {
+		limit = maxDiscrepancyLimit
+	}
+	if v, err := strconv.Atoi(c.Query("offset")); err == nil && v > 0 {
+		offset = v
+	}
+	return limit, offset
 }

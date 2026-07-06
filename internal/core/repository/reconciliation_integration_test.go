@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
@@ -110,16 +111,59 @@ func TestReconciliation_Integration(t *testing.T) {
 	if run.Status != "completed" || run.DiscrepanciesFound != 4 || run.FinishedAt == nil {
 		t.Fatalf("GetRun = %+v, want completed/4/finished", run)
 	}
-	ds, err := repo.ListDiscrepancies(ctx, runID)
+	ds, err := repo.ListDiscrepancies(ctx, runID, 100, 0)
 	if err != nil {
 		t.Fatalf("ListDiscrepancies: %v", err)
 	}
 	if len(ds) != 4 {
 		t.Fatalf("ListDiscrepancies len = %d, want 4", len(ds))
 	}
+	// Pagination: a limit returns a page in id order; offset skips.
+	page1, err := repo.ListDiscrepancies(ctx, runID, 2, 0)
+	if err != nil || len(page1) != 2 {
+		t.Fatalf("page1 = (%d, %v), want 2 rows", len(page1), err)
+	}
+	page2, err := repo.ListDiscrepancies(ctx, runID, 2, 2)
+	if err != nil || len(page2) != 2 {
+		t.Fatalf("page2 = (%d, %v), want 2 rows", len(page2), err)
+	}
+	if page1[0].ProviderPaymentID == page2[0].ProviderPaymentID {
+		t.Fatalf("offset did not advance the page: %q repeated", page1[0].ProviderPaymentID)
+	}
+
 	// The not-found contract is what the handler's 404 depends on: a missing row
 	// must surface as domain.ErrNotFound, not a raw pgx error (which would 500).
 	if _, err := repo.GetRun(ctx, runID+999); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("GetRun(unknown) = %v, want domain.ErrNotFound", err)
+	}
+
+	// An in-progress run (no finished_at) must survive the reaper — the safety
+	// invariant that stops the reaper deleting a live run mid-pass.
+	runningID, err := repo.CreateRun(ctx)
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// Reaper: ttl=0 removes finished runs (discrepancies cascade); a long ttl
+	// keeps a just-finished run.
+	kept, err := repo.ReapRuns(ctx, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("ReapRuns(24h): %v", err)
+	}
+	if kept != 0 {
+		t.Fatalf("24h retention must keep the fresh run, reaped %d", kept)
+	}
+	removed, err := repo.ReapRuns(ctx, 0)
+	if err != nil || removed == 0 {
+		t.Fatalf("ReapRuns(0) = (%d, %v), want >=1 removed", removed, err)
+	}
+	if _, err := repo.GetRun(ctx, runID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("finished run must be gone after reap, GetRun = %v", err)
+	}
+	if gone, _ := repo.ListDiscrepancies(ctx, runID, 100, 0); len(gone) != 0 {
+		t.Errorf("discrepancies must cascade-delete with the run, still see %d", len(gone))
+	}
+	if _, err := repo.GetRun(ctx, runningID); err != nil {
+		t.Errorf("in-progress run (no finished_at) must survive the reaper, GetRun = %v", err)
 	}
 }

@@ -56,6 +56,9 @@ const (
 	// Published events are pruned after this window; the durable audit trail is
 	// the ledger, so the outbox only needs a short replay buffer.
 	outboxPublishedRetention = 7 * 24 * time.Hour
+	// Reconciliation runs are pruned after this window (discrepancies cascade);
+	// they are operational history, not the source of truth.
+	reconRunRetention = 30 * 24 * time.Hour
 )
 
 // outboxLogPublisher is the P2 delivery sink: it logs each event. A real broker
@@ -140,7 +143,7 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL)
 	paymentHandler := v1.NewHandler(paymentService)
 
-	reconciler, reconHandler := buildReconciliation(prov, pool)
+	reconciler, reconHandler, reconRepo := buildReconciliation(prov, pool)
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
 	// A bind failure is fatal: the pod must not report healthy on HTTP while its
@@ -165,7 +168,7 @@ func run() error {
 	jobsWG.Add(1)
 	go func() {
 		defer jobsWG.Done()
-		runBackgroundJobs(jobsCtx, paymentService, outboxRelay, reconciler, cfg, logger)
+		runBackgroundJobs(jobsCtx, paymentService, outboxRelay, reconciler, reconRepo, cfg, logger)
 	}()
 
 	// Stop the background loops and wait for the in-flight tick to finish
@@ -189,7 +192,7 @@ func run() error {
 // window (hourly; the window itself is 24h, so cadence is not critical), and
 // relaying the transactional outbox (every 10s — event latency). The first two
 // are single-statement queries; the relay delivers to its sink.
-func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, recon *logicv1.Reconciler, cfg *config.Config, logger *zap.Logger) {
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, recon *logicv1.Reconciler, reconRepo *repository.ReconciliationRepository, cfg *config.Config, logger *zap.Logger) {
 	expiry := time.NewTicker(time.Minute)
 	reap := time.NewTicker(time.Hour)
 	outbox := time.NewTicker(outboxRelayInterval)
@@ -226,6 +229,9 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 			runJob(ctx, "Reap published outbox events", logger, func(jctx context.Context) (int64, error) {
 				return relay.ReapPublished(jctx, outboxPublishedRetention)
 			})
+			runJob(ctx, "Reap old reconciliation runs", logger, func(jctx context.Context) (int64, error) {
+				return reconRepo.ReapRuns(jctx, reconRunRetention)
+			})
 		case <-outbox.C:
 			runJob(ctx, "Relay outbox events", logger, func(jctx context.Context) (int64, error) {
 				return relay.Relay(jctx, outboxRelayBatch)
@@ -261,14 +267,16 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 // The handler's runner stays a nil interface when reconciliation is disabled —
 // assigning a nil *Reconciler directly would make the interface non-nil (typed
 // nil) and defeat the handler's disabled check.
-func buildReconciliation(prov provider.Provider, pool *pgxpool.Pool) (*logicv1.Reconciler, *v1.ReconciliationHandler) {
+// Returns the repo too, so the background reaper can prune old runs even when
+// reconciliation itself is disabled (nil reconciler).
+func buildReconciliation(prov provider.Provider, pool *pgxpool.Pool) (*logicv1.Reconciler, *v1.ReconciliationHandler, *repository.ReconciliationRepository) {
 	reconRepo := repository.NewReconciliationRepository(pool)
 	ledger, ok := prov.(logicv1.ProviderLedger)
 	if !ok {
-		return nil, v1.NewReconciliationHandler(nil, reconRepo)
+		return nil, v1.NewReconciliationHandler(nil, reconRepo), reconRepo
 	}
 	reconciler := logicv1.NewReconciler(reconRepo, ledger)
-	return reconciler, v1.NewReconciliationHandler(reconciler, reconRepo)
+	return reconciler, v1.NewReconciliationHandler(reconciler, reconRepo), reconRepo
 }
 
 func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
