@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -108,12 +109,15 @@ func (r *ReconciliationRepository) GetRun(ctx context.Context, id int64) (*domai
 	return &run, nil
 }
 
-// ListDiscrepancies returns a run's discrepancies in insertion order.
-func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID int64) ([]domain.Discrepancy, error) {
+// ListDiscrepancies returns a page of a run's discrepancies in insertion order
+// (limit/offset). A run's full count is available on the run row
+// (discrepancies_found), so callers page against that total.
+func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID int64, limit, offset int) ([]domain.Discrepancy, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT provider_payment_id, class, internal_amount_minor, provider_amount_minor,
 		       internal_status, provider_status, detail
-		FROM reconciliation_discrepancies WHERE run_id = $1 ORDER BY id`, runID)
+		FROM reconciliation_discrepancies WHERE run_id = $1 ORDER BY id
+		LIMIT $2 OFFSET $3`, runID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list discrepancies for run %d: %w", runID, err)
 	}
@@ -131,6 +135,20 @@ func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID 
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ReapRuns deletes reconciliation runs finished before the cutoff (ttl ago),
+// bounding table growth; discrepancies cascade-delete via their run FK. Only
+// finished runs are removed, so a run still in progress is never reaped. Returns
+// the number of runs removed. Mirrors the outbox reaper.
+func (r *ReconciliationRepository) ReapRuns(ctx context.Context, ttl time.Duration) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`DELETE FROM reconciliation_runs WHERE finished_at IS NOT NULL AND finished_at < $1`,
+		time.Now().Add(-ttl))
+	if err != nil {
+		return 0, fmt.Errorf("reap reconciliation runs: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // FinishRun closes a run with its terminal status and counts.

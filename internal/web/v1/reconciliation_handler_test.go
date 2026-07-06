@@ -24,16 +24,18 @@ type fakeRunner struct {
 func (f *fakeRunner) Run(context.Context, int) (int64, int, error) { return f.runID, f.found, f.err }
 
 type fakeReconReader struct {
-	run     *domain.ReconRun
-	runErr  error
-	ds      []domain.Discrepancy
-	listErr error
+	run                 *domain.ReconRun
+	runErr              error
+	ds                  []domain.Discrepancy
+	listErr             error
+	gotLimit, gotOffset int
 }
 
 func (f *fakeReconReader) GetRun(context.Context, int64) (*domain.ReconRun, error) {
 	return f.run, f.runErr
 }
-func (f *fakeReconReader) ListDiscrepancies(context.Context, int64) ([]domain.Discrepancy, error) {
+func (f *fakeReconReader) ListDiscrepancies(_ context.Context, _ int64, limit, offset int) ([]domain.Discrepancy, error) {
+	f.gotLimit, f.gotOffset = limit, offset
 	return f.ds, f.listErr
 }
 
@@ -143,6 +145,36 @@ func TestGetRun_OK(t *testing.T) {
 	// The report must expose minor-unit amounts under explicit field names.
 	if body.Discrepancies[0].InternalAmount != 2000 || body.Discrepancies[0].ProviderAmount != 2001 {
 		t.Fatalf("amounts = %+v", body.Discrepancies[0])
+	}
+}
+
+func TestGetRun_Pagination(t *testing.T) {
+	reader := &fakeReconReader{run: completedRun(7, 250)}
+	// Explicit page: limit forwarded, offset forwarded, total from the run row.
+	rec := doRecon(newReconRouter(nil, reader), http.MethodGet,
+		"/payment/v1/internal/reconciliation/runs/7?limit=50&offset=100")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+	if reader.gotLimit != 50 || reader.gotOffset != 100 {
+		t.Fatalf("reader got limit=%d offset=%d, want 50/100", reader.gotLimit, reader.gotOffset)
+	}
+	var body struct {
+		Pagination struct{ Limit, Offset, Total int } `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Pagination.Limit != 50 || body.Pagination.Offset != 100 || body.Pagination.Total != 250 {
+		t.Fatalf("pagination = %+v, want 50/100/250", body.Pagination)
+	}
+
+	// Over-cap limit is clamped; a bad/absent offset defaults to 0.
+	reader2 := &fakeReconReader{run: completedRun(7, 1)}
+	doRecon(newReconRouter(nil, reader2), http.MethodGet,
+		"/payment/v1/internal/reconciliation/runs/7?limit=9999&offset=-3")
+	if reader2.gotLimit != maxDiscrepancyLimit || reader2.gotOffset != 0 {
+		t.Fatalf("clamp: got limit=%d offset=%d, want %d/0", reader2.gotLimit, reader2.gotOffset, maxDiscrepancyLimit)
 	}
 }
 
