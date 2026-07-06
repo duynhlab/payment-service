@@ -48,54 +48,63 @@ func NewOutboxRepository(pool *pgxpool.Pool) *OutboxRepository {
 	return &OutboxRepository{pool: pool}
 }
 
-// FetchUnpublished returns up to limit unpublished events ordered by id
-// (best-effort FIFO: id is insert-order, not commit-order, so a lower id that
-// commits later is simply picked up on a later tick — never skipped, because
-// liveness keys on published_at IS NULL rather than a high-water mark).
+// ClaimUnpublished selects up to limit unpublished events ordered by id, locking
+// them `FOR UPDATE SKIP LOCKED` inside a transaction, hands them to deliver, marks
+// the ids deliver returns as published, and commits — all in the same tx, so the
+// row lock is held across delivery. Another relay instance (or replica) skips the
+// locked rows, so the relay is safe to run on more than one replica.
 //
-// Single-writer assumption: there is no row claim (FOR UPDATE SKIP LOCKED) or
-// leader gate, so running the relay on multiple replicas would deliver each
-// event once per replica. That is harmless for the P2 log sink (duplicate log
-// lines) but MUST be fenced — claim rows or elect a leader — before a real
-// broker sink ships or the service scales past one replica. Downstream
-// consumers must dedupe on the event id regardless (delivery is at-least-once).
-func (r *OutboxRepository) FetchUnpublished(ctx context.Context, limit int) ([]domain.OutboxEvent, error) {
-	rows, err := r.pool.Query(ctx, `
+// deliver returns the prefix of ids it actually delivered; a delivery failure
+// stops the batch and the delivered prefix is still committed (at-least-once —
+// downstream consumers dedupe on the event id). Returns the number marked
+// published. (id is insert-order, not commit-order — a lower id that commits
+// later is simply claimed on a later tick, never skipped, because liveness keys
+// on published_at IS NULL.)
+func (r *OutboxRepository) ClaimUnpublished(ctx context.Context, limit int, deliver func([]domain.OutboxEvent) []int64) (int64, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin outbox claim: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+
+	rows, err := tx.Query(ctx, `
 		SELECT id, event_type, payload, created_at
 		FROM payment_outbox
 		WHERE published_at IS NULL
 		ORDER BY id
-		LIMIT $1`, limit)
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("fetch outbox: %w", err)
+		return 0, fmt.Errorf("claim outbox: %w", err)
 	}
-	defer rows.Close()
-
 	var events []domain.OutboxEvent
 	for rows.Next() {
 		var e domain.OutboxEvent
-		if err := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan outbox: %w", err)
+		if scanErr := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.CreatedAt); scanErr != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan outbox: %w", scanErr)
 		}
 		events = append(events, e)
 	}
+	rows.Close() // must close before running Exec on the same tx
 	if rows.Err() != nil {
-		return nil, fmt.Errorf("fetch outbox: %w", rows.Err())
+		return 0, fmt.Errorf("claim outbox: %w", rows.Err())
 	}
-	return events, nil
-}
+	if len(events) == 0 {
+		return 0, nil
+	}
 
-// MarkPublished stamps published_at on the given events. Called after delivery,
-// so a crash before it leaves the events for redelivery (at-least-once).
-func (r *OutboxRepository) MarkPublished(ctx context.Context, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
+	delivered := deliver(events)
+	if len(delivered) > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE payment_outbox SET published_at = now() WHERE id = ANY($1)`, delivered); err != nil {
+			return 0, fmt.Errorf("mark outbox published: %w", err)
+		}
 	}
-	if _, err := r.pool.Exec(ctx,
-		`UPDATE payment_outbox SET published_at = now() WHERE id = ANY($1)`, ids); err != nil {
-		return fmt.Errorf("mark outbox published: %w", err)
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit outbox claim: %w", err)
 	}
-	return nil
+	return int64(len(delivered)), nil
 }
 
 // ReapPublished deletes published events older than ttl, bounding table growth
