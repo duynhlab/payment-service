@@ -40,7 +40,6 @@ type Config struct {
 	Tracing         TracingConfig   // OpenTelemetry/Tempo configuration
 	Profiling       ProfilingConfig // Pyroscope continuous profiling
 	Logging         LoggingConfig   // Structured logging (Zap)
-	Metrics         MetricsConfig   // Prometheus metrics
 	Database        DatabaseConfig  // PostgreSQL database configuration
 	Payment         PaymentConfig   // Payment domain settings (auth holds, idempotency, provider)
 	GRPC            GRPCConfig      // Internal gRPC server (east-west: order-fulfillment saga)
@@ -102,12 +101,6 @@ type LoggingConfig struct {
 	Format string // Log format: json, console (default: "json") - from LOG_FORMAT env
 }
 
-// MetricsConfig defines Prometheus metrics configuration
-type MetricsConfig struct {
-	Enabled bool   // Enable metrics (default: true) - from METRICS_ENABLED env
-	Path    string // Metrics endpoint path (default: "/metrics") - from METRICS_PATH env
-}
-
 // DatabaseConfig defines PostgreSQL database configuration
 // All database connections use separate environment variables (not DATABASE_URL string)
 type DatabaseConfig struct {
@@ -161,10 +154,6 @@ func Load() *Config {
 		Logging: LoggingConfig{
 			Level:  getEnv("LOG_LEVEL", "info"),
 			Format: getEnv("LOG_FORMAT", "json"),
-		},
-		Metrics: MetricsConfig{
-			Enabled: getEnvBool("METRICS_ENABLED", true),
-			Path:    getEnv("METRICS_PATH", "/metrics"),
 		},
 		Database: DatabaseConfig{
 			Host:           getEnv("DB_HOST", ""),
