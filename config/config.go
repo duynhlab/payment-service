@@ -83,11 +83,10 @@ type ServiceConfig struct {
 // TracingConfig defines OpenTelemetry tracing configuration
 // Traces are sent to OpenTelemetry Collector for distributed tracing analysis
 type TracingConfig struct {
-	Enabled            bool    // Enable tracing (default: true) - from TRACING_ENABLED env
-	Endpoint           string  // OTel Collector endpoint - from OTEL_COLLECTOR_ENDPOINT env
-	SampleRate         float64 // Trace sampling rate (0.0-1.0) - from OTEL_SAMPLE_RATE env
-	ServiceName        string  // Service name for traces (defaults to ServiceConfig.Name)
-	MaxExportBatchSize int     // Max spans per batch (default: 512)
+	Enabled     bool    // Enable tracing (default: true) - from TRACING_ENABLED env
+	Endpoint    string  // OTel Collector endpoint - from OTEL_COLLECTOR_ENDPOINT env
+	SampleRate  float64 // Trace sampling rate (0.0-1.0) - from OTEL_SAMPLE_RATE env
+	ServiceName string  // Service name for traces (defaults to ServiceConfig.Name)
 }
 
 // ProfilingConfig defines Pyroscope continuous profiling configuration
@@ -149,11 +148,10 @@ func Load() *Config {
 			Env:     getEnv("ENV", "development"),
 		},
 		Tracing: TracingConfig{
-			Enabled:            getEnvBool("TRACING_ENABLED", true),
-			Endpoint:           getEnv("OTEL_COLLECTOR_ENDPOINT", "otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4318"),
-			SampleRate:         getEnvFloat("OTEL_SAMPLE_RATE", 0.1), // 10% default (production)
-			ServiceName:        getEnv("SERVICE_NAME", defaultServiceName),
-			MaxExportBatchSize: getEnvInt("OTEL_BATCH_SIZE", 512),
+			Enabled:     getEnvBool("TRACING_ENABLED", true),
+			Endpoint:    getEnv("OTEL_COLLECTOR_ENDPOINT", "otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4318"),
+			SampleRate:  getEnvFloat("OTEL_SAMPLE_RATE", 0.1), // 10% default (production)
+			ServiceName: getEnv("SERVICE_NAME", defaultServiceName),
 		},
 		Profiling: ProfilingConfig{
 			Enabled:     getEnvBool("PROFILING_ENABLED", true),
