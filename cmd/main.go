@@ -15,7 +15,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -111,15 +110,6 @@ func run() error {
 		zap.String("env", cfg.Service.Env),
 		zap.String(fieldPort, cfg.Service.Port),
 	)
-
-	// Initialize the OTel→Prometheus bridge FIRST (otelgrpc/otelgin metrics on
-	// the scraped /metrics endpoint — the flag-off status quo). When
-	// OTEL_METRICS_ENABLED=true, initObservability below installs the OTLP
-	// MeterProvider as the global AFTER this, deliberately superseding the
-	// bridge (RFC-0014 dual-emit: client_golang scrape stays untouched either
-	// way; only the OTel-instrumented metrics switch transport).
-	metricsShutdown := initMetrics(cfg, logger)
-	defer metricsShutdown()
 
 	tp := initObservability(logger)
 
@@ -388,30 +378,10 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 	logger.Info("mockpay shutdown complete")
 }
 
-// initMetrics installs the shared obsx OTel→Prometheus metrics bridge so any
-// OTel-instrumented client surfaces its RED metrics on the existing /metrics
-// endpoint. It returns a cleanup func (a no-op when metrics are disabled or
-// setup fails).
-func initMetrics(cfg *config.Config, logger *zap.Logger) func() {
-	if !cfg.Metrics.Enabled {
-		return func() { /* metrics disabled: no provider to shut down */ }
-	}
-	metricsShutdown, err := obsx.SetupMetrics()
-	if err != nil {
-		logger.Warn("Failed to set up metrics bridge", zap.Error(err))
-		return func() { /* setup failed: no provider to shut down */ }
-	}
-	logger.Info("Metrics bridge initialized")
-	return func() {
-		if err := metricsShutdown(context.Background()); err != nil {
-			logger.Error("Metrics provider shutdown error", zap.Error(err))
-		}
-	}
-}
-
 // initObservability is the single OTel wiring point (RFC-0014) — traces per
-// TRACING_ENABLED, OTLP metrics/logs behind OTEL_METRICS_ENABLED/
-// OTEL_LOGS_ENABLED (default off). The config is built once so the tracer
+// TRACING_ENABLED, OTLP metrics (the only pipeline since the P3 cutover;
+// OTEL_METRICS_ENABLED defaults on, =false is a kill switch), logs behind
+// OTEL_LOGS_ENABLED. The config is built once so the tracer
 // scope name and the startup log reflect the values obsx actually uses.
 // Returns the SDK shutdown handle (nil when setup failed).
 func initObservability(logger *zap.Logger) interface{ Shutdown(context.Context) error } {
@@ -457,7 +427,6 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 
 	r.Use(middleware.TracingMiddleware())
 	r.Use(middleware.LoggingMiddleware(logger))
-	r.Use(middleware.PrometheusMiddleware())
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{fieldStatus: "ok"})
@@ -469,7 +438,6 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 		}
 		c.JSON(http.StatusOK, gin.H{fieldStatus: "ok"})
 	})
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// Payment v1 routes — private (JWT required) + internal (cluster-only,
 	// NetworkPolicy is the fence). Variant A edge naming.
