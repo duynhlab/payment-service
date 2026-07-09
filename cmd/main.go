@@ -16,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -122,7 +121,7 @@ func run() error {
 	metricsShutdown := initMetrics(cfg, logger)
 	defer metricsShutdown()
 
-	tp := initObservability(cfg, logger)
+	tp := initObservability(logger)
 
 	profilingShutdown := initProfiling(cfg, logger)
 	defer profilingShutdown()
@@ -415,20 +414,13 @@ func initMetrics(cfg *config.Config, logger *zap.Logger) func() {
 // OTEL_LOGS_ENABLED (default off). The config is built once so the tracer
 // scope name and the startup log reflect the values obsx actually uses.
 // Returns the SDK shutdown handle (nil when setup failed).
-func initObservability(cfg *config.Config, logger *zap.Logger) interface{ Shutdown(context.Context) error } {
+func initObservability(logger *zap.Logger) interface{ Shutdown(context.Context) error } {
 	otelCfg := obsx.ConfigFromEnv()
 	middleware.SetServiceName(otelCfg.ServiceName)
 	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
 	if err != nil {
 		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
 		return nil
-	}
-	if obs.TracerProvider != nil && cfg.Profiling.Enabled {
-		// Preserve traces→profiles correlation: spans carry
-		// pyroscope.profile.id when the wrapped provider is global.
-		// (pkg v0.16.1 absorbs this wrap via Config.ProfilingEnabled —
-		// drop this block on the next pkg bump.)
-		otel.SetTracerProvider(obsx.TracerProviderWithProfiles(obs.TracerProvider))
 	}
 	logger.Info("OpenTelemetry initialized",
 		zap.Bool("traces", obs.TracerProvider != nil),
