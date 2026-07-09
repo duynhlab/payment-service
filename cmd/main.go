@@ -329,7 +329,7 @@ func startGRPC(cfg *config.Config, logger *zap.Logger, svc *logicv1.Service) (*g
 	if err != nil {
 		return nil, fmt.Errorf("listen gRPC :%s: %w", cfg.GRPC.Port, err)
 	}
-	grpcSrv, _ := grpcx.NewServer()
+	grpcSrv, _ := grpcx.NewServer(logger)
 	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcv1.NewServer(svc))
 	go func() {
 		logger.Info("Starting gRPC server", zap.String(fieldPort, cfg.GRPC.Port))
