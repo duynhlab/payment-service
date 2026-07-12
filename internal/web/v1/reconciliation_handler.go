@@ -35,7 +35,11 @@ const msgRunFailed = "Reconciliation run failed"
 // routes and to build the Location header from a constant. The header must
 // never be derived from the request URL: reflecting user-controlled input into
 // a response header is a header-injection sink.
-const reconRunsPath = "/payment/v1/internal/reconciliation/runs"
+const reconRunsPath = "/payment/v1/internal/payments/reconciliation/runs"
+
+// reconRunsPathDeprecated is the pre-v3 path, kept mounted as an alias for one
+// release during the rollout. Remove at contract; see homelab ADR-017.
+const reconRunsPathDeprecated = "/payment/v1/internal/reconciliation/runs"
 
 // Shared JSON/log field keys.
 const (
@@ -85,9 +89,12 @@ func NewReconciliationHandler(runner ReconRunner, reader reconReader) *Reconcili
 func RegisterReconciliationRoutes(r *gin.Engine, h *ReconciliationHandler) {
 	r.POST(reconRunsPath, h.TriggerRun)
 	r.GET(reconRunsPath+"/:id", h.GetRun)
+	// Deprecated aliases — same handlers on the pre-v3 path.
+	r.POST(reconRunsPathDeprecated, h.TriggerRun)
+	r.GET(reconRunsPathDeprecated+"/:id", h.GetRun)
 }
 
-// TriggerRun handles POST /payment/v1/internal/reconciliation/runs — runs one
+// TriggerRun handles POST /payment/v1/internal/payments/reconciliation/runs — runs one
 // reconciliation pass synchronously (a pass is seconds at this volume) and
 // returns the finished run resource, 201.
 func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
@@ -130,7 +137,7 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{fieldRun: run})
 }
 
-// GetRun handles GET /payment/v1/internal/reconciliation/runs/:id — the run
+// GetRun handles GET /payment/v1/internal/payments/reconciliation/runs/:id — the run
 // resource plus its full discrepancy report.
 func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 	ctx, span, log := beginRequest(c)

@@ -45,6 +45,10 @@ func NewWebhookHandler(processor webhookProcessor, secret string) *WebhookHandle
 // RegisterWebhookRoutes mounts the public webhook route. It carries no JWT — the
 // HMAC signature is the credential; Kong lets it through anonymously.
 func RegisterWebhookRoutes(r *gin.Engine, h *WebhookHandler) {
+	r.POST("/payment/v1/public/payments/webhooks/mockpay", h.HandleMockpay)
+	// Deprecated alias — pre-v3 path kept for one release during the rollout
+	// (the mockpay emitter's MOCKPAY_WEBHOOK_URL flips to the new path in the
+	// same release). Remove at contract; see homelab ADR-017.
 	r.POST("/payment/v1/public/webhooks/mockpay", h.HandleMockpay)
 }
 
