@@ -38,7 +38,7 @@ func newWebhookRouter(p webhookProcessor) *gin.Engine {
 
 // postWebhook signs body with sigTime (zero → now) and posts it.
 func postWebhook(r *gin.Engine, body string, sig string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/payment/v1/public/webhooks/mockpay", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/payment/v1/public/payments/webhooks/mockpay", strings.NewReader(body))
 	req.Header.Set("Mockpay-Signature", sig)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -149,5 +149,18 @@ func TestWebhook_ProcessorErrorIsRetryable(t *testing.T) {
 	rec := postWebhook(r, body, sig)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("infra error must be non-2xx (retryable), got %d", rec.Code)
+	}
+}
+
+// TestWebhook_DeprecatedAliasMounted locks the expand phase of the v3 path
+// migration (homelab ADR-017): the pre-v3 webhook path stays mounted until
+// the contract release removes it.
+func TestWebhook_DeprecatedAliasMounted(t *testing.T) {
+	r := newWebhookRouter(&fakeWebhookProcessor{result: logicv1.WebhookResult{Status: "processed"}})
+	req := httptest.NewRequest(http.MethodPost, "/payment/v1/public/webhooks/mockpay", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Errorf("deprecated webhook alias not mounted (got 404)")
 	}
 }

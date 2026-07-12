@@ -31,9 +31,9 @@ reproducible failure testing.
 | GET | `/payment/v1/private/payments/{id}` | private (JWT) | Fetch one payment (owner-only) |
 | GET | `/payment/v1/private/payments` | private (JWT) | Paginated payment history |
 | POST | `/payment/v1/internal/payments/{id}/refunds` | internal | Create a (partial) refund — `Idempotency-Key` required |
-| POST | `/payment/v1/public/webhooks/mockpay` | public | Provider webhook — the HMAC-signed body is the credential (`Mockpay-Signature: t=…,v1=…`, ±5 min tolerance, fail-closed on empty secret) |
-| POST | `/payment/v1/internal/reconciliation/runs` | internal | Trigger one reconciliation pass (single-flighted; 409 when one is running) |
-| GET | `/payment/v1/internal/reconciliation/runs/{id}` | internal | Reconciliation run report + discrepancies |
+| POST | `/payment/v1/public/payments/webhooks/mockpay` | public | Provider webhook — the HMAC-signed body is the credential (`Mockpay-Signature: t=…,v1=…`, ±5 min tolerance, fail-closed on empty secret) |
+| POST | `/payment/v1/internal/payments/reconciliation/runs` | internal | Trigger one reconciliation pass (single-flighted; 409 when one is running) |
+| GET | `/payment/v1/internal/payments/reconciliation/runs/{id}` | internal | Reconciliation run report + discrepancies |
 | GET | `/health`, `/ready`, `/metrics` | — | Probes + Prometheus metrics |
 
 Amounts are always **integer minor units** (`2000` = $20.00) with an ISO-4217

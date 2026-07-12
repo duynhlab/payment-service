@@ -59,11 +59,11 @@ func completedRun(id int64, found int) *domain.ReconRun {
 
 func TestTriggerRun_OK(t *testing.T) {
 	r := newReconRouter(&fakeRunner{runID: 9, found: 2}, &fakeReconReader{run: completedRun(9, 2)})
-	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs")
+	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (%s)", rec.Code, rec.Body)
 	}
-	if loc := rec.Header().Get("Location"); loc != "/payment/v1/internal/reconciliation/runs/9" {
+	if loc := rec.Header().Get("Location"); loc != "/payment/v1/internal/payments/reconciliation/runs/9" {
 		t.Fatalf("Location = %q, want .../runs/9", loc)
 	}
 	var body struct {
@@ -83,13 +83,13 @@ func TestTriggerRun_SingleFlightIs409(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	RegisterReconciliationRoutes(r, h)
-	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs")
+	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (%s)", rec.Code, rec.Body)
 	}
 	// The guard releases: once the in-flight pass finishes, triggers work again.
 	h.running.Store(false)
-	if rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs"); rec.Code != http.StatusCreated {
+	if rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs"); rec.Code != http.StatusCreated {
 		t.Fatalf("after release: status = %d, want 201 (%s)", rec.Code, rec.Body)
 	}
 }
@@ -97,7 +97,7 @@ func TestTriggerRun_SingleFlightIs409(t *testing.T) {
 func TestTriggerRun_DisabledIs503(t *testing.T) {
 	// nil runner = reconciliation disabled (in-process stub, no provider ledger).
 	r := newReconRouter(nil, &fakeReconReader{})
-	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs")
+	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
 	}
@@ -105,7 +105,7 @@ func TestTriggerRun_DisabledIs503(t *testing.T) {
 
 func TestTriggerRun_RunErrorIs500(t *testing.T) {
 	r := newReconRouter(&fakeRunner{err: errWebBoom}, &fakeReconReader{})
-	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs")
+	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (%s)", rec.Code, rec.Body)
 	}
@@ -113,7 +113,7 @@ func TestTriggerRun_RunErrorIs500(t *testing.T) {
 
 func TestTriggerRun_LookupErrorIs500(t *testing.T) {
 	r := newReconRouter(&fakeRunner{runID: 9}, &fakeReconReader{runErr: errWebBoom})
-	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/reconciliation/runs")
+	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (%s)", rec.Code, rec.Body)
 	}
@@ -128,7 +128,7 @@ func TestGetRun_OK(t *testing.T) {
 			InternalStatus: "captured", ProviderStatus: "captured",
 		}},
 	}
-	rec := doRecon(newReconRouter(nil, reader), http.MethodGet, "/payment/v1/internal/reconciliation/runs/4")
+	rec := doRecon(newReconRouter(nil, reader), http.MethodGet, "/payment/v1/internal/payments/reconciliation/runs/4")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -152,7 +152,7 @@ func TestGetRun_Pagination(t *testing.T) {
 	reader := &fakeReconReader{run: completedRun(7, 250)}
 	// Explicit page: limit forwarded, offset forwarded, total from the run row.
 	rec := doRecon(newReconRouter(nil, reader), http.MethodGet,
-		"/payment/v1/internal/reconciliation/runs/7?limit=50&offset=100")
+		"/payment/v1/internal/payments/reconciliation/runs/7?limit=50&offset=100")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
@@ -172,7 +172,7 @@ func TestGetRun_Pagination(t *testing.T) {
 	// Over-cap limit is clamped; a bad/absent offset defaults to 0.
 	reader2 := &fakeReconReader{run: completedRun(7, 1)}
 	doRecon(newReconRouter(nil, reader2), http.MethodGet,
-		"/payment/v1/internal/reconciliation/runs/7?limit=9999&offset=-3")
+		"/payment/v1/internal/payments/reconciliation/runs/7?limit=9999&offset=-3")
 	if reader2.gotLimit != maxDiscrepancyLimit || reader2.gotOffset != 0 {
 		t.Fatalf("clamp: got limit=%d offset=%d, want %d/0", reader2.gotLimit, reader2.gotOffset, maxDiscrepancyLimit)
 	}
@@ -185,11 +185,11 @@ func TestGetRun_Errors(t *testing.T) {
 		reader *fakeReconReader
 		want   int
 	}{
-		{"bad id", "/payment/v1/internal/reconciliation/runs/abc", &fakeReconReader{}, http.StatusBadRequest},
-		{"zero id", "/payment/v1/internal/reconciliation/runs/0", &fakeReconReader{}, http.StatusBadRequest},
-		{"unknown run", "/payment/v1/internal/reconciliation/runs/99", &fakeReconReader{runErr: domain.ErrNotFound}, http.StatusNotFound},
-		{"run lookup error", "/payment/v1/internal/reconciliation/runs/1", &fakeReconReader{runErr: errWebBoom}, http.StatusInternalServerError},
-		{"discrepancy list error", "/payment/v1/internal/reconciliation/runs/1", &fakeReconReader{run: completedRun(1, 0), listErr: errWebBoom}, http.StatusInternalServerError},
+		{"bad id", "/payment/v1/internal/payments/reconciliation/runs/abc", &fakeReconReader{}, http.StatusBadRequest},
+		{"zero id", "/payment/v1/internal/payments/reconciliation/runs/0", &fakeReconReader{}, http.StatusBadRequest},
+		{"unknown run", "/payment/v1/internal/payments/reconciliation/runs/99", &fakeReconReader{runErr: domain.ErrNotFound}, http.StatusNotFound},
+		{"run lookup error", "/payment/v1/internal/payments/reconciliation/runs/1", &fakeReconReader{runErr: errWebBoom}, http.StatusInternalServerError},
+		{"discrepancy list error", "/payment/v1/internal/payments/reconciliation/runs/1", &fakeReconReader{run: completedRun(1, 0), listErr: errWebBoom}, http.StatusInternalServerError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -198,5 +198,41 @@ func TestGetRun_Errors(t *testing.T) {
 				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.want, rec.Body)
 			}
 		})
+	}
+}
+
+// TestRecon_DeprecatedAliasMounted locks the expand phase of the v3 path
+// migration (homelab ADR-017): the pre-v3 reconciliation path stays mounted
+// until the contract release removes it.
+func TestRecon_DeprecatedAliasMounted(t *testing.T) {
+	r := gin.New()
+	RegisterReconciliationRoutes(r, NewReconciliationHandler(nil, nil))
+	req := httptest.NewRequest(http.MethodPost, "/payment/v1/internal/reconciliation/runs", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Errorf("deprecated reconciliation alias not mounted (got 404)")
+	}
+}
+
+// TestCombinedRouter_StaticAndWildcardSiblings mounts the payment API and the
+// reconciliation routes on ONE engine — as cmd/main.go does — locking gin's
+// static-vs-":id" sibling dispatch under /payment/v1/internal/payments/ so a
+// gin upgrade that starts panicking on this shape fails here, not at startup.
+func TestCombinedRouter_StaticAndWildcardSiblings(t *testing.T) {
+	r := gin.New()
+	NewHandler(nil).mount(r, func(c *gin.Context) { c.Next() })
+	RegisterReconciliationRoutes(r, NewReconciliationHandler(nil, nil))
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs"}, // static
+		{http.MethodPost, "/payment/v1/internal/payments/42/refunds"},          // :id wildcard sibling
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		r.ServeHTTP(rec, req)
+		if rec.Code == http.StatusNotFound {
+			t.Errorf("%s %s not routed (got 404)", tc.method, tc.path)
+		}
 	}
 }
