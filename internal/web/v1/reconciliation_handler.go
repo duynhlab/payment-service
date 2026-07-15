@@ -99,7 +99,6 @@ func RegisterReconciliationRoutes(r *gin.Engine, h *ReconciliationHandler) {
 // returns the finished run resource, 201.
 func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	ctx, span, log := beginRequest(c)
-	defer span.End()
 
 	if h.runner == nil {
 		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal,
@@ -141,7 +140,6 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 // resource plus its full discrepancy report.
 func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 	ctx, span, log := beginRequest(c)
-	defer span.End()
 
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {

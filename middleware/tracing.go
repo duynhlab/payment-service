@@ -3,7 +3,6 @@ package middleware
 import (
 	"context"
 	"strings"
-	"sync"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -13,20 +12,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-var (
-	tracer          trace.Tracer
-	tracerOnce      sync.Once
-	detectedService string
-)
+var detectedService string
 
 // defaultServiceNameFallback names the tracer scope when SetServiceName was
 // never called (previously lived in the deleted resource.go).
 const defaultServiceNameFallback = "unknown-service"
 
-// SetServiceName records the service name used by TracingMiddleware and
-// GetTracer for the tracer scope. The OTel SDK itself (providers, exporters,
-// resource, sampler) is wired once in main() by obsx.SetupObservability
-// (RFC-0014) — this package only consumes the globals it installs.
+// SetServiceName records the service name used by TracingMiddleware for the
+// otelgin scope. The OTel SDK itself (providers, exporters, resource, sampler)
+// is wired once in main() by obsx.SetupObservability (RFC-0014) — this package
+// only consumes the globals it installs.
 func SetServiceName(name string) {
 	if name != "" {
 		detectedService = name
@@ -77,29 +72,6 @@ func TracingMiddleware() gin.HandlerFunc {
 		// Apply OpenTelemetry middleware
 		otelMiddleware(c)
 	}
-}
-
-// GetTracer returns the tracer instance with auto-detected service name
-func GetTracer() trace.Tracer {
-	tracerOnce.Do(func() {
-		serviceName := detectedService
-		if serviceName == "" {
-			serviceName = defaultServiceNameFallback
-		}
-		tracer = otel.Tracer(serviceName)
-	})
-	return tracer
-}
-
-// StartSpan starts a new span with the given name
-//
-// Usage:
-//
-//	ctx, span := middleware.StartSpan(ctx, "database.query")
-//	defer span.End()
-func StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
-	//nolint:spancheck // span is returned to caller who is responsible for calling span.End()
-	return GetTracer().Start(ctx, name, opts...)
 }
 
 // Helper Functions

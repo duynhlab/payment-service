@@ -68,29 +68,26 @@ func (h *Handler) mount(r *gin.Engine, jwtMW gin.HandlerFunc) {
 	}
 }
 
-// beginRequest starts the web request span and resolves the request logger.
-// The caller owns the span and must defer span.End().
+// beginRequest resolves the otelgin server span and the request logger. The web
+// layer does not mint its own span — otelgin already opened the server span for
+// this request (method/route are on it), so handlers annotate that span via the
+// returned handle. The caller must NOT end it; otelgin owns its lifecycle.
 func beginRequest(c *gin.Context) (context.Context, trace.Span, *zap.Logger) {
-	ctx, span := middleware.StartSpan(c.Request.Context(), "http.request", trace.WithAttributes(
-		attribute.String("layer", "web"),
-		attribute.String("method", c.Request.Method),
-		attribute.String("path", c.Request.URL.Path),
-	))
-	return ctx, span, middleware.GetLoggerFromGinContext(c)
+	ctx := c.Request.Context()
+	return ctx, trace.SpanFromContext(ctx), middleware.GetLoggerFromGinContext(c)
 }
 
-// beginAuthed starts the request span and resolves the authenticated user id
+// beginAuthed resolves the otelgin server span and the authenticated user id
 // from the JWT claims set by authmw — never from the request body. On missing
-// or non-numeric claims it writes 401, ends the span, and returns ok=false
-// (the caller must return immediately). On success the caller owns the span
-// and must defer span.End().
+// or non-numeric claims it writes 401 and returns ok=false (the caller must
+// return immediately). The returned span is the server span — annotate it, but
+// do not end it (otelgin owns its lifecycle).
 func beginAuthed(c *gin.Context, op string) (context.Context, trace.Span, *zap.Logger, int64, bool) {
 	ctx, span, zapLogger := beginRequest(c)
 	userID, err := strconv.ParseInt(c.GetString(authmw.CtxUserID), 10, 64)
 	if err != nil || userID <= 0 {
 		zapLogger.Warn(op + ": no valid user_id in context")
 		httpx.RespondError(c, http.StatusUnauthorized, httpx.CodeUnauthorized, errAuthRequired)
-		span.End()
 		return ctx, span, zapLogger, 0, false
 	}
 	return ctx, span, zapLogger, userID, true
@@ -167,7 +164,7 @@ func (r *createPaymentRequest) toInput(userID int64) (logicv1.CreateIntentInput,
 	}
 	currency := r.Currency
 	if currency == "" {
-		currency = "USD"
+		currency = domain.DefaultCurrency
 	}
 	if !logicv1.IsCurrency(currency) {
 		return in, "currency must be a 3-letter uppercase code (e.g. USD)"
@@ -203,7 +200,6 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	defer span.End()
 
 	idemKey, ok := requireIdempotencyKey(c)
 	if !ok {
@@ -253,7 +249,6 @@ func (h *Handler) GetPayment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	defer span.End()
 
 	id, ok := pathID(c)
 	if !ok {
@@ -278,7 +273,6 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	if !ok {
 		return
 	}
-	defer span.End()
 
 	page, pageSize := httpx.ParsePage(c)
 	items, total, err := h.logic.List(ctx, userID, page, pageSize)
@@ -302,7 +296,6 @@ type createRefundRequest struct {
 // cluster-only behind NetworkPolicy), so lookups run unscoped (user 0).
 func (h *Handler) CreateRefund(c *gin.Context) {
 	ctx, span, zapLogger := beginRequest(c)
-	defer span.End()
 
 	idemKey, ok := requireIdempotencyKey(c)
 	if !ok {

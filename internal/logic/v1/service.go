@@ -186,53 +186,72 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 	var declined *provider.DeclinedError
 	switch {
 	case errors.As(chErr, &declined):
-		// A re-driven decline hits an already-failed row: stale is fine here —
-		// the outcome is identical, only the cache write remains.
-		if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusFailed,
-			map[string]any{"decline_code": declined.Code}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
-			return nil, err
-		}
-		return s.finishIntent(ctx, key.ID, 422, pay.ID)
+		return s.handleDeclined(ctx, key, in, pay, declined.Code)
 	case chErr != nil:
-		// Transient: release the lock so an immediate same-key retry can
-		// re-drive, instead of getting ErrKeyLocked until the 90s takeover
-		// window elapses — the 503 tells the client to retry, so a retry must
-		// be able to make progress. The payment row stays pending; the
-		// re-driven charge replays or succeeds.
+		// Transient provider failure, counted per attempt: the payment stays
+		// pending and the client retries, so this is an attempts/health signal —
+		// unlike authorized/declined, which are the terminal decision counted
+		// once per payment.
+		recordAuthorization(ctx, authError, currencyLabel(in.Currency))
+		// Release the lock so an immediate same-key retry can re-drive instead of
+		// getting ErrKeyLocked until the 90s takeover window elapses — the 503
+		// tells the client to retry, so a retry must be able to make progress.
+		// The row stays pending; the re-driven charge replays or succeeds.
 		if relErr := s.idem.Release(ctx, key.ID); relErr != nil {
 			return nil, fmt.Errorf("provider transient (%w); lock release failed: %w", chErr, relErr)
 		}
 		return nil, chErr
 	}
+	return s.applyAuthorized(ctx, key, in, pay, charge)
+}
 
-	// Apply the successful outcome through the whitelisted transitions.
+// handleDeclined transitions the payment to failed and finishes with 422. The
+// decline is counted only when THIS call applied the transition, so a
+// crash-recovery re-drive (tolerated stale) never double-counts the decline.
+func (s *Service) handleDeclined(ctx context.Context, key *idempotency.Record, in CreateIntentInput, pay *domain.Payment, code string) (*IntentResult, error) {
+	txErr := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusFailed,
+		map[string]any{"decline_code": code})
+	if txErr != nil && !errors.Is(txErr, domain.ErrStaleTransition) {
+		return nil, txErr
+	}
+	if txErr == nil {
+		recordAuthorization(ctx, authDeclined, currencyLabel(in.Currency))
+	}
+	return s.finishIntent(ctx, key.ID, 422, pay.ID)
+}
+
+// applyAuthorized applies the successful outcome through the whitelisted
+// transitions, verifies the row actually landed in a successful state (never
+// cache a success for a row the expiry job raced), records the authorization
+// once (only the drive that applied it, not a stale re-drive), and finishes 201.
+func (s *Service) applyAuthorized(ctx context.Context, key *idempotency.Record, in CreateIntentInput, pay *domain.Payment, charge *provider.Charge) (*IntentResult, error) {
 	expires := s.now().Add(s.holdTTL)
-	if err := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusAuthorized,
+	txErr := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusAuthorized,
 		map[string]any{
 			"provider_payment_id": charge.ProviderPaymentID,
 			"authorized_at":       s.now(),
 			"expires_at":          expires,
-		}); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
-		return nil, err // stale = re-entry already applied it; verified below
+		})
+	if txErr != nil && !errors.Is(txErr, domain.ErrStaleTransition) {
+		return nil, txErr // stale = re-entry already applied it; verified below
 	}
 	if in.CaptureMethod == domain.CaptureAutomatic {
-		// Auto-capture also moves money, so it posts the capture ledger. The
-		// posting rides the CAS inside CaptureWithLedger: a re-driven charge
-		// finds the row already captured (stale) and posts nothing.
+		// Auto-capture posts the capture ledger via the CAS inside
+		// CaptureWithLedger: a re-driven charge finds the row already captured
+		// (stale) and posts nothing.
 		if err := s.payments.CaptureWithLedger(ctx, pay.ID, s.now()); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
 			return nil, err
 		}
 	}
-	// A tolerated stale has two possible causes: a re-entry that already
-	// applied the outcome (fine) or the expiry job racing us (not fine — the
-	// charge succeeded but the row says expired). Never cache a success for a
-	// row that is not actually in a successful state.
 	final, err := s.payments.FindByID(ctx, pay.ID, 0)
 	if err != nil {
 		return nil, err
 	}
 	if final.Status != domain.StatusAuthorized && final.Status != domain.StatusCaptured {
 		return nil, fmt.Errorf("%w: charge succeeded but payment is %s", domain.ErrInvalidTransition, final.Status)
+	}
+	if txErr == nil {
+		recordAuthorization(ctx, authAuthorized, currencyLabel(in.Currency))
 	}
 	return s.finishIntent(ctx, key.ID, 201, pay.ID)
 }
@@ -269,6 +288,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		return pay, nil // idempotent no-op
 	}
 	if err := domain.Transition(pay.Status, domain.StatusCaptured); err != nil {
+		recordOperation(ctx, opCapture, resultRejected)
 		return nil, err
 	}
 	// CAS FIRST, provider second: winning the row before moving money means a
@@ -288,6 +308,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		return nil, err
 	}
 	if err := s.prov.Capture(ctx, pay.ProviderPaymentID); err != nil {
+		recordOperation(ctx, opCapture, resultError)
 		// Reverse the row back to authorized and post a compensating reversal
 		// ledger transaction (append-only — never edit the capture entry).
 		if rbErr := s.payments.ReverseCapture(ctx, pay.ID); rbErr != nil {
@@ -295,6 +316,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		}
 		return nil, err
 	}
+	recordOperation(ctx, opCapture, resultOK)
 	return s.payments.FindByID(ctx, pay.ID, 0)
 }
 
@@ -308,6 +330,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		return pay, nil
 	}
 	if err := domain.Transition(pay.Status, domain.StatusVoided); err != nil {
+		recordOperation(ctx, opVoid, resultRejected)
 		return nil, err
 	}
 	// Same ordering rationale as Capture: win the row, then touch the provider.
@@ -318,17 +341,21 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		return nil, err
 	}
 	if err := s.prov.Void(ctx, pay.ProviderPaymentID); err != nil {
+		recordOperation(ctx, opVoid, resultError)
 		if rbErr := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusVoided, domain.StatusAuthorized, nil); rbErr != nil {
 			return nil, fmt.Errorf("provider void failed (%w) and rollback failed: %w", err, rbErr)
 		}
 		return nil, err
 	}
+	recordOperation(ctx, opVoid, resultOK)
 	return s.payments.FindByID(ctx, pay.ID, 0)
 }
 
 // reloadAfterRace re-reads after a lost CAS: if the payment reached the
 // desired state anyway (concurrent duplicate), that's idempotent success;
-// any other state is a real conflict.
+// any other state is a real conflict. It deliberately records no operation
+// metric — the CAS winner already counted this transition, so counting here
+// too would double-count one operation.
 func (s *Service) reloadAfterRace(ctx context.Context, id int64, want domain.Status) (*domain.Payment, error) {
 	pay, err := s.payments.FindByID(ctx, id, 0)
 	if err != nil {
@@ -372,22 +399,18 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	scopedKey := fmt.Sprintf("%d:%s", userID, idemKey)
 	ref, err := s.payments.CreateRefund(ctx, pay.ID, amountMinor, reason, scopedKey)
 	if err != nil {
-		return nil, false, err // incl. domain.ErrRefundRejected
+		if errors.Is(err, domain.ErrRefundRejected) {
+			recordOperation(ctx, opRefund, resultRejected)
+		}
+		return nil, false, err
 	}
 
 	// An adopted refund that already settled (crash after settle, before finish)
 	// must not be re-sent to the provider or re-settled — just finish.
 	if ref.Status == domain.RefundPending {
-		providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor, scopedKey)
-		status := domain.RefundSucceeded
-		if provErr != nil {
-			status = domain.RefundFailed
-		}
-		if err := s.payments.SettleRefund(ctx, ref.ID, status, providerRefundID); err != nil {
+		if err := s.settlePendingRefund(ctx, pay, ref, amountMinor, scopedKey); err != nil {
 			return nil, false, err
 		}
-		ref.Status = status
-		ref.ProviderRefundID = providerRefundID
 	}
 
 	body, _ := json.Marshal(ref)
@@ -395,6 +418,29 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 		return nil, false, err
 	}
 	return ref, false, nil
+}
+
+// settlePendingRefund sends a pending refund to the provider, persists the
+// outcome, updates ref in place, and records the operation metric. Callers must
+// gate this on ref.Status == RefundPending, so a crash-recovery retry that
+// adopts an already-settled refund never re-settles or re-counts.
+func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, ref *domain.Refund, amountMinor int64, scopedKey string) error {
+	providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor, scopedKey)
+	status := domain.RefundSucceeded
+	if provErr != nil {
+		status = domain.RefundFailed
+	}
+	if err := s.payments.SettleRefund(ctx, ref.ID, status, providerRefundID); err != nil {
+		return err
+	}
+	ref.Status = status
+	ref.ProviderRefundID = providerRefundID
+	if status == domain.RefundSucceeded {
+		recordOperation(ctx, opRefund, resultOK)
+	} else {
+		recordOperation(ctx, opRefund, resultError)
+	}
+	return nil
 }
 
 // Get returns one payment scoped to its owner.

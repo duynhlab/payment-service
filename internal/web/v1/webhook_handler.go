@@ -57,8 +57,7 @@ func RegisterWebhookRoutes(r *gin.Engine, h *WebhookHandler) {
 // we want retried) returns non-2xx; an authentic event — even for an unknown
 // payment or type — is acked 2xx so the sender stops retrying.
 func (h *WebhookHandler) HandleMockpay(c *gin.Context) {
-	ctx, span, log := beginRequest(c)
-	defer span.End()
+	ctx, _, log := beginRequest(c)
 
 	// MaxBytesReader rejects an oversized body with an error (rather than
 	// silently truncating, which would fail HMAC as if the signature were bad).

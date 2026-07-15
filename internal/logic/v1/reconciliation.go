@@ -109,6 +109,17 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 		return runID, 0, fmt.Errorf("detect discrepancies: %w", err)
 	}
 
+	// Count what detection found, grouped by the bounded discrepancy class —
+	// ledger-vs-provider drift is the KPI, so count at detection (before persist
+	// or heal).
+	byClass := make(map[domain.DiscrepancyClass]int64)
+	for _, d := range discrepancies {
+		byClass[d.Class]++
+	}
+	for class, n := range byClass {
+		recordReconDiscrepancies(ctx, string(class), n)
+	}
+
 	if len(discrepancies) > 0 {
 		if serr := r.repo.SaveDiscrepancies(ctx, runID, discrepancies); serr != nil {
 			r.finish(ctx, runID, scanned, 0, domain.ReconRunFailed)

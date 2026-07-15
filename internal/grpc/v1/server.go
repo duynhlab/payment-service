@@ -65,7 +65,7 @@ func (s *Server) Authorize(ctx context.Context, req *paymentv1.AuthorizeRequest)
 	}
 	currency := req.GetCurrency()
 	if currency == "" {
-		currency = "USD"
+		currency = domain.DefaultCurrency
 	}
 	if !logicv1.IsCurrency(currency) {
 		return nil, status.Error(codes.InvalidArgument, "currency must be a 3-letter uppercase code")
