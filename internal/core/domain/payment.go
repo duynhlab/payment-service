@@ -32,6 +32,9 @@ const (
 	CaptureAutomatic CaptureMethod = "automatic"
 )
 
+// DefaultCurrency is applied when a request omits the currency.
+const DefaultCurrency = "USD"
+
 // allowedTransitions is the whitelist: a transition absent here is invalid,
 // by construction. The DB compare-and-swap (UPDATE ... WHERE status=$expected)
 // is the concurrent-safety net; this map is the business rule and the good

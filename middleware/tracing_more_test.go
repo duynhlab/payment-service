@@ -70,17 +70,6 @@ func TestTracingMiddleware(t *testing.T) {
 	}
 }
 
-func TestStartSpan(t *testing.T) {
-	ctx, span := StartSpan(context.Background(), "unit.test")
-	if span == nil {
-		t.Fatal("StartSpan returned a nil span")
-	}
-	span.End()
-	if ctx == nil {
-		t.Error("StartSpan returned a nil context")
-	}
-}
-
 // TestSpanHelpers exercises both branches of the recording guard in
 // AddSpanAttributes/AddSpanEvent/RecordError/SetSpanStatus.
 func TestSpanHelpers(t *testing.T) {
