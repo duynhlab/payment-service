@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // maxRespBytes caps how much of a provider response we read. Responses are tiny
@@ -26,8 +28,18 @@ type HTTPClient struct {
 }
 
 // NewHTTPClient wires a mockpay client at baseURL (e.g. http://mockpay:8080).
+// The transport is wrapped with otelhttp so each outbound call carries the W3C
+// traceparent (the money-hop joins the caller's trace) and emits a client span.
+// otelhttp injects only headers via the global propagator — it never touches
+// the request body, so any body-level signing stays intact.
 func NewHTTPClient(baseURL string) *HTTPClient {
-	return &HTTPClient{baseURL: baseURL, hc: &http.Client{Timeout: 10 * time.Second}}
+	return &HTTPClient{
+		baseURL: baseURL,
+		hc: &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
+		},
+	}
 }
 
 // do issues the request and returns the status and raw body. A transport error
@@ -69,6 +81,10 @@ func decodeError(body []byte) ErrorResponse {
 
 // Charge places (and optionally captures) a hold via POST /charges.
 func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, error) {
+	start := time.Now()
+	outcome := outcomeTransient // transport error / unexpected status default
+	defer func() { recordProviderCall(ctx, opCharge, outcome, start) }()
+
 	status, body, err := c.do(ctx, http.MethodPost, "/charges", req)
 	if err != nil {
 		return nil, err
@@ -79,8 +95,10 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 		if err := json.Unmarshal(body, &charge); err != nil {
 			return nil, fmt.Errorf("mockpay charge decode: %w", err)
 		}
+		outcome = outcomeOK
 		return &charge, nil
 	case http.StatusPaymentRequired:
+		outcome = outcomeDeclined
 		return nil, &DeclinedError{Code: decodeError(body).Code}
 	case http.StatusServiceUnavailable:
 		return nil, ErrTransient
@@ -95,7 +113,7 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 
 // Capture captures a hold via POST /charges/{id}/capture.
 func (c *HTTPClient) Capture(ctx context.Context, providerPaymentID string) error {
-	return c.mutate(ctx, "/charges/"+url.PathEscape(providerPaymentID)+"/capture")
+	return c.mutate(ctx, opCapture, "/charges/"+url.PathEscape(providerPaymentID)+"/capture")
 }
 
 // GetTransactions pages the provider's ledger (GET /transactions) — the food
@@ -118,11 +136,16 @@ func (c *HTTPClient) GetTransactions(ctx context.Context, page, pageSize int) (*
 
 // Void releases a hold via POST /charges/{id}/void.
 func (c *HTTPClient) Void(ctx context.Context, providerPaymentID string) error {
-	return c.mutate(ctx, "/charges/"+url.PathEscape(providerPaymentID)+"/void")
+	return c.mutate(ctx, opVoid, "/charges/"+url.PathEscape(providerPaymentID)+"/void")
 }
 
-// mutate posts to a capture/void endpoint that returns no body on success.
-func (c *HTTPClient) mutate(ctx context.Context, path string) error {
+// mutate posts to a capture/void endpoint that returns no body on success. op is
+// the bounded metric label ("capture"/"void").
+func (c *HTTPClient) mutate(ctx context.Context, op, path string) error {
+	start := time.Now()
+	outcome := outcomeTransient
+	defer func() { recordProviderCall(ctx, op, outcome, start) }()
+
 	status, body, err := c.do(ctx, http.MethodPost, path, nil)
 	if err != nil {
 		return err
@@ -130,11 +153,16 @@ func (c *HTTPClient) mutate(ctx context.Context, path string) error {
 	if status != http.StatusOK {
 		return fmt.Errorf("mockpay %s: status %d: %s", path, status, decodeError(body).Error)
 	}
+	outcome = outcomeOK
 	return nil
 }
 
 // Refund issues a refund via POST /refunds.
 func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amountMinor int64, idempotencyKey string) (string, error) {
+	start := time.Now()
+	outcome := outcomeTransient
+	defer func() { recordProviderCall(ctx, opRefund, outcome, start) }()
+
 	status, body, err := c.do(ctx, http.MethodPost, "/refunds", RefundRequest{
 		ProviderPaymentID: providerPaymentID,
 		AmountMinor:       amountMinor,
@@ -150,5 +178,6 @@ func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amoun
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return "", fmt.Errorf("mockpay refund decode: %w", err)
 	}
+	outcome = outcomeOK
 	return resp.ProviderRefundID, nil
 }
