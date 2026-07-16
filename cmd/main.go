@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -342,6 +343,19 @@ func startGRPC(cfg *config.Config, logger *zap.Logger, svc *logicv1.Service) (*g
 
 // runMockpay serves the mock provider until SIGTERM/SIGINT, then drains.
 func runMockpay(cfg *config.Config, logger *zap.Logger) {
+	// mockpay is a deployed service (a real network hop), so it gets the same
+	// OTel wiring as the main binary: this installs the TracerProvider + W3C
+	// propagator that let the otelhttp handler below open a server span joining
+	// the caller's trace (the money-hop's far end).
+	obsShutdown, logger := initObservability(logger)
+	if obsShutdown != nil {
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = obsShutdown.Shutdown(sctx)
+		}()
+	}
+
 	var emitter mockpay.Emitter
 	switch {
 	case cfg.Payment.WebhookURL == "":
@@ -354,7 +368,7 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Service.Port,
-		Handler:           mockpay.New(logger, emitter).Handler(),
+		Handler:           otelhttp.NewHandler(mockpay.New(logger, emitter).Handler(), "mockpay"),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
