@@ -50,8 +50,8 @@ github.com/docker/go-connections v0.6.0 h1:LlMG9azAe1TqfR7sO+NJttz1gy6KO7VJBh+pM
 github.com/docker/go-connections v0.6.0/go.mod h1:AahvXYshr6JgfUJGdDCs2b5EZG/vmaMAntpSFH5BFKE=
 github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
 github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
-github.com/duynhlab/pkg v0.23.0 h1:MiGxVVP4EP0DjoIdOFyvO3k4CqGQVRJiTMdg/D3UaNg=
-github.com/duynhlab/pkg v0.23.0/go.mod h1:9pu+0f/Huqpz4m03rLWA0UKaOEH735adW/5h1vANlK8=
+github.com/duynhlab/pkg v0.24.0 h1:6FtEV7FuBc6dTDdqVIyU74zThlD8U/bxIWtUsuOusss=
+github.com/duynhlab/pkg v0.24.0/go.mod h1:9pu+0f/Huqpz4m03rLWA0UKaOEH735adW/5h1vANlK8=
 github.com/ebitengine/purego v0.10.0 h1:QIw4xfpWT6GWTzaW5XEKy3HXoqrJGx1ijYHzTF0/ISU=
 github.com/ebitengine/purego v0.10.0/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
 github.com/exaring/otelpgx v0.11.1 h1:pE79fIg/qh/Lpu00kvswFC5dKfqyJJhMJ4Y4N3w5Lj4=
