@@ -104,11 +104,17 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 	case http.StatusServiceUnavailable:
 		return nil, ErrTransient
 	default:
-		// Any other status is treated as retryable by the caller (driveCharge's
-		// default path). That is the safe default: /charges only emits
-		// 200/402/503, and a charge is idempotent per key, so re-driving an
-		// unexpected status replays rather than double-charges.
-		return nil, fmt.Errorf("mockpay charge: status %d: %s", status, decodeError(body).Error)
+		err := fmt.Errorf("mockpay charge: status %d: %s", status, decodeError(body).Error)
+		// A decided client error (malformed request, unknown resource) can never
+		// start working on retry, so it must not be filed as an open outcome —
+		// re-driving it burns the retry budget and, once phase 6 keeps ambiguous
+		// charges open, would hold an intent in doubt that is not in doubt at
+		// all. 408/429 stay undecided: both mean ask again.
+		if isDefiniteStatus(status) {
+			outcome = outcomeDeclined
+			return nil, fmt.Errorf("%w: %w", ErrDefinite, err)
+		}
+		return nil, err
 	}
 }
 
@@ -151,8 +157,20 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path string) error {
 	if err != nil {
 		return err
 	}
+	if status == http.StatusServiceUnavailable {
+		return ErrTransient
+	}
 	if status != http.StatusOK {
-		return fmt.Errorf("mockpay %s: status %d: %s", path, status, decodeError(body).Error)
+		err := fmt.Errorf("mockpay %s: status %d: %s", path, status, decodeError(body).Error)
+		// Same rule as the other operations: a decided answer is decided. It
+		// matters most here — once an ambiguous capture stops auto-reversing
+		// (phase 6), a definite "this charge does not exist" must resolve the
+		// intent instead of leaving it open forever.
+		if isDefiniteStatus(status) {
+			outcome = outcomeDeclined
+			return fmt.Errorf("%w: %w", ErrDefinite, err)
+		}
+		return err
 	}
 	outcome = outcomeOK
 	return nil

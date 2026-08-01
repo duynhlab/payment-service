@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -122,6 +123,33 @@ func TestServer_Charge(t *testing.T) {
 			t.Fatalf("bad body status %d", resp.StatusCode)
 		}
 	})
+}
+
+// The no-answer trigger must create the charge and THEN withhold the response:
+// a lost answer with no effect is a different (easier) case than a lost answer
+// with one. The test uses a short client timeout rather than waiting out the
+// server's delay.
+func TestServer_NoAnswerCreatesTheChargeThenGoesSilent(t *testing.T) {
+	base := newServer(t)
+	hc := &http.Client{Timeout: 900 * time.Millisecond}
+	body, _ := json.Marshal(provider.ChargeRequest{IdempotencyKey: "na", AmountMinor: 5013, Currency: "USD", AutoCapture: true})
+
+	_, err := hc.Post(base+"/charges", "application/json", bytes.NewReader(body))
+	if err == nil {
+		t.Fatal("the …13 trigger must not answer within the client timeout")
+	}
+
+	// The charge exists provider-side: the transactions feed lists it, which is
+	// exactly how reconciliation would discover the orphan.
+	resp, gerr := http.Get(base + "/transactions")
+	if gerr != nil {
+		t.Fatalf("transactions: %v", gerr)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	tb, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(tb), "mp_1") {
+		t.Fatalf("the silent charge must still exist provider-side, got %s", tb)
+	}
 }
 
 // A refund amount ending in the refund-decline suffix is refused with 402 and a

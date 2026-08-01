@@ -24,7 +24,10 @@ reproducible failure testing.
   insufficient funds, `…19` transient error that succeeds on retry. Refunds have
   their own suffix, `…07` refund declined — the saga refunds the amount it
   charged, so a shared suffix could never produce "charge succeeded, refund
-  refused"
+  refused". `…13` makes the provider **go silent**: the charge is created and
+  then the response is withheld past the client timeout, reproducing the
+  lost-response window without destroying the charge (killing the provider would
+  take the charge with it, which is a different case)
 
 ## API Endpoints
 

@@ -233,6 +233,58 @@ func TestHTTPClient_TransportErrorIsRetryable(t *testing.T) {
 	}
 }
 
+// Charge and the capture/void mutations must classify a decided answer the same
+// way the refund path does — a 404 or a malformed request cannot start working on
+// retry. 5xx and the two ask-again statuses stay undecided.
+func TestHTTPClient_ChargeAndMutationsClassifyDecidedAnswers(t *testing.T) {
+	cases := []struct {
+		status   int
+		definite bool
+	}{
+		{http.StatusNotFound, true},
+		{http.StatusBadRequest, true},
+		{http.StatusRequestTimeout, false},
+		{http.StatusTooManyRequests, false},
+		{http.StatusInternalServerError, false},
+	}
+	for _, tc := range cases {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tc.status)
+		}))
+		c := provider.NewHTTPClient(ts.URL)
+
+		_, chargeErr := c.Charge(context.Background(), provider.ChargeRequest{IdempotencyKey: "k", AmountMinor: 5000, Currency: "USD"})
+		capErr := c.Capture(context.Background(), "ch_1")
+		voidErr := c.Void(context.Background(), "ch_1")
+		ts.Close()
+
+		for name, err := range map[string]error{"charge": chargeErr, "capture": capErr, "void": voidErr} {
+			if err == nil {
+				t.Fatalf("%s: status %d must error", name, tc.status)
+			}
+			if got := errors.Is(err, provider.ErrDefinite); got != tc.definite {
+				t.Errorf("%s status %d: definite = %v, want %v (err %v)", name, tc.status, got, tc.definite, err)
+			}
+		}
+	}
+}
+
+// 503 stays the explicit ask-again signal on the mutations too, not a decided
+// answer and not an opaque unknown.
+func TestHTTPClient_MutationsMap503ToTransient(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(ts.Close)
+	c := provider.NewHTTPClient(ts.URL)
+
+	for name, err := range map[string]error{"capture": c.Capture(context.Background(), "ch_1"), "void": c.Void(context.Background(), "ch_1")} {
+		if !errors.Is(err, provider.ErrTransient) {
+			t.Errorf("%s 503 err = %v, want ErrTransient", name, err)
+		}
+	}
+}
+
 // A refund refusal must be typed as a DECLINE, not left as a generic error: the
 // caller uses the type to tell "the provider decided no" (record failed, stop)
 // from "we do not know" (hold the reserve, retry with the same key). Before this
