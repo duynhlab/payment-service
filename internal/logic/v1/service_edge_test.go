@@ -21,6 +21,10 @@ type failingProvider struct {
 	refundErr  error
 	captureErr error
 	voidErr    error
+	// gotCaptureKey/gotVoidKey record the provider idempotency key the service
+	// passed, so a test can prove a retry reuses it.
+	gotCaptureKey string
+	gotVoidKey    string
 }
 
 func (f *failingProvider) Refund(ctx context.Context, id string, amt int64, key string) (string, error) {
@@ -30,18 +34,20 @@ func (f *failingProvider) Refund(ctx context.Context, id string, amt int64, key 
 	return f.Stub.Refund(ctx, id, amt, key)
 }
 
-func (f *failingProvider) Capture(ctx context.Context, id string) error {
+func (f *failingProvider) Capture(ctx context.Context, id, idemKey string) error {
+	f.gotCaptureKey = idemKey
 	if f.captureErr != nil {
 		return f.captureErr
 	}
-	return f.Stub.Capture(ctx, id)
+	return f.Stub.Capture(ctx, id, idemKey)
 }
 
-func (f *failingProvider) Void(ctx context.Context, id string) error {
+func (f *failingProvider) Void(ctx context.Context, id, idemKey string) error {
+	f.gotVoidKey = idemKey
 	if f.voidErr != nil {
 		return f.voidErr
 	}
-	return f.Stub.Void(ctx, id)
+	return f.Stub.Void(ctx, id, idemKey)
 }
 
 // TestCreateRefund_ProviderUnknownNeverSealsTheKey is the regression test for
@@ -304,6 +310,32 @@ func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
 	}
 	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("err = %v, want ErrRefundNotSettled for an unexpected status", err)
+	}
+}
+
+// TestCaptureVoid_CarryADeterministicProviderKey: the key must be the same on
+// every attempt of the same logical operation, or the provider has nothing to
+// replay and a post-doubt retry gets a fresh verdict.
+func TestCaptureVoid_CarryADeterministicProviderKey(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub()}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-key", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("capture:payment:%d", res.Payment.ID)
+	if prov.gotCaptureKey != want {
+		t.Fatalf("capture key = %q, want %q", prov.gotCaptureKey, want)
+	}
+
+	res2, _ := svc.CreateIntent(context.Background(), "k-key2", intent(3000))
+	if _, err := svc.Void(context.Background(), res2.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("void:payment:%d", res2.Payment.ID); prov.gotVoidKey != want {
+		t.Fatalf("void key = %q, want %q", prov.gotVoidKey, want)
 	}
 }
 

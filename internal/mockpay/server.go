@@ -10,9 +10,11 @@
 package mockpay
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -61,6 +63,12 @@ type Server struct {
 	amounts       map[string]int64           // provider_payment_id -> amount (for GET /transactions)
 	refundsByKey  map[string]string          // refund idempotency key -> provider_refund_id
 	transientSeen map[string]bool            // charge keys that already hit the transient trigger once
+	// mutationKeys binds an idempotency key to the (operation, charge) it was
+	// first used for, so reuse elsewhere is a detectable caller bug. It does NOT
+	// remember the answer: replaying a remembered success could contradict the
+	// charge's later state — a capture replayed after a void would report money
+	// that is no longer collectable. State is the truth here.
+	mutationKeys map[string]mutationBinding
 }
 
 // New builds an empty mock provider. emitter may be nil (emission disabled).
@@ -74,6 +82,7 @@ func New(logger *zap.Logger, emitter Emitter) *Server {
 		refunded:      map[string]bool{},
 		amounts:       map[string]int64{},
 		refundsByKey:  map[string]string{},
+		mutationKeys:  map[string]mutationBinding{},
 		transientSeen: map[string]bool{},
 	}
 }
@@ -271,8 +280,15 @@ func (s *Server) noAnswer(ctx context.Context) {
 
 func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	key, ok := mutationKey(w, r)
+	if !ok {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.bindKey(w, key, opCapture, id) {
+		return
+	}
 	if _, ok := s.captured[id]; !ok {
 		writeError(w, http.StatusNotFound, "", msgUnknownCharge)
 		return
@@ -285,10 +301,17 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	key, ok := mutationKey(w, r)
+	if !ok {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.bindKey(w, key, opVoid, id) {
+		return
+	}
 	if s.voided[id] {
-		w.WriteHeader(http.StatusOK) // idempotent: a lost 200 must be retryable
+		w.WriteHeader(http.StatusOK) // idempotent by state: a lost 200 is retryable
 		return
 	}
 	if _, ok := s.captured[id]; !ok {
@@ -300,6 +323,66 @@ func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("void", zap.String("id", id))
 	s.emit("charge.voided", id, 0)
 	w.WriteHeader(http.StatusOK)
+}
+
+// mutationBinding is what an idempotency key was first used for. Only the
+// identity is kept — never the answer.
+type mutationBinding struct {
+	operation string
+	chargeID  string
+}
+
+// Operation names used in idempotency-key bindings.
+const (
+	opCapture = "capture"
+	opVoid    = "void"
+)
+
+// mutationKey reads the optional idempotency key from a capture/void body.
+//
+// Three cases, deliberately distinguished: no body at all is a legacy caller and
+// keeps the pre-key behaviour; a well-formed body yields its key; a body that is
+// present but undecodable is a 400, because silently treating it as keyless
+// would disable the mechanism in exactly the situation it exists for — a request
+// whose connection died mid-flight. ok=false means the response is written.
+func mutationKey(w http.ResponseWriter, r *http.Request) (string, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "", "unreadable request body")
+		return "", false
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "", true // no body: legacy caller
+	}
+	var req provider.MutationRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "", "invalid mutation request")
+		return "", false
+	}
+	return req.IdempotencyKey, true
+}
+
+// bindKey records that this key belongs to (op, chargeID), or answers 409 when it
+// was already used for a different one — borrowing another operation's verdict
+// would hide the caller's key-derivation bug behind a plausible success.
+// Returns false when the response is written. Caller holds s.mu.
+func (s *Server) bindKey(w http.ResponseWriter, key, op, chargeID string) bool {
+	if key == "" {
+		return true
+	}
+	want := mutationBinding{operation: op, chargeID: chargeID}
+	if prior, ok := s.mutationKeys[key]; ok && prior != want {
+		s.logger.Warn("idempotency key reused for a different operation or charge",
+			zap.String("key", key), zap.String("bound_operation", prior.operation),
+			zap.String("bound_charge", prior.chargeID),
+			zap.String("requested_operation", op), zap.String("requested_charge", chargeID))
+		writeError(w, http.StatusConflict, provider.CodeIdempotencyConflict,
+			"idempotency key reused for a different operation or charge")
+		return false
+	}
+	s.mutationKeys[key] = want
+	return true
 }
 
 func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {

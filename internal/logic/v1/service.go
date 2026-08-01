@@ -309,7 +309,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		}
 		return nil, err
 	}
-	if err := s.prov.Capture(ctx, pay.ProviderPaymentID); err != nil {
+	if err := s.prov.Capture(ctx, pay.ProviderPaymentID, providerKey(providerOpCapture, pay.ID)); err != nil {
 		recordOperation(ctx, opCapture, resultError)
 		// Reverse the row back to authorized and post a compensating reversal
 		// ledger transaction (append-only — never edit the capture entry).
@@ -342,7 +342,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		}
 		return nil, err
 	}
-	if err := s.prov.Void(ctx, pay.ProviderPaymentID); err != nil {
+	if err := s.prov.Void(ctx, pay.ProviderPaymentID, providerKey(providerOpVoid, pay.ID)); err != nil {
 		recordOperation(ctx, opVoid, resultError)
 		if rbErr := s.payments.TransitionStatus(ctx, pay.ID, domain.StatusVoided, domain.StatusAuthorized, nil); rbErr != nil {
 			return nil, fmt.Errorf("provider void failed (%w) and rollback failed: %w", err, rbErr)
@@ -367,6 +367,27 @@ func (s *Service) reloadAfterRace(ctx context.Context, id int64, want domain.Sta
 		return pay, nil
 	}
 	return nil, fmt.Errorf("%w: payment is %s", domain.ErrInvalidTransition, pay.Status)
+}
+
+// Provider-facing operation names for idempotency keys. Their own constants on
+// purpose: the metric labels happen to spell the same words, and deriving keys
+// from those would mean renaming a dashboard label silently changes every
+// in-flight idempotency key.
+const (
+	providerOpCapture = "capture"
+	providerOpVoid    = "void"
+)
+
+// providerKey builds the provider-facing idempotency key for an intent-level
+// mutation. Deterministic on (operation, payment) so every retry of the SAME
+// logical operation carries the SAME key — which is the whole point: the
+// provider replays its original answer instead of re-evaluating and telling a
+// post-doubt retry "already done" as though that were a failure.
+//
+// The payment id is the right anchor rather than a per-attempt value: a capture
+// is captured once, and all its attempts are the same operation.
+func providerKey(op string, paymentID int64) string {
+	return fmt.Sprintf("%s:payment:%d", op, paymentID)
 }
 
 // releaseTimeout bounds the detached key-release call. Short on purpose: it runs

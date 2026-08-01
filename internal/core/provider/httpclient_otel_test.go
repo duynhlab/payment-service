@@ -53,9 +53,9 @@ func TestHTTPClient_TraceparentAndDurationMetric(t *testing.T) {
 	}
 	// capture/void/refund happy paths (op labels + body integrity for refund).
 	statusCh <- http.StatusOK
-	_ = c.Capture(ctx, "mp_1")
+	_ = c.Capture(ctx, "mp_1", "k-cap")
 	statusCh <- http.StatusOK
-	_ = c.Void(ctx, "mp_1")
+	_ = c.Void(ctx, "mp_1", "k-void")
 	statusCh <- http.StatusOK
 	_, _ = c.Refund(ctx, "mp_1", 100, "refkey")
 
