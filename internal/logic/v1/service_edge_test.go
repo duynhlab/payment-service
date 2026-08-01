@@ -232,6 +232,81 @@ func TestCreateRefund_SettleFailureAfterMoneyMovedStaysOpen(t *testing.T) {
 	}
 }
 
+// TestCreateRefund_ReleaseFailureIsSurfacedNotSwallowed: a key that cannot be
+// unlocked leaves the caller locked out until the takeover window, so the failure
+// is counted and recorded on the span. The refund's own error must still be what
+// the caller sees — the release is cleanup, not the outcome.
+func TestCreateRefund_ReleaseFailureIsSurfacedNotSwallowed(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	fi.releaseErr = errors.New("db gone")
+	prov := &failingProvider{Stub: provider.NewStub(), refundErr: errors.New("mockpay down")}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-rel", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := svc.CreateRefund(context.Background(), "rk-rel", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("err = %v, want the refund's own ErrRefundNotSettled", err)
+	}
+	if errors.Is(err, fi.releaseErr) {
+		t.Fatal("the release failure must not replace the refund outcome")
+	}
+}
+
+// TestCreateRefund_DeclineRecordFailureReopensTheOutcome: the provider declined,
+// but persisting that verdict failed — so we do not actually know the refund is
+// dead. Reporting the decline would park an order on a verdict no row holds; the
+// answer must be the retryable sentinel instead.
+func TestCreateRefund_DeclineRecordFailureReopensTheOutcome(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(),
+		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-drf", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	fp.settleRefundErr = errors.New("db gone")
+	_, _, err := svc.CreateRefund(context.Background(), "rk-drf", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("err = %v, want ErrRefundNotSettled (the decline was not recorded)", err)
+	}
+	if errors.Is(err, domain.ErrRefundDeclined) {
+		t.Fatal("an unrecorded decline must not be reported as a decline")
+	}
+}
+
+// TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed guards the defensive
+// arm: whatever state an adopted refund is in, only `succeeded` may be sealed.
+func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-weird", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, 7, 500, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Force a state the FSM does not produce, then replay the key past its seal.
+	for _, r := range fp.refs {
+		r.Status = domain.RefundStatus("in_review")
+	}
+	for _, k := range fi.keys {
+		if k.Key == "rk-weird" {
+			k.ResponseCode, k.ResponseBody = nil, nil
+			k.LockedAt = time.Unix(0, 0)
+		}
+	}
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("err = %v, want ErrRefundNotSettled for an unexpected status", err)
+	}
+}
+
 // TestCreateRefund_RejectedByState covers every non-refundable state: a refund
 // is only valid against a captured payment, so authorized/voided/expired/failed
 // payments must all be rejected.

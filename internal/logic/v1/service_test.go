@@ -224,6 +224,9 @@ type fakeIdem struct {
 	seq  int64
 	keys map[string]*idempotency.Record
 	take time.Duration
+	// releaseErr, when set, fails every Release — the window where a key is left
+	// locked after a failed attempt.
+	releaseErr error
 	// reapTTL/reapCount record the last Reap call so tests can assert the
 	// service delegates the configured TTL and surfaces the returned count.
 	reapTTL   time.Duration
@@ -283,6 +286,9 @@ func (f *fakeIdem) Checkpoint(_ context.Context, id int64, subjectID *int64) err
 // Release is a single UPDATE on ctx, so a caller that passes an already-expired
 // request context never actually unlocks the key.
 func (f *fakeIdem) Release(ctx context.Context, id int64) error {
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
