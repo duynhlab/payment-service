@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	paymentv1 "github.com/duynhlab/pkg/proto/payment/v1"
@@ -219,6 +220,21 @@ func TestRefund(t *testing.T) {
 		f := &fakeLogic{byOrder: pay, refundErr: domain.ErrRefundRejected}
 		if _, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{OrderId: 42, AmountMinor: 1000}); status.Code(err) != codes.FailedPrecondition {
 			t.Fatalf("want FailedPrecondition, got %v", status.Code(err))
+		}
+	})
+	// The saga must be able to tell "the provider said no" (stop, park) from
+	// "we do not know" (retry with the same identity). Both used to arrive as a
+	// successful response carrying status "failed".
+	t.Run("declined → FailedPrecondition (not retryable)", func(t *testing.T) {
+		f := &fakeLogic{byOrder: pay, refundErr: fmt.Errorf("%w: issuer", domain.ErrRefundDeclined)}
+		if _, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{OrderId: 42, AmountMinor: 1000}); status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("want FailedPrecondition, got %v", status.Code(err))
+		}
+	})
+	t.Run("not settled → Unavailable (retryable)", func(t *testing.T) {
+		f := &fakeLogic{byOrder: pay, refundErr: fmt.Errorf("%w: deadline", domain.ErrRefundNotSettled)}
+		if _, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{OrderId: 42, AmountMinor: 1000}); status.Code(err) != codes.Unavailable {
+			t.Fatalf("want Unavailable, got %v", status.Code(err))
 		}
 	})
 	t.Run("unknown order → NotFound", func(t *testing.T) {

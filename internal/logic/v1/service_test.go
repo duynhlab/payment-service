@@ -23,6 +23,8 @@ type fakePayments struct {
 	byOrd  map[int64]int64
 	refSeq int64
 	refs   map[int64]*domain.Refund
+	// settleRefundErr, when set, fails every SettleRefund call.
+	settleRefundErr error
 	// ledgerPosts / reversals count successful capture / reversal postings —
 	// the fake posts nothing real, but rides the same CAS, so the counters
 	// prove the logic layer's ledger idempotency without a DB.
@@ -197,6 +199,11 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// settleRefundErr models the window where the provider already moved money
+	// but persisting that fact failed.
+	if f.settleRefundErr != nil {
+		return f.settleRefundErr
+	}
 	r, ok := f.refs[refundID]
 	if !ok {
 		return domain.ErrNotFound
@@ -217,6 +224,9 @@ type fakeIdem struct {
 	seq  int64
 	keys map[string]*idempotency.Record
 	take time.Duration
+	// releaseErr, when set, fails every Release — the window where a key is left
+	// locked after a failed attempt.
+	releaseErr error
 	// reapTTL/reapCount record the last Reap call so tests can assert the
 	// service delegates the configured TTL and surfaces the returned count.
 	reapTTL   time.Duration
@@ -271,7 +281,17 @@ func (f *fakeIdem) Checkpoint(_ context.Context, id int64, subjectID *int64) err
 	return nil
 }
 
-func (f *fakeIdem) Release(_ context.Context, id int64) error {
+// Release mirrors the real repository in the one way that matters for the
+// detached-release contract: a dead context fails the call. The production
+// Release is a single UPDATE on ctx, so a caller that passes an already-expired
+// request context never actually unlocks the key.
+func (f *fakeIdem) Release(ctx context.Context, id int64) error {
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, k := range f.keys {

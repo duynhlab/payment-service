@@ -695,6 +695,20 @@ func TestTranslateError(t *testing.T) {
 			wantMessage: "provider unavailable, retry",
 		},
 		{
+			name:        "refund declined is a definite conflict",
+			err:         fmt.Errorf("%w: card_issuer_refused", domain.ErrRefundDeclined),
+			wantStatus:  http.StatusUnprocessableEntity,
+			wantCode:    httpx.CodePaymentDeclined,
+			wantMessage: "Provider declined the refund",
+		},
+		{
+			name:        "refund not settled asks for a same-key retry",
+			err:         fmt.Errorf("%w: context deadline exceeded", domain.ErrRefundNotSettled),
+			wantStatus:  http.StatusServiceUnavailable,
+			wantCode:    httpx.CodeInternal,
+			wantMessage: "Refund not settled, retry with the same Idempotency-Key",
+		},
+		{
 			name:       "wrapped sentinel still matches",
 			err:        fmt.Errorf("transition: %w: captured -> voided", domain.ErrInvalidTransition),
 			wantStatus: http.StatusConflict,

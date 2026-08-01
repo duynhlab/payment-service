@@ -124,6 +124,33 @@ func TestServer_Charge(t *testing.T) {
 	})
 }
 
+// A refund amount ending in the refund-decline suffix is refused with 402 and a
+// machine code, so the client can type it as a DECIDED answer. The suffix is
+// refund-only on purpose: the saga refunds the amount it charged, so sharing a
+// charge-decline suffix would make "charge succeeded, refund refused"
+// unreachable.
+func TestServer_RefundDeclineHasItsOwnSuffix(t *testing.T) {
+	base := newServer(t)
+	// 5007 ends in 07 (refund decline) and NOT in a charge-decline suffix, so the
+	// charge itself must succeed.
+	_, body := post(t, base+"/charges", provider.ChargeRequest{IdempotencyKey: "cd", AmountMinor: 5007, Currency: "USD"})
+	id := decodeCharge(t, body).ProviderPaymentID
+	if id == "" {
+		t.Fatal("a …07 charge must succeed — the suffix is refund-only")
+	}
+	if st, _ := post(t, base+"/charges/"+id+"/capture", nil); st != http.StatusOK {
+		t.Fatalf("capture status %d", st)
+	}
+
+	st, rb := post(t, base+"/refunds", provider.RefundRequest{ProviderPaymentID: id, AmountMinor: 5007, IdempotencyKey: "rk-dec"})
+	if st != http.StatusPaymentRequired {
+		t.Fatalf("refund status = %d, want 402", st)
+	}
+	if !strings.Contains(string(rb), "refund_declined") {
+		t.Fatalf("decline body = %s, want the refund_declined code", rb)
+	}
+}
+
 func TestServer_CaptureVoidRefund(t *testing.T) {
 	base := newServer(t)
 	_, body := post(t, base+"/charges", provider.ChargeRequest{IdempotencyKey: "c", AmountMinor: 7000, Currency: "USD"})

@@ -233,6 +233,84 @@ func TestHTTPClient_TransportErrorIsRetryable(t *testing.T) {
 	}
 }
 
+// A refund refusal must be typed as a DECLINE, not left as a generic error: the
+// caller uses the type to tell "the provider decided no" (record failed, stop)
+// from "we do not know" (hold the reserve, retry with the same key). Before this
+// was typed, every real refund refusal read as unknown and the refund stayed
+// pending forever.
+func TestHTTPClient_RefundRefusalIsADecline(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"code":"refund_declined","error":"issuer refused"}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	_, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk-402")
+	var declined *provider.DeclinedError
+	if !errors.As(err, &declined) {
+		t.Fatalf("refund 402 err = %v, want *DeclinedError", err)
+	}
+	if declined.Code != "refund_declined" {
+		t.Errorf("decline code = %q, want refund_declined", declined.Code)
+	}
+}
+
+// A 200 with no provider refund id is not evidence that money moved. Decoding
+// such a body succeeds, so without this guard the refund would be settled
+// `succeeded` and its ledger entry would carry no provider reference — nothing
+// reconciliation could ever match.
+func TestHTTPClient_RefundOKWithoutIDIsNotSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	id, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk-empty")
+	if err == nil {
+		t.Fatalf("200 with no refund id must error, got id %q", id)
+	}
+	var declined *provider.DeclinedError
+	if errors.As(err, &declined) {
+		t.Fatalf("a missing id is unknown, not a decline: %v", err)
+	}
+}
+
+// A decided non-402 failure (unknown charge, malformed request) must be typed
+// ErrDefinite, not left generic: replaying it can never succeed, so treating it
+// as "we do not know" would retry forever and hold the refund's reserve open.
+// 5xx and the two ask-again statuses stay undecided.
+func TestHTTPClient_RefundDefiniteVsUndecided(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		definite bool
+	}{
+		{"unknown charge", http.StatusNotFound, true},
+		{"malformed request", http.StatusBadRequest, true},
+		{"conflict", http.StatusConflict, true},
+		{"request timeout asks again", http.StatusRequestTimeout, false},
+		{"rate limited asks again", http.StatusTooManyRequests, false},
+		{"server error", http.StatusInternalServerError, false},
+		{"bad gateway", http.StatusBadGateway, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(ts.Close)
+
+			_, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk")
+			if err == nil {
+				t.Fatalf("status %d must error", tc.status)
+			}
+			if got := errors.Is(err, provider.ErrDefinite); got != tc.definite {
+				t.Fatalf("status %d definite = %v, want %v (err %v)", tc.status, got, tc.definite, err)
+			}
+		})
+	}
+}
+
 // An unexpected status (500) is likewise not a decline — the caller retries.
 func TestHTTPClient_UnexpectedStatusIsError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

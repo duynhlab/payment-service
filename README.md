@@ -19,9 +19,12 @@ reproducible failure testing.
   database compare-and-swap, so concurrent transitions cannot both win
 - **Refunds** — first-class objects, partial and repeatable;
   `partially_refunded` is derived from `SUM(refunds)` rather than stored
-- **Deterministic failure triggers** — magic amount suffixes (`…02` generic
-  decline, `…95` insufficient funds, `…19` transient error that succeeds on
-  retry) make failure paths reproducible in tests and demos
+- **Deterministic failure triggers** — magic amount suffixes make failure paths
+  reproducible in tests and demos. Charges: `…02` generic decline, `…95`
+  insufficient funds, `…19` transient error that succeeds on retry. Refunds have
+  their own suffix, `…07` refund declined — the saga refunds the amount it
+  charged, so a shared suffix could never produce "charge succeeded, refund
+  refused"
 
 ## API Endpoints
 
