@@ -31,7 +31,16 @@ var (
 		metric.WithDescription("Money-lifecycle operations (capture/void/refund) by outcome"))
 	reconDiscrepancyCounter, _ = meter.Int64Counter("payment.reconciliation.discrepancies.total",
 		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by kind"))
+	keyReleaseFailureCounter, _ = meter.Int64Counter("payment.idempotency.release_failures.total",
+		metric.WithDescription("Idempotency keys that could not be unlocked after a failed attempt; each one delays a caller's same-key retry until the takeover window"))
 )
+
+// recordKeyReleaseFailure counts a key left locked after a failed attempt. The
+// caller is told to retry immediately, so a rising count means those retries are
+// bouncing off ErrLocked instead — invisible without this counter.
+func recordKeyReleaseFailure(ctx context.Context) {
+	keyReleaseFailureCounter.Add(ctx, 1)
+}
 
 // Authorization outcomes (bounded).
 const (

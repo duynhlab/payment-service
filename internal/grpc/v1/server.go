@@ -197,6 +197,15 @@ func mapErr(err error) error {
 		return status.Error(codes.FailedPrecondition, "invalid payment state transition")
 	case errors.Is(err, domain.ErrRefundRejected):
 		return status.Error(codes.FailedPrecondition, "refund rejected")
+	case errors.Is(err, domain.ErrRefundDeclined):
+		// Definite: retrying cannot change the provider's mind, so the saga must
+		// stop and park rather than burn its compensation budget.
+		return status.Error(codes.FailedPrecondition, "refund declined by provider")
+	case errors.Is(err, domain.ErrRefundNotSettled):
+		// Unknown outcome — Unavailable is the platform's retryable code, and the
+		// saga's retry carries the same refund identity, so it replays rather
+		// than refunding twice.
+		return status.Error(codes.Unavailable, "refund not settled, retry")
 	default:
 		return status.Error(codes.Internal, "payment operation failed")
 	}

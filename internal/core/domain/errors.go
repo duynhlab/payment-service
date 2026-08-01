@@ -19,6 +19,19 @@ var ErrPaymentExists = errors.New("order already has a payment")
 // capturable/refundable or the amount would exceed the capture.
 var ErrRefundRejected = errors.New("refund rejected: not refundable or exceeds captured amount")
 
+// ErrRefundNotSettled is returned when a refund's provider outcome is UNKNOWN
+// (timeout, transport error, unclassifiable status): the money may or may not
+// have moved. The refund stays `pending` so its reserved amount keeps blocking
+// a second refund of the same money, and the caller MUST be able to retry with
+// the same idempotency key — which is why this is an error rather than a
+// success carrying status "failed". Retryable.
+var ErrRefundNotSettled = errors.New("refund outcome unknown: not settled")
+
+// ErrRefundDeclined is returned when the provider DEFINITELY refused the
+// refund. No money moved, so the refund is recorded `failed` and its reserve is
+// released; the answer is still not a success. Not retryable.
+var ErrRefundDeclined = errors.New("refund declined by provider")
+
 // ErrKeyConflict is returned when the same key arrives with a different
 // request hash — a key identifies one request, not one endpoint. Maps to
 // 409 IDEMPOTENCY_CONFLICT.

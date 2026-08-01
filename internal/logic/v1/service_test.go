@@ -271,7 +271,14 @@ func (f *fakeIdem) Checkpoint(_ context.Context, id int64, subjectID *int64) err
 	return nil
 }
 
-func (f *fakeIdem) Release(_ context.Context, id int64) error {
+// Release mirrors the real repository in the one way that matters for the
+// detached-release contract: a dead context fails the call. The production
+// Release is a single UPDATE on ctx, so a caller that passes an already-expired
+// request context never actually unlocks the key.
+func (f *fakeIdem) Release(ctx context.Context, id int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, k := range f.keys {

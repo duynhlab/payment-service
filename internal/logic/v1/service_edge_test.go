@@ -43,25 +43,148 @@ func (f *failingProvider) Void(ctx context.Context, id string) error {
 	return f.Stub.Void(ctx, id)
 }
 
-func TestCreateRefund_ProviderFailureSettlesFailed(t *testing.T) {
+// TestCreateRefund_ProviderUnknownNeverSealsTheKey is the regression test for
+// the money bug this slice fixes: a refund whose provider outcome is UNKNOWN
+// (timeout, transport error, unclassifiable status) used to be persisted as
+// `failed` AND sealed into the idempotency cache as a 201. Every later retry
+// then replayed that verdict without ever calling the provider again, so the
+// customer's money never moved and no key existed that could re-drive it.
+//
+// The refund must instead stay `pending` (we do not know whether money moved,
+// so the reserve stays held — refunding again on top would risk paying twice),
+// the caller must see an error, and the SAME key must re-drive the provider.
+func TestCreateRefund_ProviderUnknownNeverSealsTheKey(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), refundErr: errors.New("mockpay down")}
 	svc := NewService(fp, fi, prov, 168*time.Hour)
 
-	res, _ := svc.CreateIntent(context.Background(), "k-pf", intent(2000))
+	res, _ := svc.CreateIntent(context.Background(), "k-unk", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
 		t.Fatal(err)
 	}
-	ref, _, err := svc.CreateRefund(context.Background(), "rk-pf", res.Payment.ID, 7, 500, "")
+
+	_, _, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("unknown provider outcome err = %v, want ErrRefundNotSettled", err)
+	}
+	if len(fp.refs) != 1 {
+		t.Fatalf("refund count = %d, want exactly one", len(fp.refs))
+	}
+	for _, r := range fp.refs {
+		if r.Status != domain.RefundPending {
+			t.Fatalf("refund status = %s, want pending (fate unknown)", r.Status)
+		}
+	}
+
+	// The same key must re-drive the provider rather than replay a sealed
+	// verdict. With the provider recovered, the retry settles for real.
+	prov.refundErr = nil
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, 7, 500, "")
 	if err != nil {
-		t.Fatalf("refund with provider failure should settle failed, got err %v", err)
+		t.Fatalf("retry after recovery: %v", err)
 	}
-	if ref.Status != domain.RefundFailed {
-		t.Fatalf("refund status = %s, want failed", ref.Status)
+	if replayed {
+		t.Fatal("retry replayed a cached response — the failed attempt was sealed")
 	}
-	// A failed refund releases its reserved amount: full refund still possible.
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-pf2", res.Payment.ID, 7, 2000, ""); err != nil {
-		t.Fatalf("full refund after failed refund must pass, got %v", err)
+	if ref.Status != domain.RefundSucceeded {
+		t.Fatalf("retry status = %s, want succeeded", ref.Status)
+	}
+}
+
+// TestCreateRefund_ProviderDeclineIsDefinite separates a DEFINITE answer from
+// an unknown one: the provider said no, so the refund is `failed` and its
+// reserved amount is released (no money moved, so a different refund may still
+// be attempted). The caller still gets an error — a refund that did not happen
+// is never a 201.
+func TestCreateRefund_ProviderDeclineIsDefinite(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(),
+		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-dec", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := svc.CreateRefund(context.Background(), "rk-dec", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrRefundDeclined) {
+		t.Fatalf("declined refund err = %v, want ErrRefundDeclined", err)
+	}
+	if len(fp.refs) != 1 {
+		t.Fatalf("refund count = %d, want exactly one", len(fp.refs))
+	}
+	for _, r := range fp.refs {
+		if r.Status != domain.RefundFailed {
+			t.Fatalf("refund status = %s, want failed (definite)", r.Status)
+		}
+	}
+
+	// A definite decline released the reserve, so the full amount is refundable.
+	prov.refundErr = nil
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-dec2", res.Payment.ID, 7, 2000, ""); err != nil {
+		t.Fatalf("full refund after a definite decline must pass, got %v", err)
+	}
+}
+
+// TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess closes the second door
+// into the same bug: the first attempt already persisted `failed`, so a same-key
+// retry adopts that row and skips settlement entirely. Without the seal guard it
+// would answer 201 with a failed refund body — the exact lie the fresh-failure
+// path was just taught not to tell.
+func TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(),
+		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-adopt", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
+		t.Fatalf("first attempt err = %v, want ErrRefundDeclined", err)
+	}
+
+	// Same key, provider now healthy: the adopted row is still `failed`, so the
+	// answer must stay an error rather than become a success — and it must keep
+	// the DECLINE's certainty, so the saga stops instead of retrying a decision
+	// the provider already made.
+	prov.refundErr = nil
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrRefundDeclined) {
+		t.Fatalf("retry of a declined refund err = %v (ref %+v, replayed %v), want ErrRefundDeclined",
+			err, ref, replayed)
+	}
+}
+
+// TestCreateRefund_UnknownReleasesKeyOnADeadContext pins the reason the release
+// is detached from the request context. The canonical unknown outcome IS a
+// timeout, so by the time we unlock the key the request context is already dead.
+// Releasing on it would fail exactly when it matters, leaving the key locked
+// while the response tells the caller to retry immediately — the retry would
+// bounce off ErrLocked until the takeover window (90s here, minutes in prod).
+func TestCreateRefund_UnknownReleasesKeyOnADeadContext(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(), refundErr: context.DeadlineExceeded}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-dead", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	// A context that is already cancelled when the refund attempt gives up.
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := svc.CreateRefund(dead, "rk-dead", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("err = %v, want ErrRefundNotSettled", err)
+	}
+
+	// The key must be usable again on a live context — not locked out.
+	prov.refundErr = nil
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-dead", res.Payment.ID, 7, 500, ""); err != nil {
+		t.Fatalf("same-key retry after a dead-context failure: %v (key left locked?)", err)
 	}
 }
 

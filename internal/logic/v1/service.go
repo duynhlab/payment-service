@@ -367,6 +367,26 @@ func (s *Service) reloadAfterRace(ctx context.Context, id int64, want domain.Sta
 	return nil, fmt.Errorf("%w: payment is %s", domain.ErrInvalidTransition, pay.Status)
 }
 
+// releaseTimeout bounds the detached key-release call. Short on purpose: it runs
+// on the failure path, after the caller is already waiting.
+const releaseTimeout = 3 * time.Second
+
+// releaseKey unlocks a claimed idempotency key after a failed attempt so an
+// immediate same-key retry can re-drive.
+//
+// It deliberately does NOT ride the request context. The canonical reason we
+// are here is a provider TIMEOUT, which means ctx is already past its deadline —
+// releasing on it would fail exactly when the release matters most, leaving the
+// key locked while the response tells the caller to retry immediately. The
+// retry would then bounce off ErrLocked until the takeover window.
+func (s *Service) releaseKey(ctx context.Context, keyID int64) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
+	defer cancel()
+	if err := s.idem.Release(rctx, keyID); err != nil {
+		recordKeyReleaseFailure(rctx)
+	}
+}
+
 // CreateRefund runs the idempotent (partial) refund flow. P1 settles
 // synchronously against the provider stub; async webhook settlement is P2.
 func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, userID, amountMinor int64, reason string) (*domain.Refund, bool, error) {
@@ -392,6 +412,7 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 
 	pay, err := s.payments.FindByID(ctx, paymentID, 0)
 	if err != nil {
+		s.releaseKey(ctx, key.ID)
 		return nil, false, err
 	}
 	// The refund insert is idempotent by this scoped key: a crash-recovery
@@ -402,6 +423,7 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 		if errors.Is(err, domain.ErrRefundRejected) {
 			recordOperation(ctx, opRefund, resultRejected)
 		}
+		s.releaseKey(ctx, key.ID)
 		return nil, false, err
 	}
 
@@ -409,12 +431,34 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	// must not be re-sent to the provider or re-settled — just finish.
 	if ref.Status == domain.RefundPending {
 		if err := s.settlePendingRefund(ctx, pay, ref, amountMinor, scopedKey); err != nil {
+			s.releaseKey(ctx, key.ID)
 			return nil, false, err
 		}
 	}
 
+	// ONLY a succeeded refund is sealed. Sealing any other outcome would cache
+	// it as the final answer for this key, and since the caller cannot mint a
+	// different key for the same refund, the money could never be sent again.
+	// This also covers the adopted-refund door above: a `failed` row reached by
+	// an earlier attempt answers with an error, not a cached 201.
+	if ref.Status != domain.RefundSucceeded {
+		s.releaseKey(ctx, key.ID)
+		// Keep the verdict's certainty: an adopted `failed` row was settled by a
+		// DEFINITE decline (that is the only way this status is written), so the
+		// caller must stop rather than retry a decision the provider already
+		// made. Anything else is still open.
+		if ref.Status == domain.RefundFailed {
+			return nil, false, fmt.Errorf("%w: refund %d already failed", domain.ErrRefundDeclined, ref.ID)
+		}
+		return nil, false, fmt.Errorf("%w: refund is %s", domain.ErrRefundNotSettled, ref.Status)
+	}
+
 	body, _ := json.Marshal(ref)
 	if err := s.idem.Finish(ctx, key.ID, 201, body); err != nil {
+		// The money moved but the answer is an error, so the caller will retry;
+		// release the key or that retry bounces off ErrLocked. The retry adopts
+		// this succeeded refund and seals it, without touching the provider.
+		s.releaseKey(ctx, key.ID)
 		return nil, false, err
 	}
 	return ref, false, nil
@@ -426,21 +470,46 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 // adopts an already-settled refund never re-settles or re-counts.
 func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, ref *domain.Refund, amountMinor int64, scopedKey string) error {
 	providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor, scopedKey)
-	status := domain.RefundSucceeded
 	if provErr != nil {
-		status = domain.RefundFailed
+		return s.refundNotSucceeded(ctx, ref, provErr)
 	}
-	if err := s.payments.SettleRefund(ctx, ref.ID, status, providerRefundID); err != nil {
+	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, providerRefundID); err != nil {
 		return err
 	}
-	ref.Status = status
+	ref.Status = domain.RefundSucceeded
 	ref.ProviderRefundID = providerRefundID
-	if status == domain.RefundSucceeded {
-		recordOperation(ctx, opRefund, resultOK)
-	} else {
-		recordOperation(ctx, opRefund, resultError)
-	}
+	recordOperation(ctx, opRefund, resultOK)
 	return nil
+}
+
+// refundNotSucceeded turns a provider failure into the right persisted state and
+// a non-nil error, because a refund that did not happen must never be answered
+// as one (and so must never reach idem.Finish — see CreateRefund).
+//
+// The split is between a DEFINITE and an UNKNOWN outcome:
+//
+//   - Definite decline: the provider refused, so no money moved. Record `failed`
+//     — that releases the reserved amount, leaving the payment refundable by
+//     another request — and return ErrRefundDeclined (not retryable).
+//   - Anything else (timeout, transport error, unclassifiable status): we do not
+//     know whether the money moved. Recording `failed` here would be marking an
+//     ambiguous outcome definite, which also frees the reserve and invites a
+//     second refund of money that may already be out the door. The row stays
+//     `pending` so the reserve keeps holding, and ErrRefundNotSettled tells the
+//     caller to retry with the SAME key — the provider call carries that key, so
+//     the retry replays provider-side rather than refunding twice.
+func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, provErr error) error {
+	recordOperation(ctx, opRefund, resultError)
+
+	var declined *provider.DeclinedError
+	if !errors.As(provErr, &declined) {
+		return fmt.Errorf("%w: %w", domain.ErrRefundNotSettled, provErr)
+	}
+	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundFailed, ""); err != nil {
+		return err
+	}
+	ref.Status = domain.RefundFailed
+	return fmt.Errorf("%w: %w", domain.ErrRefundDeclined, provErr)
 }
 
 // Get returns one payment scoped to its owner.

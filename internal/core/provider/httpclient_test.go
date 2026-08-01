@@ -233,6 +233,48 @@ func TestHTTPClient_TransportErrorIsRetryable(t *testing.T) {
 	}
 }
 
+// A refund refusal must be typed as a DECLINE, not left as a generic error: the
+// caller uses the type to tell "the provider decided no" (record failed, stop)
+// from "we do not know" (hold the reserve, retry with the same key). Before this
+// was typed, every real refund refusal read as unknown and the refund stayed
+// pending forever.
+func TestHTTPClient_RefundRefusalIsADecline(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"code":"refund_declined","error":"issuer refused"}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	_, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk-402")
+	var declined *provider.DeclinedError
+	if !errors.As(err, &declined) {
+		t.Fatalf("refund 402 err = %v, want *DeclinedError", err)
+	}
+	if declined.Code != "refund_declined" {
+		t.Errorf("decline code = %q, want refund_declined", declined.Code)
+	}
+}
+
+// A 200 with no provider refund id is not evidence that money moved. Decoding
+// such a body succeeds, so without this guard the refund would be settled
+// `succeeded` and its ledger entry would carry no provider reference — nothing
+// reconciliation could ever match.
+func TestHTTPClient_RefundOKWithoutIDIsNotSuccess(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	id, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk-empty")
+	if err == nil {
+		t.Fatalf("200 with no refund id must error, got id %q", id)
+	}
+	var declined *provider.DeclinedError
+	if errors.As(err, &declined) {
+		t.Fatalf("a missing id is unknown, not a decline: %v", err)
+	}
+}
+
 // An unexpected status (500) is likewise not a decline — the caller retries.
 func TestHTTPClient_UnexpectedStatusIsError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

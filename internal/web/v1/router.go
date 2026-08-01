@@ -135,6 +135,14 @@ func translateError(c *gin.Context, err error) {
 			"Refund rejected: not refundable or exceeds captured amount")
 	case errors.Is(err, domain.ErrInvalidTransition):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition, "Invalid payment state transition")
+	case errors.Is(err, domain.ErrRefundDeclined):
+		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition,
+			"Provider declined the refund")
+	case errors.Is(err, domain.ErrRefundNotSettled):
+		// The refund may or may not have moved money, so this is neither a
+		// success nor a definite failure: retry with the SAME key.
+		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal,
+			"Refund not settled, retry with the same Idempotency-Key")
 	case errors.Is(err, provider.ErrTransient):
 		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal, "provider unavailable, retry")
 	default:

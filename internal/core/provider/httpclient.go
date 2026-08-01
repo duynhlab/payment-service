@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -171,12 +172,26 @@ func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amoun
 	if err != nil {
 		return "", err
 	}
+	// A refusal is a DEFINITE answer and must be typed as one: the caller records
+	// the refund failed and stops, instead of treating a decided "no" as an
+	// unknown outcome and holding the reserve forever while it retries.
+	if status == http.StatusPaymentRequired {
+		outcome = outcomeDeclined
+		return "", &DeclinedError{Code: decodeError(body).Code}
+	}
 	if status != http.StatusOK {
 		return "", fmt.Errorf("mockpay refund: status %d: %s", status, decodeError(body).Error)
 	}
 	var resp RefundResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return "", fmt.Errorf("mockpay refund decode: %w", err)
+	}
+	// A 200 carrying no refund id is not a demonstrated refund — decoding an
+	// empty or unrelated body succeeds and would otherwise be settled as
+	// `succeeded`, posting a ledger entry with no provider reference to
+	// reconcile against. Treat it as an unresolved outcome.
+	if resp.ProviderRefundID == "" {
+		return "", errors.New("mockpay refund: 200 with no provider refund id")
 	}
 	outcome = outcomeOK
 	return resp.ProviderRefundID, nil
