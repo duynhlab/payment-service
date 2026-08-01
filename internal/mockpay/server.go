@@ -10,12 +10,14 @@
 package mockpay
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -29,6 +31,10 @@ const msgUnknownCharge = "unknown charge"
 // codeRefundDeclined is the machine code a refused refund carries, mirroring the
 // charge path's decline codes so one client mapping covers both.
 const codeRefundDeclined = "refund_declined"
+
+// noAnswerDelay outlasts the payment client's 10s HTTP timeout, so the
+// …13 trigger produces a real timeout rather than a modelled error.
+const noAnswerDelay = 15 * time.Second
 
 // refundDeclineSuffix is the refund-only magic amount: a refund of an amount
 // ending in 07 is refused. Distinct from provider.Classify's charge suffixes
@@ -216,9 +222,26 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// second attempt with the same key falls through to success
+	case provider.OutcomeNoAnswer:
+		// Go silent: the charge IS created but the client never learns of it.
+		// That lost-response window is what the phase-6 taxonomy exists for, and
+		// it could previously only be reproduced by killing a container — which
+		// also destroyed the charge, so the "provider did it, we do not know"
+		// case was untestable. Here the charge really survives.
+		s.mintCharge(req)
+		s.noAnswer(r.Context())
+		return
 	case provider.OutcomeOK:
 	}
 
+	c := s.mintCharge(req)
+	writeJSON(w, http.StatusOK, c)
+}
+
+// mintCharge creates the charge and emits its webhook. Split out so the
+// no-answer trigger can create a charge that really exists and then stay silent
+// about it — the lost-response window, reproduced faithfully. Caller holds s.mu.
+func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
 	s.seq++
 	c := provider.Charge{ProviderPaymentID: fmt.Sprintf("mp_%d", s.seq), Captured: req.AutoCapture}
 	if req.IdempotencyKey != "" {
@@ -233,7 +256,17 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 		eventType = "charge.captured"
 	}
 	s.emit(eventType, c.ProviderPaymentID, req.AmountMinor)
-	writeJSON(w, http.StatusOK, c)
+	return c
+}
+
+// noAnswer holds the response open past any sane client timeout, then closes
+// without writing. The caller sees a transport failure with no verdict — which
+// is the point: the effect landed, the answer did not.
+func (s *Server) noAnswer(ctx context.Context) {
+	select {
+	case <-time.After(noAnswerDelay):
+	case <-ctx.Done():
+	}
 }
 
 func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {

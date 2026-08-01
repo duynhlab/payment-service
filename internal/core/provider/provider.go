@@ -19,6 +19,10 @@ const (
 	DeclineInsufficient = "insufficient_funds" // amount_minor % 100 == 95
 	DeclineProcessing   = "processing_error"   // amount_minor % 100 == 19 (transient — retry succeeds)
 
+	// errUnknownProviderPayment is wrapped in ErrDefinite: the provider does not
+	// have this charge, and no retry invents one. The HTTP client answers 404
+	// the same way, so a stub-backed test sees the classification production
+	// sees.
 	errUnknownProviderPayment = "unknown provider payment %q"
 )
 
@@ -110,6 +114,11 @@ const (
 	OutcomeGenericDecline
 	OutcomeInsufficient
 	OutcomeTransient
+	// OutcomeNoAnswer models the provider going silent — the case that matters
+	// most and was previously untestable without stopping a container: the
+	// request may have been processed, we simply never learn. Distinct from
+	// OutcomeTransient, which is an explicit "ask again".
+	OutcomeNoAnswer
 )
 
 // Classify maps an amount's minor-unit suffix to its magic outcome. Shared by
@@ -123,6 +132,8 @@ func Classify(amountMinor int64) Outcome {
 		return OutcomeInsufficient
 	case 19:
 		return OutcomeTransient
+	case 13:
+		return OutcomeNoAnswer
 	default:
 		return OutcomeOK
 	}
@@ -193,6 +204,10 @@ func (s *Stub) Charge(_ context.Context, req ChargeRequest) (*Charge, error) {
 		return nil, &DeclinedError{Code: DeclineGeneric}
 	case OutcomeInsufficient:
 		return nil, &DeclinedError{Code: DeclineInsufficient}
+	case OutcomeNoAnswer:
+		// Silence, not a verdict: the charge may exist provider-side. Modelled as
+		// a deadline so callers classify it exactly as they would a real timeout.
+		return nil, fmt.Errorf("mockpay charge: %w", context.DeadlineExceeded)
 	case OutcomeTransient:
 		if !s.transientSeen[req.IdempotencyKey] {
 			s.transientSeen[req.IdempotencyKey] = true
@@ -219,7 +234,7 @@ func (s *Stub) Capture(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.captured[id]; !ok {
-		return fmt.Errorf(errUnknownProviderPayment, id)
+		return fmt.Errorf("%w: "+errUnknownProviderPayment, ErrDefinite, id)
 	}
 	s.captured[id] = true
 	return nil
@@ -234,7 +249,7 @@ func (s *Stub) Void(_ context.Context, id string) error {
 		return nil
 	}
 	if _, ok := s.captured[id]; !ok {
-		return fmt.Errorf(errUnknownProviderPayment, id)
+		return fmt.Errorf("%w: "+errUnknownProviderPayment, ErrDefinite, id)
 	}
 	delete(s.captured, id)
 	s.voided[id] = true
@@ -246,7 +261,7 @@ func (s *Stub) Refund(_ context.Context, id string, _ int64, idemKey string) (st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.captured[id]; !ok {
-		return "", fmt.Errorf(errUnknownProviderPayment, id)
+		return "", fmt.Errorf("%w: "+errUnknownProviderPayment, ErrDefinite, id)
 	}
 	return "re_" + idemKey, nil
 }
