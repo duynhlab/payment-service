@@ -136,7 +136,10 @@ func translateError(c *gin.Context, err error) {
 	case errors.Is(err, domain.ErrInvalidTransition):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition, "Invalid payment state transition")
 	case errors.Is(err, domain.ErrRefundDeclined):
-		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition,
+		// Same code and status as a declined charge: the provider decided, the
+		// state machine did not. INVALID_TRANSITION would tell a client the
+		// opposite of what happened.
+		httpx.RespondError(c, http.StatusUnprocessableEntity, httpx.CodePaymentDeclined,
 			"Provider declined the refund")
 	case errors.Is(err, domain.ErrRefundNotSettled):
 		// The refund may or may not have moved money, so this is neither a

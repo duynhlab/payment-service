@@ -158,6 +158,18 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path string) error {
 	return nil
 }
 
+// isDefiniteStatus reports whether a non-200 provider status is a decided
+// answer. Client errors are decided by definition — the request as sent is
+// wrong, so replaying it changes nothing — except the two that explicitly ask
+// for a retry. Server errors (5xx) and transport failures stay undecided: the
+// request may well have been processed.
+func isDefiniteStatus(status int) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
+		return false
+	}
+	return status >= 400 && status < 500
+}
+
 // Refund issues a refund via POST /refunds.
 func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amountMinor int64, idempotencyKey string) (string, error) {
 	start := time.Now()
@@ -174,13 +186,22 @@ func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amoun
 	}
 	// A refusal is a DEFINITE answer and must be typed as one: the caller records
 	// the refund failed and stops, instead of treating a decided "no" as an
-	// unknown outcome and holding the reserve forever while it retries.
+	// unknown outcome and holding the reserve open while it retries something
+	// that can never succeed.
 	if status == http.StatusPaymentRequired {
 		outcome = outcomeDeclined
 		return "", &DeclinedError{Code: decodeError(body).Code}
 	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("mockpay refund: status %d: %s", status, decodeError(body).Error)
+		err := fmt.Errorf("mockpay refund: status %d: %s", status, decodeError(body).Error)
+		// Other 4xx are equally decided — a malformed request or an unknown
+		// charge cannot start working on retry — so they must not be filed as
+		// "we do not know". 408/429 are the exceptions: both mean ask again.
+		if isDefiniteStatus(status) {
+			outcome = outcomeDeclined
+			return "", fmt.Errorf("%w: %w", ErrDefinite, err)
+		}
+		return "", err
 	}
 	var resp RefundResponse
 	if err := json.Unmarshal(body, &resp); err != nil {

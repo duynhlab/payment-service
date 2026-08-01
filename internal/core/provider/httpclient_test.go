@@ -275,6 +275,42 @@ func TestHTTPClient_RefundOKWithoutIDIsNotSuccess(t *testing.T) {
 	}
 }
 
+// A decided non-402 failure (unknown charge, malformed request) must be typed
+// ErrDefinite, not left generic: replaying it can never succeed, so treating it
+// as "we do not know" would retry forever and hold the refund's reserve open.
+// 5xx and the two ask-again statuses stay undecided.
+func TestHTTPClient_RefundDefiniteVsUndecided(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		definite bool
+	}{
+		{"unknown charge", http.StatusNotFound, true},
+		{"malformed request", http.StatusBadRequest, true},
+		{"conflict", http.StatusConflict, true},
+		{"request timeout asks again", http.StatusRequestTimeout, false},
+		{"rate limited asks again", http.StatusTooManyRequests, false},
+		{"server error", http.StatusInternalServerError, false},
+		{"bad gateway", http.StatusBadGateway, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(ts.Close)
+
+			_, err := provider.NewHTTPClient(ts.URL).Refund(context.Background(), "ch_1", 500, "rk")
+			if err == nil {
+				t.Fatalf("status %d must error", tc.status)
+			}
+			if got := errors.Is(err, provider.ErrDefinite); got != tc.definite {
+				t.Fatalf("status %d definite = %v, want %v (err %v)", tc.status, got, tc.definite, err)
+			}
+		})
+	}
+}
+
 // An unexpected status (500) is likewise not a decline — the caller retries.
 func TestHTTPClient_UnexpectedStatusIsError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -697,8 +697,8 @@ func TestTranslateError(t *testing.T) {
 		{
 			name:        "refund declined is a definite conflict",
 			err:         fmt.Errorf("%w: card_issuer_refused", domain.ErrRefundDeclined),
-			wantStatus:  http.StatusConflict,
-			wantCode:    httpx.CodeInvalidTransition,
+			wantStatus:  http.StatusUnprocessableEntity,
+			wantCode:    httpx.CodePaymentDeclined,
 			wantMessage: "Provider declined the refund",
 		},
 		{

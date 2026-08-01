@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -185,6 +186,49 @@ func TestCreateRefund_UnknownReleasesKeyOnADeadContext(t *testing.T) {
 	prov.refundErr = nil
 	if _, _, err := svc.CreateRefund(context.Background(), "rk-dead", res.Payment.ID, 7, 500, ""); err != nil {
 		t.Fatalf("same-key retry after a dead-context failure: %v (key left locked?)", err)
+	}
+}
+
+// TestCreateRefund_DefiniteFailureIsNotRetried covers the failure the deployed
+// provider actually produces: an unknown charge answers 404, which is decided.
+// It must be recorded `failed` and stopped like a decline — filing it as unknown
+// would retry something that can never succeed and hold the reserve open for a
+// refund that will never happen.
+func TestCreateRefund_DefiniteFailureIsNotRetried(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	prov := &failingProvider{Stub: provider.NewStub(),
+		refundErr: fmt.Errorf("%w: mockpay refund: status 404", provider.ErrDefinite)}
+	svc := NewService(fp, fi, prov, 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-def", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-def", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
+		t.Fatalf("definite failure err = %v, want ErrRefundDeclined (not retryable)", err)
+	}
+	for _, r := range fp.refs {
+		if r.Status != domain.RefundFailed {
+			t.Fatalf("refund status = %s, want failed (decided)", r.Status)
+		}
+	}
+}
+
+// TestCreateRefund_SettleFailureAfterMoneyMovedStaysOpen: the provider paid, but
+// persisting that fact failed. From the outside the refund is unsettled, so the
+// answer must be the retryable sentinel — a bare error would be a non-retryable
+// 500 for a refund whose money already left.
+func TestCreateRefund_SettleFailureAfterMoneyMovedStaysOpen(t *testing.T) {
+	fp, fi := newFakePayments(), newFakeIdem()
+	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour)
+
+	res, _ := svc.CreateIntent(context.Background(), "k-settle", intent(2000))
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	fp.settleRefundErr = errors.New("db gone")
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-settle", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("settle failure err = %v, want ErrRefundNotSettled", err)
 	}
 }
 

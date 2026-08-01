@@ -58,6 +58,11 @@ const (
 	resultOK       = "ok"
 	resultRejected = "rejected"
 	resultError    = "error"
+	// A failed money operation splits by whether the provider DECIDED. The two
+	// need opposite responses — a decline is parked, an unknown outcome is
+	// retried and then resolved — so they cannot share one label.
+	resultDeclined = "declined"
+	resultUnknown  = "unknown"
 )
 
 // recordAuthorization counts one authorization attempt with its outcome and

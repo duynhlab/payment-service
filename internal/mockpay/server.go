@@ -26,6 +26,10 @@ import (
 // the mock has never issued (or already voided).
 const msgUnknownCharge = "unknown charge"
 
+// codeRefundDeclined is the machine code a refused refund carries, mirroring the
+// charge path's decline codes so one client mapping covers both.
+const codeRefundDeclined = "refund_declined"
+
 // maxBodyBytes caps request bodies (tiny JSON) so a client cannot grow memory
 // with a giant body.
 const maxBodyBytes = 1 << 20 // 1 MiB
@@ -277,6 +281,17 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := s.captured[req.ProviderPaymentID]; !ok {
 		writeError(w, http.StatusNotFound, "", msgUnknownCharge)
+		return
+	}
+	// A refund can be refused too, and the caller MUST be able to tell that
+	// decided "no" from a timeout: one is recorded and parked, the other is held
+	// open and retried. Without a trigger here the decline branch is unreachable
+	// end to end, so the same magic-amount convention the charge path uses
+	// (provider.Classify) drives it — a refund amount ending in 02 is refused.
+	if provider.Classify(req.AmountMinor) == provider.OutcomeGenericDecline {
+		s.logger.Info("refund declined", zap.String("charge", req.ProviderPaymentID),
+			zap.Int64("amount_minor", req.AmountMinor))
+		writeError(w, http.StatusPaymentRequired, codeRefundDeclined, "refund declined")
 		return
 	}
 

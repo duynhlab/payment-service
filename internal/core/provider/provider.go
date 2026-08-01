@@ -128,6 +128,15 @@ func Classify(amountMinor int64) Outcome {
 	}
 }
 
+// ErrDefinite marks a provider answer that is FINAL even though it is not a
+// business decline: the request as sent can never succeed (malformed, unknown
+// charge, an amount the provider refuses to process). It exists because the
+// caller's only real question about a failure is "is this decided?" — a decided
+// failure is recorded and stopped, an undecided one is held open and retried.
+//
+// 408 and 429 are deliberately NOT definite: both mean "ask again".
+var ErrDefinite = errors.New("provider answered definitively: request cannot succeed")
+
 // Provider is the outbound port to the payment provider.
 type Provider interface {
 	Charge(ctx context.Context, req ChargeRequest) (*Charge, error)

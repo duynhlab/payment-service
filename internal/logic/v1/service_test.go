@@ -23,6 +23,8 @@ type fakePayments struct {
 	byOrd  map[int64]int64
 	refSeq int64
 	refs   map[int64]*domain.Refund
+	// settleRefundErr, when set, fails every SettleRefund call.
+	settleRefundErr error
 	// ledgerPosts / reversals count successful capture / reversal postings —
 	// the fake posts nothing real, but rides the same CAS, so the counters
 	// prove the logic layer's ledger idempotency without a DB.
@@ -197,6 +199,11 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// settleRefundErr models the window where the provider already moved money
+	// but persisting that fact failed.
+	if f.settleRefundErr != nil {
+		return f.settleRefundErr
+	}
 	r, ok := f.refs[refundID]
 	if !ok {
 		return domain.ErrNotFound

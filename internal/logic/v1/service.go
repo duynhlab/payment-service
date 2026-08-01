@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/duynhlab/pkg/idempotency"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
@@ -383,7 +385,14 @@ func (s *Service) releaseKey(ctx context.Context, keyID int64) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseTimeout)
 	defer cancel()
 	if err := s.idem.Release(rctx, keyID); err != nil {
+		// Counted so the lockout is alertable, and recorded on the request's span
+		// so the specific stuck key is traceable — the logic layer carries no
+		// logger of its own, and a bare counter would say something is wrong
+		// without saying which caller is locked out.
 		recordKeyReleaseFailure(rctx)
+		span := trace.SpanFromContext(rctx)
+		span.RecordError(err, trace.WithAttributes(
+			attribute.Int64("payment.idempotency_key_id", keyID)))
 	}
 }
 
@@ -442,6 +451,9 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 	// This also covers the adopted-refund door above: a `failed` row reached by
 	// an earlier attempt answers with an error, not a cached 201.
 	if ref.Status != domain.RefundSucceeded {
+		// Counted, or a refund rejected on adoption is invisible: no provider
+		// call happened on this attempt, so nothing else records it.
+		recordOperation(ctx, opRefund, resultRejected)
 		s.releaseKey(ctx, key.ID)
 		// Keep the verdict's certainty: an adopted `failed` row was settled by a
 		// DEFINITE decline (that is the only way this status is written), so the
@@ -474,7 +486,10 @@ func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, 
 		return s.refundNotSucceeded(ctx, ref, provErr)
 	}
 	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, providerRefundID); err != nil {
-		return err
+		// The money MOVED but we could not record it. That is the ambiguous case
+		// too — from the outside the refund is unsettled — and the same-key retry
+		// replays the provider's answer and re-persists it.
+		return fmt.Errorf("%w: recording the refund failed: %w", domain.ErrRefundNotSettled, err)
 	}
 	ref.Status = domain.RefundSucceeded
 	ref.ProviderRefundID = providerRefundID
@@ -488,25 +503,34 @@ func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, 
 //
 // The split is between a DEFINITE and an UNKNOWN outcome:
 //
-//   - Definite decline: the provider refused, so no money moved. Record `failed`
-//     — that releases the reserved amount, leaving the payment refundable by
-//     another request — and return ErrRefundDeclined (not retryable).
-//   - Anything else (timeout, transport error, unclassifiable status): we do not
-//     know whether the money moved. Recording `failed` here would be marking an
-//     ambiguous outcome definite, which also frees the reserve and invites a
-//     second refund of money that may already be out the door. The row stays
-//     `pending` so the reserve keeps holding, and ErrRefundNotSettled tells the
-//     caller to retry with the SAME key — the provider call carries that key, so
-//     the retry replays provider-side rather than refunding twice.
+//   - Decided (a business decline, or any other final answer such as a malformed
+//     request or an unknown charge): no money moved and a retry cannot change
+//     that. Record `failed` — which releases the reserved amount — and return
+//     ErrRefundDeclined (not retryable).
+//   - Undecided (timeout, transport error, 5xx): we do not know whether the money
+//     moved. Recording `failed` would mark an ambiguous outcome definite, so the
+//     row stays `pending` and ErrRefundNotSettled asks the caller to retry with
+//     the SAME idempotency key.
+//
+// What protects the money on that retry is the PROVIDER's idempotency key, which
+// the retry re-sends: the provider replays its own answer instead of paying
+// again. The pending row's held reserve is a narrower guard — it only caps the
+// TOTAL refunded against the capture, so it stops a same-money retry only when
+// the refund covers the whole remaining refundable amount. Sending the same key
+// is what makes a partial refund safe, which is why the error says so.
 func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, provErr error) error {
-	recordOperation(ctx, opRefund, resultError)
-
 	var declined *provider.DeclinedError
-	if !errors.As(provErr, &declined) {
+	decided := errors.As(provErr, &declined) || errors.Is(provErr, provider.ErrDefinite)
+	if !decided {
+		recordOperation(ctx, opRefund, resultUnknown)
 		return fmt.Errorf("%w: %w", domain.ErrRefundNotSettled, provErr)
 	}
+	recordOperation(ctx, opRefund, resultDeclined)
 	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundFailed, ""); err != nil {
-		return err
+		// The verdict itself is now unpersisted, so the outcome is open again:
+		// ask for a same-key retry rather than reporting a decline we did not
+		// manage to record.
+		return fmt.Errorf("%w: recording the decline failed: %w", domain.ErrRefundNotSettled, err)
 	}
 	ref.Status = domain.RefundFailed
 	return fmt.Errorf("%w: %w", domain.ErrRefundDeclined, provErr)
