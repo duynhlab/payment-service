@@ -14,7 +14,13 @@ import (
 type Status string
 
 const (
-	StatusPending    Status = "pending"
+	StatusPending Status = "pending"
+	// StatusProcessing is the INTENT state for doubt: an operation was attempted
+	// and the provider's answer never arrived. It is not a verdict and must never
+	// be resolved by guessing — only by learning what the provider actually did
+	// (RFC-0021 phase 6). Reaching it never triggers the semantic opposite of the
+	// operation in doubt.
+	StatusProcessing Status = "processing"
 	StatusAuthorized Status = "authorized"
 	StatusCaptured   Status = "captured"
 	StatusFailed     Status = "failed"
@@ -40,10 +46,16 @@ const DefaultCurrency = "USD"
 // is the concurrent-safety net; this map is the business rule and the good
 // error message.
 var allowedTransitions = map[Status][]Status{
-	StatusPending:    {StatusAuthorized, StatusFailed},
-	StatusAuthorized: {StatusCaptured, StatusVoided, StatusExpired},
-	StatusCaptured:   {StatusRefunded},
-	// failed, voided, expired, refunded are terminal.
+	StatusPending:    {StatusAuthorized, StatusFailed, StatusProcessing},
+	StatusAuthorized: {StatusCaptured, StatusVoided, StatusExpired, StatusProcessing},
+	StatusCaptured:   {StatusRefunded, StatusProcessing},
+	StatusVoided:     {StatusProcessing},
+	// Resolution: `processing` leads back to whichever definite state the
+	// provider turns out to have produced. It can reach `captured` and `voided`
+	// as well as the pre-operation states, because the doubt may be about an
+	// operation that DID land — resolving it is learning which, not choosing.
+	StatusProcessing: {StatusAuthorized, StatusFailed, StatusCaptured, StatusVoided, StatusRefunded},
+	// failed, expired, refunded are terminal.
 }
 
 // ErrInvalidTransition is returned when a requested state change is not in the
@@ -102,9 +114,14 @@ func (p *Payment) PartiallyRefunded() bool {
 type RefundStatus string
 
 const (
-	RefundPending   RefundStatus = "pending"
-	RefundSucceeded RefundStatus = "succeeded"
-	RefundFailed    RefundStatus = "failed"
+	RefundPending RefundStatus = "pending"
+	// RefundProcessing is the refund-level twin of StatusProcessing: the provider
+	// was asked and never answered. Distinct from RefundPending, which means
+	// "not asked yet" — the difference decides whether a retry re-drives the
+	// provider or starts something new.
+	RefundProcessing RefundStatus = "processing"
+	RefundSucceeded  RefundStatus = "succeeded"
+	RefundFailed     RefundStatus = "failed"
 )
 
 // Refund is a first-class object — never a mutation of its payment.
