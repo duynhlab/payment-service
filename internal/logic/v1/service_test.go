@@ -36,6 +36,11 @@ type fakePayments struct {
 	// transitionErr, when set, fails every CAS — the crash window between learning
 	// the provider's answer and writing it down.
 	transitionErr error
+	// findErr, when set, fails every payment read — the sweep's "this row will not
+	// load" branch.
+	findErr error
+	// findRefundErr does the same for refund reads.
+	findRefundErr error
 }
 
 func newFakePayments() *fakePayments {
@@ -64,6 +69,9 @@ func (f *fakePayments) Create(_ context.Context, p *domain.Payment) (*domain.Pay
 }
 
 func (f *fakePayments) FindByID(_ context.Context, id, userID int64) (*domain.Payment, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
@@ -219,6 +227,9 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 }
 
 func (f *fakePayments) FindRefundByID(_ context.Context, id int64) (*domain.Refund, error) {
+	if f.findRefundErr != nil {
+		return nil, f.findRefundErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.refs[id]

@@ -185,6 +185,34 @@ func TestProcessingRefund_KeepsItsReserveAndCanStillSettle(t *testing.T) {
 	}
 }
 
+// FindRefundByID is what the doubt sweep re-drives a parked refund from, so the
+// two fields that make a replay a replay — the amount and the ORIGINAL key — must
+// survive the round-trip. Losing the key turns the next attempt into a second
+// payout.
+func TestFindRefundByID_CarriesTheAmountAndTheOriginalKey(t *testing.T) {
+	pool := newTestDB(t)
+	ctx := context.Background()
+	repo := NewPaymentRepository(pool)
+
+	pay := capturedPayment(t, repo, 21, 4000, "ch_find")
+	created, err := repo.CreateRefund(ctx, pay.ID, 1500, "partial", "21:rk-find")
+	if err != nil {
+		t.Fatalf("create refund: %v", err)
+	}
+
+	got, err := repo.FindRefundByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("find refund: %v", err)
+	}
+	if got.AmountMinor != 1500 || got.IdempotencyKey != "21:rk-find" || got.PaymentID != pay.ID {
+		t.Fatalf("refund = %+v, want amount 1500, key 21:rk-find, payment %d", got, pay.ID)
+	}
+
+	if _, err := repo.FindRefundByID(ctx, created.ID+9999); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("missing refund = %v, want ErrNotFound", err)
+	}
+}
+
 // A capture parked in `processing` must still be reversible: that is how a
 // resolution records "the provider says it definitely never captured". While the
 // CAS only accepted `captured`, the reversal was impossible and the books kept
