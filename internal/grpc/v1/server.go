@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 
 	paymentv1 "github.com/duynhlab/pkg/proto/payment/v1"
 	"google.golang.org/grpc/codes"
@@ -115,22 +116,63 @@ func (s *Server) Void(ctx context.Context, req *paymentv1.VoidRequest) (*payment
 	return &paymentv1.VoidResponse{Payment: mapPayment(voided)}, nil
 }
 
-// Refund returns captured money (compensation). Idempotent by the order
-// (key refund:order:<id>).
+// Refund returns captured money (compensation).
+//
+// Idempotency is scoped by refund_request_id, and that identity is the caller's
+// to choose because only the caller knows whether two refunds are the same
+// intent. Keying on the order alone gave an order ONE refund identity for its
+// whole life, so a cancellation's remainder refund collided with the saga's
+// earlier compensation refund and was rejected outright — the second refund
+// could never be sent, whatever it was for.
+//
+// An empty request id keeps the historical `refund:order:<id>` key, so a saga
+// mid-flight across the rollout retries onto the same key it started with rather
+// than minting a second refund.
 func (s *Server) Refund(ctx context.Context, req *paymentv1.RefundRequest) (*paymentv1.RefundResponse, error) {
 	if req.GetAmountMinor() <= 0 || req.GetAmountMinor() > logicv1.MaxAmountMinor {
 		return nil, status.Error(codes.InvalidArgument, errMsgAmountRange)
+	}
+	key, err := refundKey(req.GetOrderId(), req.GetRefundRequestId())
+	if err != nil {
+		return nil, err
 	}
 	pay, err := s.lookup(ctx, req.GetOrderId())
 	if err != nil {
 		return nil, err
 	}
-	ref, _, err := s.svc.CreateRefund(ctx, fmt.Sprintf("refund:order:%d", req.GetOrderId()),
+	ref, _, err := s.svc.CreateRefund(ctx, key,
 		pay.ID, sagaUserID, req.GetAmountMinor(), req.GetReason())
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return &paymentv1.RefundResponse{Refund: mapRefund(ref)}, nil
+}
+
+// maxRefundRequestID bounds the caller-supplied identity. It ends up inside an
+// idempotency key and inside a provider key, so it is validated at the boundary
+// like any other external input rather than trusted because the caller is
+// internal.
+const maxRefundRequestID = 64
+
+// refundRequestIDPattern keeps the identity to characters that read the same in
+// a log line, a URL and a provider dashboard. A key that cannot be quoted back
+// verbatim is a key nobody can trace.
+var refundRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+
+// refundKey builds the idempotency key for a refund request.
+func refundKey(orderID int64, requestID string) (string, error) {
+	if requestID == "" {
+		return fmt.Sprintf("refund:order:%d", orderID), nil
+	}
+	if len(requestID) > maxRefundRequestID {
+		return "", status.Errorf(codes.InvalidArgument,
+			"refund_request_id must be at most %d characters", maxRefundRequestID)
+	}
+	if !refundRequestIDPattern.MatchString(requestID) {
+		return "", status.Error(codes.InvalidArgument,
+			"refund_request_id must use only letters, digits, and . _ : -")
+	}
+	return fmt.Sprintf("refund:order:%d:%s", orderID, requestID), nil
 }
 
 // GetPayment returns the order's payment snapshot (read-only). Owner-scoping is

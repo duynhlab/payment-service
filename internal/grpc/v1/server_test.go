@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	paymentv1 "github.com/duynhlab/pkg/proto/payment/v1"
@@ -247,6 +248,60 @@ func TestRefund(t *testing.T) {
 		for _, amt := range []int64{0, logicv1.MaxAmountMinor + 1} {
 			if _, err := NewServer(&fakeLogic{}).Refund(context.Background(), &paymentv1.RefundRequest{OrderId: 42, AmountMinor: amt}); status.Code(err) != codes.InvalidArgument {
 				t.Fatalf("want InvalidArgument for amount %d, got %v", amt, status.Code(err))
+			}
+		}
+	})
+
+	// The identity is what makes two refunds two refunds. Keyed on the order
+	// alone, an order had ONE refund identity for its whole life: a cancellation's
+	// remainder refund collided with the saga's earlier compensation refund and
+	// was rejected outright, so the second money movement could never happen.
+	t.Run("a request id scopes the key", func(t *testing.T) {
+		f := &fakeLogic{byOrder: pay, refund: &domain.Refund{ID: 4, PaymentID: 9}}
+		if _, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{
+			OrderId: 42, AmountMinor: 1000, RefundRequestId: "cancel-remainder",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if f.gotRefundID != "refund:order:42:cancel-remainder" {
+			t.Fatalf("key = %q, want it scoped by the request id", f.gotRefundID)
+		}
+	})
+
+	// A saga mid-flight across the rollout keeps retrying onto the key it started
+	// with. If an empty id minted a different key, that retry would become a
+	// SECOND refund rather than a replay of the first.
+	t.Run("no request id keeps the historical key", func(t *testing.T) {
+		f := &fakeLogic{byOrder: pay, refund: &domain.Refund{ID: 5, PaymentID: 9}}
+		if _, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{
+			OrderId: 42, AmountMinor: 1000,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if f.gotRefundID != "refund:order:42" {
+			t.Fatalf("key = %q, want the historical shape", f.gotRefundID)
+		}
+	})
+
+	// The id lands inside an idempotency key and, downstream, inside a provider
+	// key — so it is validated at the boundary like any other external input, not
+	// trusted because the caller happens to be internal.
+	t.Run("a malformed request id is refused before anything moves", func(t *testing.T) {
+		for name, id := range map[string]string{
+			"whitespace":  "cancel remainder",
+			"path escape": "../../etc",
+			"too long":    strings.Repeat("x", maxRefundRequestID+1),
+			"newline":     "cancel\nremainder",
+		} {
+			f := &fakeLogic{byOrder: pay, refund: &domain.Refund{ID: 6}}
+			_, err := NewServer(f).Refund(context.Background(), &paymentv1.RefundRequest{
+				OrderId: 42, AmountMinor: 1000, RefundRequestId: id,
+			})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Errorf("%s: want InvalidArgument, got %v", name, status.Code(err))
+			}
+			if f.gotRefundID != "" {
+				t.Errorf("%s: the refund was attempted with key %q", name, f.gotRefundID)
 			}
 		}
 	})
