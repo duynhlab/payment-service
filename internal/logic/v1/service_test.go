@@ -30,6 +30,12 @@ type fakePayments struct {
 	// prove the logic layer's ledger idempotency without a DB.
 	ledgerPosts int
 	reversals   int
+	// beforeTransition runs before each CAS, so a test can slip a competing writer
+	// into the window between a resolution's read and its write.
+	beforeTransition func()
+	// transitionErr, when set, fails every CAS — the crash window between learning
+	// the provider's answer and writing it down.
+	transitionErr error
 }
 
 func newFakePayments() *fakePayments {
@@ -100,6 +106,12 @@ func (f *fakePayments) ListByUser(_ context.Context, userID int64, limit, offset
 }
 
 func (f *fakePayments) TransitionStatus(_ context.Context, id int64, from, to domain.Status, set map[string]any) error {
+	if hook := f.beforeTransition; hook != nil {
+		hook()
+	}
+	if f.transitionErr != nil {
+		return f.transitionErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
@@ -137,7 +149,10 @@ func (f *fakePayments) ReverseCapture(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
-	if !ok || p.Status != domain.StatusCaptured {
+	// Mirror the production CAS (`WHERE status IN ('captured','processing')`): a
+	// reversal is also how a PARKED capture is undone once the provider says it
+	// definitely never happened.
+	if !ok || (p.Status != domain.StatusCaptured && p.Status != domain.StatusProcessing) {
 		return domain.ErrStaleTransition
 	}
 	p.Status = domain.StatusAuthorized
@@ -189,6 +204,13 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 	if amountMinor+f.refundedLocked(paymentID) > p.AmountMinor {
 		return nil, domain.ErrRefundRejected
 	}
+	// Mirror the production guard: nothing new goes out while a refund's fate is
+	// unknown. Two partials can both fit under the amount cap and both be paid.
+	for _, r := range f.refs {
+		if r.PaymentID == paymentID && r.Status == domain.RefundProcessing {
+			return nil, domain.ErrRefundRejected
+		}
+	}
 	f.refSeq++
 	r := &domain.Refund{ID: f.refSeq, PaymentID: paymentID, AmountMinor: amountMinor, Status: domain.RefundPending, Reason: reason, IdempotencyKey: idemKey}
 	f.refs[r.ID] = r
@@ -206,6 +228,12 @@ func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status do
 	}
 	r, ok := f.refs[refundID]
 	if !ok {
+		return domain.ErrNotFound
+	}
+	// Mirror the production CAS (`WHERE status IN ('pending','processing')`). Its
+	// absence here is what let a settle-from-processing pass in tests while being
+	// impossible in Postgres.
+	if r.Status != domain.RefundPending && r.Status != domain.RefundProcessing {
 		return domain.ErrNotFound
 	}
 	r.Status = status
@@ -325,7 +353,9 @@ func (f *fakeIdem) Reap(_ context.Context, ttl time.Duration) (int64, error) {
 
 func newTestService() (*Service, *fakePayments, *fakeIdem, *provider.Stub) {
 	fp, fi, st := newFakePayments(), newFakeIdem(), provider.NewStub()
-	return NewService(fp, fi, st, 168*time.Hour), fp, fi, st
+	// A real attempt log, because production always has one and parking now
+	// depends on it: an unknown outcome is only parked once its evidence lands.
+	return NewService(fp, fi, st, 168*time.Hour, WithAttempts(&recordingAttempts{})), fp, fi, st
 }
 
 func intent(amount int64) CreateIntentInput {

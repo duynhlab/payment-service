@@ -227,7 +227,11 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 	case provider.OutcomeTransient:
 		if !s.transientSeen[req.IdempotencyKey] {
 			s.transientSeen[req.IdempotencyKey] = true
-			writeError(w, http.StatusServiceUnavailable, provider.DeclineProcessing, "processing error, retry")
+			// 429, not 503: the trigger models a provider that REFUSED the request
+			// and did nothing with it, which is a decided answer the caller may
+			// safely retry. A 503 would mean "I may have done it" — undecided — and
+			// the client now classifies it that way.
+			writeError(w, http.StatusTooManyRequests, provider.DeclineProcessing, "processing error, retry")
 			return
 		}
 		// second attempt with the same key falls through to success

@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -117,7 +118,7 @@ func TestCreateIntent_RepoErrorPropagation(t *testing.T) {
 			ep := &erroringPayments{fakePayments: newFakePayments()}
 			ei := &erroringIdem{fakeIdem: newFakeIdem()}
 			tt.mut(ep, ei)
-			svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+			svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 			if _, err := svc.CreateIntent(context.Background(), "k-err", intent(2000)); !errors.Is(err, errBoom) {
 				t.Fatalf("want errBoom, got %v", err)
 			}
@@ -128,7 +129,7 @@ func TestCreateIntent_RepoErrorPropagation(t *testing.T) {
 func TestFinishIntent_FindErrorPropagates(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	// Let the flow run, but poison the final snapshot read.
 	res, err := svc.CreateIntent(context.Background(), "k-snap", intent(2000))
@@ -155,7 +156,7 @@ func TestCreateIntent_MapsIdempotencySentinels(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: tt.claimErr}
-			svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+			svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 			if _, err := svc.CreateIntent(context.Background(), "k", intent(2000)); !errors.Is(err, tt.want) {
 				t.Fatalf("want %v, got %v", tt.want, err)
 			}
@@ -167,7 +168,7 @@ func TestCreateIntent_MapsIdempotencySentinels(t *testing.T) {
 // CreateIntent mapping — guards a future divergent call site).
 func TestCreateRefund_MapsIdempotencySentinels(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: idempotency.ErrLocked}
-	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, domain.ErrKeyLocked) {
 		t.Fatalf("want domain.ErrKeyLocked, got %v", err)
 	}
@@ -175,7 +176,7 @@ func TestCreateRefund_MapsIdempotencySentinels(t *testing.T) {
 
 func TestCreateRefund_ClaimError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: errBoom}
-	svc := NewService(&erroringPayments{fakePayments: newFakePayments()}, ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(&erroringPayments{fakePayments: newFakePayments()}, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, errBoom) {
 		t.Fatalf("claim error must propagate, got %v", err)
@@ -183,7 +184,7 @@ func TestCreateRefund_ClaimError(t *testing.T) {
 }
 
 func TestCreateRefund_PaymentLookupError(t *testing.T) {
-	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("missing payment must surface ErrNotFound, got %v", err)
@@ -192,7 +193,7 @@ func TestCreateRefund_PaymentLookupError(t *testing.T) {
 
 func TestCreateRefund_FinishError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-rf", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -204,15 +205,23 @@ func TestCreateRefund_FinishError(t *testing.T) {
 	}
 }
 
-func TestCreateIntent_TransientReleaseErrorPropagates(t *testing.T) {
-	// A transient provider error tries to release the lock; if that release
-	// itself fails, the wrapped error surfaces (not swallowed).
+// A transient provider error releases the lock so the client's retry can make
+// progress. If the release itself fails, the PROVIDER's error is still the one
+// errors.Is matches — a cleanup failure must not replace the outcome, or a
+// "retry" answer becomes an opaque internal error about a lock — and the lockout
+// is carried alongside it, since a caller told to retry immediately needs to know
+// its key is still held. It is also counted and put on the request span
+// (payment.idempotency.release_failures.total).
+func TestCreateIntent_TransientReleaseFailureKeepsTheProviderError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), releaseErr: errBoom}
-	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	_, err := svc.CreateIntent(context.Background(), "k-tr", intent(2019)) // ...19 => transient
+	if !errors.Is(err, provider.ErrTransient) {
+		t.Fatalf("err = %v, want the provider's transient error", err)
+	}
 	if !errors.Is(err, errBoom) {
-		t.Fatalf("release failure must surface, got %v", err)
+		t.Errorf("err = %v, want the lockout surfaced alongside the provider outcome", err)
 	}
 }
 
@@ -253,7 +262,7 @@ func TestCreateIntent_CheckpointErrorPropagates(t *testing.T) {
 	// The payment-id checkpoint after Create must propagate its error rather
 	// than proceed to the provider charge.
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), checkpointErr: errBoom}
-	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	if _, err := svc.CreateIntent(context.Background(), "k-cp", intent(2000)); !errors.Is(err, errBoom) {
 		t.Fatalf("checkpoint error must propagate, got %v", err)
@@ -265,7 +274,7 @@ func TestCreateIntent_AdoptCheckpointErrorPropagates(t *testing.T) {
 	// failure rather than silently charging.
 	ep := &erroringPayments{fakePayments: newFakePayments()}
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	order := int64(51)
 	// Seed a pending payment for the order directly (a prior crashed attempt).
@@ -289,7 +298,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	fp := newFakePayments()
 	ep := &erroringPayments{fakePayments: fp}
 	fi := newFakeIdem()
-	svc := NewService(ep, fi, provider.NewStub(), 168*time.Hour)
+	svc := NewService(ep, fi, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	// Seed a checkpointed, in-flight key whose lock is already stale.
 	pid := int64(123)
@@ -314,7 +323,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 // operator needs to see both failures.
 func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: fmt.Errorf("%w: capture down", provider.ErrDefinite)}
 	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cf", intent(2000))
@@ -328,7 +337,7 @@ func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 
 func TestVoid_ProviderFailAndRollbackFail(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
-	prov := &failingProvider{Stub: provider.NewStub(), voidErr: errors.New("void down")}
+	prov := &failingProvider{Stub: provider.NewStub(), voidErr: fmt.Errorf("%w: void down", provider.ErrDefinite)}
 	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-vf", intent(2000))
@@ -347,7 +356,7 @@ func TestVoid_ProviderFailAndRollbackFail(t *testing.T) {
 func TestReloadAfterRace_FindError(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
 	ei := &erroringIdem{fakeIdem: newFakeIdem()}
-	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour)
+	svc := NewService(ep, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-rr", intent(2000))
 	// Force the CAS to lose while the status is in fact unchanged (still

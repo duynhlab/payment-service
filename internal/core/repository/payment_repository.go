@@ -35,7 +35,7 @@ const paymentColumns = `
 	payment_method, COALESCE(provider_payment_id,''), COALESCE(decline_code,''),
 	authorized_at, expires_at, captured_at, created_at, updated_at,
 	COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
-	          WHERE r.payment_id = payments.id AND r.status IN ('pending','succeeded')), 0) AS refunded_minor`
+	          WHERE r.payment_id = payments.id AND r.status IN ('pending','processing','succeeded')), 0) AS refunded_minor`
 
 func scanPayment(row pgx.Row) (*domain.Payment, error) {
 	var p domain.Payment
@@ -199,7 +199,7 @@ func (r *PaymentRepository) ReverseCapture(ctx context.Context, id int64) error 
 	var providerRef string
 	err = tx.QueryRow(ctx, `
 		UPDATE payments SET status = 'authorized', captured_at = NULL, updated_at = now()
-		WHERE id = $1 AND status = 'captured'
+		WHERE id = $1 AND status IN ('captured','processing')
 		RETURNING amount_minor, COALESCE(provider_payment_id,'')`,
 		id).Scan(&amount, &providerRef)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -278,8 +278,14 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 		SELECT p.id, $2::bigint, $3::text, $4::text FROM payments p
 		WHERE p.id = $1 AND p.status IN ('captured','refunded')
 		  AND $2::bigint + COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
-		                             WHERE r.payment_id = p.id AND r.status IN ('pending','succeeded')), 0)
+		                             WHERE r.payment_id = p.id AND r.status IN ('pending','processing','succeeded')), 0)
 		      <= p.amount_minor
+		  -- Fail closed while a refund's fate is unknown. The amount guard above only
+		  -- stops a SECOND refund that would exceed the capture, so two partials could
+		  -- both fit and both be paid — under different keys, so the provider replays
+		  -- neither. Until the open one is settled, nothing new goes out.
+		  AND NOT EXISTS (SELECT 1 FROM refunds open_r
+		                   WHERE open_r.payment_id = p.id AND open_r.status = 'processing')
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING `+refundColumns,
 		paymentID, amountMinor, reason, idemKey))
@@ -321,7 +327,8 @@ func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, st
 	var paymentID, amount int64
 	err = tx.QueryRow(ctx, `
 		UPDATE refunds SET status = $2, provider_refund_id = NULLIF($3,''), updated_at = now()
-		WHERE id = $1 AND status = 'pending' RETURNING payment_id, amount_minor`,
+		WHERE id = $1 AND status IN ('pending','processing')
+		RETURNING payment_id, amount_minor`,
 		refundID, status, providerRefundID).Scan(&paymentID, &amount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrNotFound

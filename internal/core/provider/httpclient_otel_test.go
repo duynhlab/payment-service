@@ -46,8 +46,12 @@ func TestHTTPClient_TraceparentAndDurationMetric(t *testing.T) {
 	defer span.End()
 	wantTID := span.SpanContext().TraceID().String()
 
-	// One charge per outcome the histogram must distinguish.
-	for _, st := range []int{http.StatusOK, http.StatusPaymentRequired, http.StatusServiceUnavailable} {
+	// One charge per outcome the histogram must distinguish. 429 and 503 are both
+	// here on purpose: they are the pair the phase-6 classification splits, and a
+	// histogram that cannot tell them apart cannot tell "the provider refused and
+	// did nothing" from "no answer, the money may have moved".
+	for _, st := range []int{http.StatusOK, http.StatusPaymentRequired,
+		http.StatusTooManyRequests, http.StatusServiceUnavailable} {
 		statusCh <- st
 		_, _ = c.Charge(ctx, ChargeRequest{IdempotencyKey: "idem-xyz", AmountMinor: 4200, Currency: "USD"})
 	}
@@ -89,7 +93,8 @@ func TestHTTPClient_TraceparentAndDurationMetric(t *testing.T) {
 			}
 		}
 	}
-	for _, want := range []string{"charge/ok", "charge/declined", "charge/transient", "capture/ok", "void/ok", "refund/ok"} {
+	for _, want := range []string{"charge/ok", "charge/declined", "charge/transient",
+		"charge/unknown", "capture/ok", "void/ok", "refund/ok"} {
 		if !seen[want] {
 			t.Errorf("provider histogram missing %q (got %v)", want, seen)
 		}
