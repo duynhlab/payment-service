@@ -138,7 +138,11 @@ func run() error {
 	paymentRepo := repository.NewPaymentRepository(pool)
 	idemRepo := idempotency.New(pool, cfg.Payment.IdempotencyLockTakeover)
 	prov := selectProvider(cfg, logger)
-	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL)
+	// The attempt log is what makes an unknown provider outcome resolvable rather
+	// than permanent, so production always gets the real recorder.
+	attemptRepo := repository.NewAttemptRepository(pool)
+	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL,
+		logicv1.WithAttempts(attemptRepo))
 	paymentHandler := v1.NewHandler(paymentService)
 
 	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)

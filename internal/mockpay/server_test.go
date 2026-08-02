@@ -105,8 +105,8 @@ func TestServer_Charge(t *testing.T) {
 
 	t.Run("transient then success", func(t *testing.T) {
 		req := provider.ChargeRequest{IdempotencyKey: "tk", AmountMinor: 2019, Currency: "USD"}
-		if st, _ := post(t, base+"/charges", req); st != http.StatusServiceUnavailable {
-			t.Fatalf("first attempt status %d", st)
+		if st, _ := post(t, base+"/charges", req); st != http.StatusTooManyRequests {
+			t.Fatalf("first attempt status %d, want 429 — the trigger models a refused request, not a maybe-processed one", st)
 		}
 		if st, _ := post(t, base+"/charges", req); st != http.StatusOK {
 			t.Fatalf("retry status %d", st)

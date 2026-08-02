@@ -135,6 +135,11 @@ func translateError(c *gin.Context, err error) {
 			"Refund rejected: not refundable or exceeds captured amount")
 	case errors.Is(err, domain.ErrInvalidTransition):
 		httpx.RespondError(c, http.StatusConflict, httpx.CodeInvalidTransition, "Invalid payment state transition")
+	case errors.Is(err, domain.ErrOutcomeUnknown):
+		// 503, not 500: the operation may have landed, and the same
+		// Idempotency-Key is safe to retry.
+		httpx.RespondError(c, http.StatusServiceUnavailable, httpx.CodeInternal,
+			"Provider outcome unknown, retry with the same Idempotency-Key")
 	case errors.Is(err, domain.ErrRefundDeclined):
 		// Same code and status as a declined charge: the provider decided, the
 		// state machine did not. INVALID_TRANSITION would tell a client the

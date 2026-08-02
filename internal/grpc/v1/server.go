@@ -185,6 +185,14 @@ func mapRefund(r *domain.Refund) *paymentv1.Refund {
 // business rejection (don't retry forever) from an infra error (retryable).
 func mapErr(err error) error {
 	switch {
+	case errors.Is(err, domain.ErrOutcomeUnknown):
+		// Neither success nor failure: the provider may have acted. Unavailable is
+		// the platform's retryable code, and every operation carries a
+		// deterministic provider key, so the saga's retry replays rather than
+		// acting twice. Answering FailedPrecondition here would tell the saga to
+		// compensate an operation that might have succeeded — the same mistake
+		// this phase removes from the payment side.
+		return status.Error(codes.Unavailable, "provider outcome unknown, retry")
 	case errors.Is(err, domain.ErrNotFound):
 		return status.Error(codes.NotFound, "payment not found")
 	case errors.Is(err, domain.ErrKeyConflict):

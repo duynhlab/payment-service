@@ -46,13 +46,18 @@ type Attempt struct {
 	PaymentID int64
 	Operation AttemptOperation
 	Outcome   OutcomeClass
-	// ProviderRef is the provider's own identifier where the answer carried one
-	// (a charge or refund id). Empty for an UNKNOWN attempt by definition — which
-	// is exactly why resolving one means asking the provider what it has.
+	// ProviderRef is the charge or refund this round-trip acted on, where we had
+	// one to send. It is empty exactly when the round-trip was the call that would
+	// have minted it — an authorize whose answer never arrived — and that absence
+	// is why resolving an authorize needs the idempotency key instead.
 	ProviderRef string
 	// ProviderStatus is the provider's code/status verbatim, for reconciliation
 	// and for the operator reading the row later.
 	ProviderStatus string
+	// IdempotencyKey is the provider-facing key this round-trip used. Resolution
+	// re-drives the identical operation under this same key so the provider
+	// replays its original answer instead of performing the work again.
+	IdempotencyKey string
 	// RefundID ties a refund attempt to its refund row; nil for intent-level
 	// operations.
 	RefundID  *int64

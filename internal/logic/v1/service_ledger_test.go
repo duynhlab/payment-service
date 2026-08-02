@@ -2,7 +2,7 @@ package v1
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -55,9 +55,12 @@ func TestAutoCapture_PostsLedgerOncePerReplay(t *testing.T) {
 
 // When the provider capture fails, the row and the ledger are both compensated:
 // one capture post followed by one reversal, leaving the payment authorized.
-func TestCapture_ProviderFailPostsReversal(t *testing.T) {
+// A DECIDED capture refusal posts the compensating reversal. An UNKNOWN one must
+// not — see TestCapture_UnknownOutcomeParksInsteadOfReversing, which pins that
+// the capture entry stands alone while the intent parks.
+func TestCapture_DecidedFailPostsReversal(t *testing.T) {
 	fp := newFakePayments()
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: fmt.Errorf("%w: capture down", provider.ErrDefinite)}
 	svc := NewService(fp, newFakeIdem(), prov, 168*time.Hour)
 
 	res, err := svc.CreateIntent(context.Background(), "k-rev", intent(2000))

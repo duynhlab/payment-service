@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -204,15 +205,23 @@ func TestCreateRefund_FinishError(t *testing.T) {
 	}
 }
 
-func TestCreateIntent_TransientReleaseErrorPropagates(t *testing.T) {
-	// A transient provider error tries to release the lock; if that release
-	// itself fails, the wrapped error surfaces (not swallowed).
+// A transient provider error releases the lock so the client's retry can make
+// progress. If the release itself fails, the PROVIDER's error is still the one
+// errors.Is matches — a cleanup failure must not replace the outcome, or a
+// "retry" answer becomes an opaque internal error about a lock — and the lockout
+// is carried alongside it, since a caller told to retry immediately needs to know
+// its key is still held. It is also counted and put on the request span
+// (payment.idempotency.release_failures.total).
+func TestCreateIntent_TransientReleaseFailureKeepsTheProviderError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), releaseErr: errBoom}
 	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour)
 
 	_, err := svc.CreateIntent(context.Background(), "k-tr", intent(2019)) // ...19 => transient
+	if !errors.Is(err, provider.ErrTransient) {
+		t.Fatalf("err = %v, want the provider's transient error", err)
+	}
 	if !errors.Is(err, errBoom) {
-		t.Fatalf("release failure must surface, got %v", err)
+		t.Errorf("err = %v, want the lockout surfaced alongside the provider outcome", err)
 	}
 }
 
@@ -314,7 +323,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 // operator needs to see both failures.
 func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: errors.New("capture down")}
+	prov := &failingProvider{Stub: provider.NewStub(), captureErr: fmt.Errorf("%w: capture down", provider.ErrDefinite)}
 	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cf", intent(2000))
@@ -328,7 +337,7 @@ func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 
 func TestVoid_ProviderFailAndRollbackFail(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments()}
-	prov := &failingProvider{Stub: provider.NewStub(), voidErr: errors.New("void down")}
+	prov := &failingProvider{Stub: provider.NewStub(), voidErr: fmt.Errorf("%w: void down", provider.ErrDefinite)}
 	svc := NewService(ep, newFakeIdem(), prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-vf", intent(2000))

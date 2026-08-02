@@ -6,6 +6,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+
+	"github.com/duynhlab/payment-service/internal/core/domain"
 )
 
 // Business metrics for payment, answering the on-call questions that matter for
@@ -31,9 +33,42 @@ var (
 		metric.WithDescription("Money-lifecycle operations (capture/void/refund) by outcome"))
 	reconDiscrepancyCounter, _ = meter.Int64Counter("payment.reconciliation.discrepancies.total",
 		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by kind"))
+	providerUnknownCounter, _ = meter.Int64Counter("payment.provider.unknown.total",
+		metric.WithDescription("Provider calls that returned no verdict, by operation — each one leaves an intent in doubt until it is resolved"))
+	attemptWriteFailureCounter, _ = meter.Int64Counter("payment.attempt.write_failures.total",
+		metric.WithDescription("Attempt rows that could not be written, by operation — the money state is still correct, but its evidence is missing"))
 	keyReleaseFailureCounter, _ = meter.Int64Counter("payment.idempotency.release_failures.total",
 		metric.WithDescription("Idempotency keys that could not be unlocked after a failed attempt; each one delays a caller's same-key retry until the takeover window"))
+	attemptResolutionCounter, _ = meter.Int64Counter("payment.attempt.resolution.total",
+		metric.WithDescription("Re-drives of an open UNKNOWN attempt, by operation and the class the provider answered with — `UNKNOWN` here means the doubt survived the round-trip"))
 )
+
+// recordResolution counts one attempt at closing existing doubt. It is the
+// counterpart to providerUnknownCounter: doubt created versus doubt settled, and
+// the two rates together are what say whether the worklist is draining. An
+// outcome of UNKNOWN is counted too — a resolution that learned nothing is the
+// interesting case, not an absence of data.
+func recordResolution(ctx context.Context, op string, class domain.OutcomeClass) {
+	attemptResolutionCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(labelOperation, op),
+		attribute.String("outcome_class", string(class)),
+	))
+}
+
+// recordProviderUnknown counts a provider call that answered nothing. Separate
+// from the operation counter's `unknown` result because this is the signal an
+// alert watches: a rising rate means doubt is being created faster than it is
+// resolved, which no per-outcome ratio makes obvious.
+func recordProviderUnknown(ctx context.Context, op string) {
+	providerUnknownCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(labelOperation, op)))
+}
+
+// recordAttemptWriteFailure counts a lost attempt row. Deliberately visible: the
+// attempt log is what makes an unknown outcome resolvable, so silently losing
+// rows would leave doubt that nothing can close.
+func recordAttemptWriteFailure(ctx context.Context, op string) {
+	attemptWriteFailureCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(labelOperation, op)))
+}
 
 // recordKeyReleaseFailure counts a key left locked after a failed attempt. The
 // caller is told to retry immediately, so a rising count means those retries are
@@ -41,6 +76,9 @@ var (
 func recordKeyReleaseFailure(ctx context.Context) {
 	keyReleaseFailureCounter.Add(ctx, 1)
 }
+
+// labelOperation is the attribute key every per-operation instrument shares.
+const labelOperation = "operation"
 
 // Authorization outcomes (bounded).
 const (
@@ -51,9 +89,13 @@ const (
 
 // Operation names and outcomes (bounded).
 const (
-	opCapture = "capture"
-	opVoid    = "void"
-	opRefund  = "refund"
+	// opAuthorize labels the charge round-trip. The authorization COUNTER is
+	// separate (it counts terminal decisions per payment); this label is for the
+	// per-round-trip signals — unknown outcomes and lost attempt rows.
+	opAuthorize = "authorize"
+	opCapture   = "capture"
+	opVoid      = "void"
+	opRefund    = "refund"
 
 	resultOK       = "ok"
 	resultRejected = "rejected"

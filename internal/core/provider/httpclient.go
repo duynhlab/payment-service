@@ -21,8 +21,14 @@ const maxRespBytes = 1 << 20 // 1 MiB
 
 // HTTPClient is the Provider implementation that talks to the mockpay HTTP
 // service. It maps mockpay's status codes back onto the port's error contract:
-// 402 → DeclinedError (→ 422 PAYMENT_DECLINED), 503 → ErrTransient (retryable),
-// and any transport failure is likewise treated as transient by the caller.
+// 402 → DeclinedError (→ 422 PAYMENT_DECLINED), 429 → ErrTransient (the provider
+// refused the request and did nothing with it), other 4xx → ErrDefinite.
+//
+// Everything else — 5xx, a timeout, a transport failure — is UNDECIDED and left
+// untyped: the request may well have been processed. 503 in particular is not
+// transient. "Service unavailable" says nothing about whether the work happened,
+// and treating it as a decided no-effect is what let a lost capture response
+// trigger a reversal against money the provider had already taken.
 type HTTPClient struct {
 	baseURL string
 	hc      *http.Client
@@ -101,7 +107,7 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 	case http.StatusPaymentRequired:
 		outcome = outcomeDeclined
 		return nil, &DeclinedError{Code: decodeError(body).Code}
-	case http.StatusServiceUnavailable:
+	case http.StatusTooManyRequests:
 		return nil, ErrTransient
 	default:
 		err := fmt.Errorf("mockpay charge: status %d: %s", status, decodeError(body).Error)
@@ -109,7 +115,7 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 		// start working on retry, so it must not be filed as an open outcome —
 		// re-driving it burns the retry budget and, once phase 6 keeps ambiguous
 		// charges open, would hold an intent in doubt that is not in doubt at
-		// all. 408/429 stay undecided: both mean ask again.
+		// all. 408 stays undecided; 429 is handled above.
 		if isDefiniteStatus(status) {
 			outcome = outcomeDeclined
 			return nil, fmt.Errorf("%w: %w", ErrDefinite, err)
@@ -161,7 +167,7 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path, idempotencyKey string
 	if err != nil {
 		return err
 	}
-	if status == http.StatusServiceUnavailable {
+	if status == http.StatusTooManyRequests {
 		return ErrTransient
 	}
 	if status != http.StatusOK {
@@ -194,6 +200,10 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path, idempotencyKey string
 // wrong, so replaying it changes nothing — except the two that explicitly ask
 // for a retry. Server errors (5xx) and transport failures stay undecided: the
 // request may well have been processed.
+//
+// 429 never reaches here (the callers type it ErrTransient first) but is listed
+// anyway: it is not a decided refusal of the payment, and a future caller that
+// stops special-casing it must not silently inherit the opposite meaning.
 func isDefiniteStatus(status int) bool {
 	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
 		return false

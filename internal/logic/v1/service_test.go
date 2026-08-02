@@ -137,7 +137,10 @@ func (f *fakePayments) ReverseCapture(_ context.Context, id int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
-	if !ok || p.Status != domain.StatusCaptured {
+	// Mirror the production CAS (`WHERE status IN ('captured','processing')`): a
+	// reversal is also how a PARKED capture is undone once the provider says it
+	// definitely never happened.
+	if !ok || (p.Status != domain.StatusCaptured && p.Status != domain.StatusProcessing) {
 		return domain.ErrStaleTransition
 	}
 	p.Status = domain.StatusAuthorized
@@ -206,6 +209,12 @@ func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status do
 	}
 	r, ok := f.refs[refundID]
 	if !ok {
+		return domain.ErrNotFound
+	}
+	// Mirror the production CAS (`WHERE status IN ('pending','processing')`). Its
+	// absence here is what let a settle-from-processing pass in tests while being
+	// impossible in Postgres.
+	if r.Status != domain.RefundPending && r.Status != domain.RefundProcessing {
 		return domain.ErrNotFound
 	}
 	r.Status = status

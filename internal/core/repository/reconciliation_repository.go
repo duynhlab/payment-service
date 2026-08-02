@@ -36,7 +36,7 @@ func (r *ReconciliationRepository) ListReconcilable(ctx context.Context) ([]doma
 	rows, err := r.pool.Query(ctx, `
 		SELECT p.id, p.provider_payment_id, p.amount_minor, p.status,
 		       COALESCE((SELECT SUM(rf.amount_minor) FROM refunds rf
-		                 WHERE rf.payment_id = p.id AND rf.status IN ('pending', 'succeeded')), 0) AS refunded_minor
+		                 WHERE rf.payment_id = p.id AND rf.status IN ('pending', 'processing', 'succeeded')), 0) AS refunded_minor
 		FROM payments p
 		WHERE p.provider_payment_id IS NOT NULL AND p.provider_payment_id <> ''`)
 	if err != nil {

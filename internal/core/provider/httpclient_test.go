@@ -129,6 +129,8 @@ func TestHTTPClient_ChargeDeclines(t *testing.T) {
 	}
 }
 
+// The …19 trigger models a provider that refused the request outright (429), so
+// the first call is decided-nothing-happened and the same key then succeeds.
 func TestHTTPClient_ChargeTransientThenSucceeds(t *testing.T) {
 	c := newClient(t)
 	req := provider.ChargeRequest{IdempotencyKey: "tk", AmountMinor: 2019, Currency: "USD"}
@@ -269,18 +271,52 @@ func TestHTTPClient_ChargeAndMutationsClassifyDecidedAnswers(t *testing.T) {
 	}
 }
 
-// 503 stays the explicit ask-again signal on the mutations too, not a decided
-// answer and not an opaque unknown.
-func TestHTTPClient_MutationsMap503ToTransient(t *testing.T) {
+// 429 is the explicit ask-again signal: the provider refused the request and did
+// nothing with it, so a retry starts from a clean slate.
+func TestHTTPClient_MutationsMap429ToTransient(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	t.Cleanup(ts.Close)
 	c := provider.NewHTTPClient(ts.URL)
 
 	for name, err := range map[string]error{"capture": c.Capture(context.Background(), "ch_1", "k-cap"), "void": c.Void(context.Background(), "ch_1", "k-void")} {
 		if !errors.Is(err, provider.ErrTransient) {
-			t.Errorf("%s 503 err = %v, want ErrTransient", name, err)
+			t.Errorf("%s 429 err = %v, want ErrTransient", name, err)
+		}
+	}
+}
+
+// 503 must be UNDECIDED, and this is the assertion that keeps it that way. It
+// reads like an infrastructure blip, but "service unavailable" says nothing about
+// whether the work happened — typing it transient is what let a lost capture
+// response trigger a reversal against money the provider had already taken. So it
+// must be neither ErrTransient (decided, nothing happened) nor ErrDefinite
+// (decided, cannot succeed).
+func TestHTTPClient_503IsUndecidedOnEveryOperation(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(ts.Close)
+	c := provider.NewHTTPClient(ts.URL)
+
+	_, chargeErr := c.Charge(context.Background(), provider.ChargeRequest{IdempotencyKey: "k", AmountMinor: 100, Currency: "USD"})
+	_, refundErr := c.Refund(context.Background(), "ch_1", 100, "k-ref")
+	for name, err := range map[string]error{
+		"charge":  chargeErr,
+		"capture": c.Capture(context.Background(), "ch_1", "k-cap"),
+		"void":    c.Void(context.Background(), "ch_1", "k-void"),
+		"refund":  refundErr,
+	} {
+		if err == nil {
+			t.Errorf("%s 503 err = nil, want an error", name)
+			continue
+		}
+		if errors.Is(err, provider.ErrTransient) {
+			t.Errorf("%s 503 was typed ErrTransient: 503 does not promise the work did not happen", name)
+		}
+		if errors.Is(err, provider.ErrDefinite) {
+			t.Errorf("%s 503 was typed ErrDefinite: a server error is not a decided answer", name)
 		}
 	}
 }
