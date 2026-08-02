@@ -151,7 +151,7 @@ func TestHTTPClient_CaptureVoidRefund(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Capture(ctx, charge.ProviderPaymentID); err != nil {
+	if err := c.Capture(ctx, charge.ProviderPaymentID, "k-cap"); err != nil {
 		t.Fatalf("capture: %v", err)
 	}
 	refundID, err := c.Refund(ctx, charge.ProviderPaymentID, 3000, "rk")
@@ -175,11 +175,11 @@ func TestHTTPClient_VoidReleasesHold(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Void(ctx, charge.ProviderPaymentID); err != nil {
+	if err := c.Void(ctx, charge.ProviderPaymentID, "k-void"); err != nil {
 		t.Fatalf("void: %v", err)
 	}
 	// A voided hold no longer exists — capture must fail.
-	if err := c.Capture(ctx, charge.ProviderPaymentID); err == nil {
+	if err := c.Capture(ctx, charge.ProviderPaymentID, "k-cap"); err == nil {
 		t.Fatal("capture of a voided hold must fail")
 	}
 }
@@ -187,13 +187,13 @@ func TestHTTPClient_VoidReleasesHold(t *testing.T) {
 func TestHTTPClient_UnknownChargeErrors(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
-	if err := c.Capture(ctx, "mp_nope"); err == nil {
+	if err := c.Capture(ctx, "mp_nope", "k-cap"); err == nil {
 		t.Fatal("capture of unknown charge must error")
 	}
 	if _, err := c.Refund(ctx, "mp_nope", 100, "x"); err == nil {
 		t.Fatal("refund of unknown charge must error")
 	}
-	if err := c.Void(ctx, "mp_nope"); err == nil {
+	if err := c.Void(ctx, "mp_nope", "k-void"); err == nil {
 		t.Fatal("void of unknown charge must error")
 	}
 }
@@ -207,10 +207,10 @@ func TestHTTPClient_VoidIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Void(ctx, charge.ProviderPaymentID); err != nil {
+	if err := c.Void(ctx, charge.ProviderPaymentID, "k-void"); err != nil {
 		t.Fatalf("first void: %v", err)
 	}
-	if err := c.Void(ctx, charge.ProviderPaymentID); err != nil {
+	if err := c.Void(ctx, charge.ProviderPaymentID, "k-void"); err != nil {
 		t.Fatalf("second void must be a no-op, got %v", err)
 	}
 }
@@ -254,8 +254,8 @@ func TestHTTPClient_ChargeAndMutationsClassifyDecidedAnswers(t *testing.T) {
 		c := provider.NewHTTPClient(ts.URL)
 
 		_, chargeErr := c.Charge(context.Background(), provider.ChargeRequest{IdempotencyKey: "k", AmountMinor: 5000, Currency: "USD"})
-		capErr := c.Capture(context.Background(), "ch_1")
-		voidErr := c.Void(context.Background(), "ch_1")
+		capErr := c.Capture(context.Background(), "ch_1", "k-cap")
+		voidErr := c.Void(context.Background(), "ch_1", "k-void")
 		ts.Close()
 
 		for name, err := range map[string]error{"charge": chargeErr, "capture": capErr, "void": voidErr} {
@@ -278,7 +278,7 @@ func TestHTTPClient_MutationsMap503ToTransient(t *testing.T) {
 	t.Cleanup(ts.Close)
 	c := provider.NewHTTPClient(ts.URL)
 
-	for name, err := range map[string]error{"capture": c.Capture(context.Background(), "ch_1"), "void": c.Void(context.Background(), "ch_1")} {
+	for name, err := range map[string]error{"capture": c.Capture(context.Background(), "ch_1", "k-cap"), "void": c.Void(context.Background(), "ch_1", "k-void")} {
 		if !errors.Is(err, provider.ErrTransient) {
 			t.Errorf("%s 503 err = %v, want ErrTransient", name, err)
 		}

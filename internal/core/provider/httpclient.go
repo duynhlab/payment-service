@@ -119,8 +119,8 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 }
 
 // Capture captures a hold via POST /charges/{id}/capture.
-func (c *HTTPClient) Capture(ctx context.Context, providerPaymentID string) error {
-	return c.mutate(ctx, opCapture, "/charges/"+url.PathEscape(providerPaymentID)+"/capture")
+func (c *HTTPClient) Capture(ctx context.Context, providerPaymentID, idempotencyKey string) error {
+	return c.mutate(ctx, opCapture, "/charges/"+url.PathEscape(providerPaymentID)+"/capture", idempotencyKey)
 }
 
 // GetTransactions pages the provider's ledger (GET /transactions) — the food
@@ -142,18 +142,22 @@ func (c *HTTPClient) GetTransactions(ctx context.Context, page, pageSize int) (*
 }
 
 // Void releases a hold via POST /charges/{id}/void.
-func (c *HTTPClient) Void(ctx context.Context, providerPaymentID string) error {
-	return c.mutate(ctx, opVoid, "/charges/"+url.PathEscape(providerPaymentID)+"/void")
+func (c *HTTPClient) Void(ctx context.Context, providerPaymentID, idempotencyKey string) error {
+	return c.mutate(ctx, opVoid, "/charges/"+url.PathEscape(providerPaymentID)+"/void", idempotencyKey)
 }
 
 // mutate posts to a capture/void endpoint that returns no body on success. op is
 // the bounded metric label ("capture"/"void").
-func (c *HTTPClient) mutate(ctx context.Context, op, path string) error {
+func (c *HTTPClient) mutate(ctx context.Context, op, path, idempotencyKey string) error {
 	start := time.Now()
 	outcome := outcomeTransient
 	defer func() { recordProviderCall(ctx, op, outcome, start) }()
 
-	status, body, err := c.do(ctx, http.MethodPost, path, nil)
+	var reqBody any
+	if idempotencyKey != "" {
+		reqBody = MutationRequest{IdempotencyKey: idempotencyKey}
+	}
+	status, body, err := c.do(ctx, http.MethodPost, path, reqBody)
 	if err != nil {
 		return err
 	}
@@ -161,7 +165,16 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path string) error {
 		return ErrTransient
 	}
 	if status != http.StatusOK {
-		err := fmt.Errorf("mockpay %s: status %d: %s", path, status, decodeError(body).Error)
+		decoded := decodeError(body)
+		err := fmt.Errorf("mockpay %s: status %d: %s", path, status, decoded.Error)
+		// A key conflict is surfaced as the SAME typed error the in-memory double
+		// returns, so `errors.Is(err, ErrKeyConflict)` means the same thing on
+		// both paths — otherwise a caller's key-derivation bug is a typed failure
+		// in tests and an anonymous one in production.
+		if status == http.StatusConflict && decoded.Code == CodeIdempotencyConflict {
+			outcome = outcomeDeclined
+			return fmt.Errorf("%w: %w: %w", ErrDefinite, ErrKeyConflict, err)
+		}
 		// Same rule as the other operations: a decided answer is decided. It
 		// matters most here — once an ambiguous capture stops auto-reversing
 		// (phase 6), a definite "this charge does not exist" must resolve the

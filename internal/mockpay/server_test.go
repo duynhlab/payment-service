@@ -125,6 +125,78 @@ func TestServer_Charge(t *testing.T) {
 	})
 }
 
+// A key identifies ONE operation on ONE charge. Reusing it elsewhere must
+// conflict rather than borrow that operation's verdict, which would hide the
+// caller's key-derivation bug behind a plausible success. Note what is NOT
+// claimed: the answer is never replayed from memory — capture and void are
+// idempotent against the charge's CURRENT state, and a remembered answer could
+// contradict it (a capture success replayed after a void would report money that
+// is no longer collectable).
+func TestServer_MutationKeyBindsOneOperationToOneCharge(t *testing.T) {
+	base := newServer(t)
+	_, b1 := post(t, base+"/charges", provider.ChargeRequest{IdempotencyKey: "m1", AmountMinor: 7000, Currency: "USD"})
+	id1 := decodeCharge(t, b1).ProviderPaymentID
+	_, b2 := post(t, base+"/charges", provider.ChargeRequest{IdempotencyKey: "m2", AmountMinor: 8000, Currency: "USD"})
+	id2 := decodeCharge(t, b2).ProviderPaymentID
+
+	key := provider.MutationRequest{IdempotencyKey: "capture:payment:1"}
+	if st, _ := post(t, base+"/charges/"+id1+"/capture", key); st != http.StatusOK {
+		t.Fatalf("first capture status %d", st)
+	}
+	// Same key, same operation, same charge: still fine (idempotent by state).
+	if st, _ := post(t, base+"/charges/"+id1+"/capture", key); st != http.StatusOK {
+		t.Fatalf("same-key repeat status = %d, want 200", st)
+	}
+	// Same key, other charge → conflict.
+	if st, body := post(t, base+"/charges/"+id2+"/capture", key); st != http.StatusConflict {
+		t.Fatalf("key reuse on another charge = %d %s, want 409", st, body)
+	}
+	// Same key, same charge, OTHER operation → conflict too. Without the
+	// operation in the binding this void would silently do nothing and answer 200.
+	if st, body := post(t, base+"/charges/"+id1+"/void", key); st != http.StatusConflict {
+		t.Fatalf("key reuse for another operation = %d %s, want 409", st, body)
+	}
+	// Its own key voids normally.
+	if st, _ := post(t, base+"/charges/"+id1+"/void", provider.MutationRequest{IdempotencyKey: "void:payment:1"}); st != http.StatusOK {
+		t.Fatalf("void with its own key status %d", st)
+	}
+	// And the charge really is voided — the capture key did not shield it.
+	if got := transactionStatus(t, base, id1); got != "voided" {
+		t.Fatalf("charge %s status = %q, want voided", id1, got)
+	}
+}
+
+// A body that is present but undecodable must be a 400, not a silent
+// downgrade to keyless: the situation this mechanism exists for is a request
+// whose connection died mid-flight, which is exactly when a truncated body
+// arrives. Answering 200 there would disable the protection precisely when it
+// is needed.
+func TestServer_MalformedMutationBodyIsRejected(t *testing.T) {
+	base := newServer(t)
+	_, b := post(t, base+"/charges", provider.ChargeRequest{IdempotencyKey: "mb", AmountMinor: 5000, Currency: "USD"})
+	id := decodeCharge(t, b).ProviderPaymentID
+
+	resp, err := http.Post(base+"/charges/"+id+"/capture", "application/json",
+		strings.NewReader(`{"idempotency_key":"capture:payment`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("truncated body status = %d, want 400", resp.StatusCode)
+	}
+
+	// No body at all is a legacy caller and still works.
+	resp2, err := http.Post(base+"/charges/"+id+"/capture", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("no-body capture status = %d, want 200", resp2.StatusCode)
+	}
+}
+
 // The no-answer trigger must create the charge and THEN withhold the response:
 // a lost answer with no effect is a different (easier) case than a lost answer
 // with one. The test uses a short client timeout rather than waiting out the
@@ -275,4 +347,26 @@ func TestServer_Health(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health status %d", resp.StatusCode)
 	}
+}
+
+// transactionStatus reads one charge's status from the provider's own ledger
+// feed — the same source reconciliation reads, so an assertion here is about
+// what the provider actually holds rather than what a handler replied.
+func transactionStatus(t *testing.T, base, chargeID string) string {
+	t.Helper()
+	resp, err := http.Get(base + "/transactions")
+	if err != nil {
+		t.Fatalf("transactions: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var page provider.TransactionsPage
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		t.Fatalf("decode transactions: %v", err)
+	}
+	for _, tx := range page.Transactions {
+		if tx.ProviderPaymentID == chargeID {
+			return tx.Status
+		}
+	}
+	return ""
 }

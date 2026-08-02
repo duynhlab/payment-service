@@ -148,11 +148,66 @@ func Classify(amountMinor int64) Outcome {
 // 408 and 429 are deliberately NOT definite: both mean "ask again".
 var ErrDefinite = errors.New("provider answered definitively: request cannot succeed")
 
+// ErrKeyConflict is returned when an idempotency key is reused for a different
+// (operation, charge) pair. A real provider answers the same way, and both
+// doubles do, so a caller that derives keys wrongly fails loudly instead of
+// quietly receiving an answer that belongs to something else.
+var ErrKeyConflict = errors.New("idempotency key reused for a different operation or charge")
+
+// Operation names used in idempotency keys. Deliberately their own constants:
+// deriving them from metric labels would mean renaming a dashboard label
+// silently changes every in-flight idempotency key.
+const (
+	opCaptureKey = "capture"
+	opVoidKey    = "void"
+)
+
+// CodeIdempotencyConflict is the machine code a provider returns for key reuse.
+// Shared so the HTTP client maps it back to ErrKeyConflict rather than matching
+// on a message.
+const CodeIdempotencyConflict = "idempotency_conflict"
+
+// mutationBinding is what an idempotency key was first used for. Only the
+// identity is kept — never the answer (see mutationKeys).
+type mutationBinding struct {
+	operation string
+	chargeID  string
+}
+
+// bindKey records that this key belongs to (op, chargeID), or reports a conflict
+// when it was already used for a different one. Caller holds s.mu.
+func (s *Stub) bindKey(idemKey, op, chargeID string) error {
+	if idemKey == "" {
+		return nil // no key: answer from state, as before keys existed
+	}
+	want := mutationBinding{operation: op, chargeID: chargeID}
+	if prior, ok := s.mutationKeys[idemKey]; ok && prior != want {
+		return fmt.Errorf("%w: %w", ErrDefinite, ErrKeyConflict)
+	}
+	s.mutationKeys[idemKey] = want
+	return nil
+}
+
+// MutationRequest is the body of a capture/void call. It carries only the
+// idempotency key: the charge id is in the path, and the amount is the
+// authorized amount (partial capture is not a thing here yet).
+type MutationRequest struct {
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
 // Provider is the outbound port to the payment provider.
 type Provider interface {
 	Charge(ctx context.Context, req ChargeRequest) (*Charge, error)
-	Capture(ctx context.Context, providerPaymentID string) error
-	Void(ctx context.Context, providerPaymentID string) error
+	// Capture and Void take an idempotency key for the same reason Charge and
+	// Refund do, but against a different hazard. Both are naturally idempotent
+	// by charge id — a charge can only be captured once — so the key is not
+	// there to stop a second capture. It is there so a RETRY AFTER DOUBT gets
+	// the provider's ORIGINAL answer replayed instead of a fresh evaluation:
+	// without it, a stricter provider answers "already captured" with a 4xx,
+	// which classifies as a decided FAILURE for an operation that in fact
+	// SUCCEEDED. The key is deterministic per intent, so the retry carries it.
+	Capture(ctx context.Context, providerPaymentID, idempotencyKey string) error
+	Void(ctx context.Context, providerPaymentID, idempotencyKey string) error
 	Refund(ctx context.Context, providerPaymentID string, amountMinor int64, idempotencyKey string) (providerRefundID string, err error)
 }
 
@@ -169,6 +224,15 @@ type Stub struct {
 	// processing_error trigger once, so the next attempt with the same key
 	// succeeds — used to test transient-then-recover retries.
 	transientSeen map[string]bool
+	// mutationKeys binds an idempotency key to the (operation, charge) it was
+	// first used for, so reusing it elsewhere is a detectable caller bug.
+	//
+	// It deliberately does NOT remember the ANSWER. Remembering one and replaying
+	// it means the double can contradict its own state: a capture success
+	// replayed after the hold was voided would report success for money that is
+	// no longer collectable. The charge's CURRENT state is the truth, and
+	// capture/void are already idempotent against it.
+	mutationKeys map[string]mutationBinding
 }
 
 // NewStub returns an empty in-memory provider.
@@ -178,6 +242,7 @@ func NewStub() *Stub {
 		captured:      map[string]bool{},
 		voided:        map[string]bool{},
 		transientSeen: map[string]bool{},
+		mutationKeys:  map[string]mutationBinding{},
 	}
 }
 
@@ -229,10 +294,18 @@ func (s *Stub) Charge(_ context.Context, req ChargeRequest) (*Charge, error) {
 	return c, nil
 }
 
-// Capture marks a hold captured; capturing twice is a no-op (idempotent).
-func (s *Stub) Capture(_ context.Context, id string) error {
+// Capture marks a hold captured. Idempotent twice over: by charge state, and by
+// idempotency key — a repeated key replays the first answer verbatim.
+func (s *Stub) Capture(_ context.Context, id, idemKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.bindKey(idemKey, opCaptureKey, id); err != nil {
+		return err
+	}
+	return s.captureLocked(id)
+}
+
+func (s *Stub) captureLocked(id string) error {
 	if _, ok := s.captured[id]; !ok {
 		return fmt.Errorf("%w: "+errUnknownProviderPayment, ErrDefinite, id)
 	}
@@ -242,9 +315,16 @@ func (s *Stub) Capture(_ context.Context, id string) error {
 
 // Void releases a hold. Idempotent: voiding an already-voided id is a no-op
 // (a lost 200 must be safely retryable), while a never-issued id is an error.
-func (s *Stub) Void(_ context.Context, id string) error {
+func (s *Stub) Void(_ context.Context, id, idemKey string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.bindKey(idemKey, opVoidKey, id); err != nil {
+		return err
+	}
+	return s.voidLocked(id)
+}
+
+func (s *Stub) voidLocked(id string) error {
 	if s.voided[id] {
 		return nil
 	}
