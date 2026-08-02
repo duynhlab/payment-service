@@ -32,13 +32,20 @@ func NewReconciliationRepository(pool *pgxpool.Pool) *ReconciliationRepository {
 // the life of the service, so before prod scale this must window by created_at /
 // id (a rolling recent window + a slower full sweep), the same way the outbox
 // relay documents its single-writer assumption.
+//
+// Payments parked in `processing` are excluded. Their drift is not drift — it is a
+// question the attempt log already owns, with a resolution path of its own. Left
+// in, every parked row matches no provider status and re-reports the same
+// status_mismatch on every single run, burying the real discrepancies in the one
+// signal that is supposed to surface them.
 func (r *ReconciliationRepository) ListReconcilable(ctx context.Context) ([]domain.ReconRow, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT p.id, p.provider_payment_id, p.amount_minor, p.status,
 		       COALESCE((SELECT SUM(rf.amount_minor) FROM refunds rf
 		                 WHERE rf.payment_id = p.id AND rf.status IN ('pending', 'processing', 'succeeded')), 0) AS refunded_minor
 		FROM payments p
-		WHERE p.provider_payment_id IS NOT NULL AND p.provider_payment_id <> ''`)
+		WHERE p.provider_payment_id IS NOT NULL AND p.provider_payment_id <> ''
+		  AND p.status <> 'processing'`)
 	if err != nil {
 		return nil, fmt.Errorf("list reconcilable payments: %w", err)
 	}

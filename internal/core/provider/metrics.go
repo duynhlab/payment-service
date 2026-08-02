@@ -42,9 +42,15 @@ const (
 	opVoid    = "void"
 	opRefund  = "refund"
 
-	outcomeOK        = "ok"
-	outcomeDeclined  = "declined"  // provider rejected the card (charge only)
-	outcomeTransient = "transient" // 503 / unexpected status / transport error — retryable
+	outcomeOK       = "ok"
+	outcomeDeclined = "declined" // provider gave a decided no (a card decline, or any other final answer)
+	// outcomeTransient is a DECIDED refusal that did nothing: 429. Retrying it
+	// starts from a clean slate.
+	outcomeTransient = "transient"
+	// outcomeUnknown is no answer at all: 5xx, a timeout, a transport failure. The
+	// work may have happened. Splitting this from `transient` is the whole point of
+	// RFC-0021 phase 6 — one is safe to redo, the other has to be asked about.
+	outcomeUnknown = "unknown"
 )
 
 // recordProviderCall records one provider-call duration with its bounded op and

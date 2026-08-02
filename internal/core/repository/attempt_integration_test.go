@@ -165,6 +165,13 @@ func TestProcessingRefund_KeepsItsReserveAndCanStillSettle(t *testing.T) {
 	if _, err := repo.CreateRefund(ctx, pay.ID, 5000, "retry under a new key", "9:rk-2"); !errors.Is(err, domain.ErrRefundRejected) {
 		t.Fatalf("second full refund = %v, want ErrRefundRejected — that money is already claimed", err)
 	}
+	// And a PARTIAL one, which the amount cap alone would have let through: two
+	// 500-minor refunds fit inside a 5000 capture, they carry different keys, so the
+	// provider replays neither and pays both. Nothing new goes out while one is in
+	// doubt.
+	if _, err := repo.CreateRefund(ctx, pay.ID, 500, "partial while one is in doubt", "9:rk-3"); !errors.Is(err, domain.ErrRefundRejected) {
+		t.Fatalf("partial refund alongside a parked one = %v, want ErrRefundRejected", err)
+	}
 
 	if err := repo.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, "rf_1"); err != nil {
 		t.Fatalf("settling a parked refund = %v, want it to land: the provider already paid", err)

@@ -89,7 +89,7 @@ func decodeError(body []byte) ErrorResponse {
 // Charge places (and optionally captures) a hold via POST /charges.
 func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, error) {
 	start := time.Now()
-	outcome := outcomeTransient // transport error / unexpected status default
+	outcome := outcomeUnknown // transport error / unexpected status default
 	defer func() { recordProviderCall(ctx, opCharge, outcome, start) }()
 
 	status, body, err := c.do(ctx, http.MethodPost, "/charges", req)
@@ -108,6 +108,7 @@ func (c *HTTPClient) Charge(ctx context.Context, req ChargeRequest) (*Charge, er
 		outcome = outcomeDeclined
 		return nil, &DeclinedError{Code: decodeError(body).Code}
 	case http.StatusTooManyRequests:
+		outcome = outcomeTransient
 		return nil, ErrTransient
 	default:
 		err := fmt.Errorf("mockpay charge: status %d: %s", status, decodeError(body).Error)
@@ -156,7 +157,7 @@ func (c *HTTPClient) Void(ctx context.Context, providerPaymentID, idempotencyKey
 // the bounded metric label ("capture"/"void").
 func (c *HTTPClient) mutate(ctx context.Context, op, path, idempotencyKey string) error {
 	start := time.Now()
-	outcome := outcomeTransient
+	outcome := outcomeUnknown
 	defer func() { recordProviderCall(ctx, op, outcome, start) }()
 
 	var reqBody any
@@ -168,6 +169,7 @@ func (c *HTTPClient) mutate(ctx context.Context, op, path, idempotencyKey string
 		return err
 	}
 	if status == http.StatusTooManyRequests {
+		outcome = outcomeTransient
 		return ErrTransient
 	}
 	if status != http.StatusOK {
@@ -214,7 +216,7 @@ func isDefiniteStatus(status int) bool {
 // Refund issues a refund via POST /refunds.
 func (c *HTTPClient) Refund(ctx context.Context, providerPaymentID string, amountMinor int64, idempotencyKey string) (string, error) {
 	start := time.Now()
-	outcome := outcomeTransient
+	outcome := outcomeUnknown
 	defer func() { recordProviderCall(ctx, opRefund, outcome, start) }()
 
 	status, body, err := c.do(ctx, http.MethodPost, "/refunds", RefundRequest{

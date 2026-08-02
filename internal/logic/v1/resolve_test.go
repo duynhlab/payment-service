@@ -303,48 +303,95 @@ func TestCreateIntent_DefiniteNonDeclineFailsTheIntent(t *testing.T) {
 	}
 }
 
-// A payment parked with no attempt row cannot be resolved by guessing. The only
-// way into that state is a lost attempt write, so it must read as doubt — never as
-// an outcome, and never as a rejection the saga would compensate on.
-func TestResolve_ParkedWithoutEvidenceStaysDoubt(t *testing.T) {
+// TestResolve_UnwiredLogCannotPark: a service without an attempt log can still
+// answer honestly, but it must not create doubt it has no way to settle.
+// "No open attempts" and "I cannot tell you whether there are any" have to look
+// different, or a misconfigured service answers doubt with a verdict.
+func TestResolve_UnwiredLogCannotPark(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	prov := &failingProvider{Stub: provider.NewStub(), captureThenErr: context.DeadlineExceeded}
-	// The log drops writes, so the park lands with no evidence behind it.
-	rec := &recordingAttempts{err: errors.New("attempts table gone")}
-	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(rec))
-	ctx := context.Background()
-
-	res, _ := svc.CreateIntent(ctx, "k-noev", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
-		t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
-	}
-	rec.err = nil // the log recovers, but the row that would have been written is gone
-
-	prov.captureThenErr = nil
-	_, err := svc.Capture(ctx, res.Payment.ID, 7)
-	if !errors.Is(err, domain.ErrOutcomeUnknown) {
-		t.Fatalf("err = %v, want ErrOutcomeUnknown — unresolvable doubt is still doubt", err)
-	}
-	if errors.Is(err, domain.ErrInvalidTransition) {
-		t.Fatal("reported as a precondition failure: callers read that as permanent and compensate")
-	}
-}
-
-// An unwired attempt log can park an intent but must never pretend it can resolve
-// one: "no open attempts" and "I cannot tell you" have to look different, or a
-// misconfigured service would silently answer doubt with a verdict.
-func TestResolve_UnwiredLogRefusesRatherThanGuesses(t *testing.T) {
-	fp, fi := newFakePayments(), newFakeIdem()
-	prov := &failingProvider{Stub: provider.NewStub(), captureThenErr: context.DeadlineExceeded}
+	prov := &failingProvider{Stub: provider.NewStub()}
 	svc := NewService(fp, fi, prov, 168*time.Hour) // no WithAttempts
 	ctx := context.Background()
 
-	res, _ := svc.CreateIntent(ctx, "k-unwired", intent(2000))
+	res, err := svc.CreateIntent(ctx, "k-unwired", intent(2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov.captureThenErr = context.DeadlineExceeded
 	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
-		t.Fatalf("err = %v, want the park to still happen", err)
+		t.Fatalf("err = %v, want the unknown outcome still reported", err)
+	}
+	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	if got.Status == domain.StatusProcessing {
+		t.Fatal("parked without a log: the doubt could never be resolved")
+	}
+}
+
+// TestResolve_RepeatedSilenceDoesNotMultiplyTheWork is the storm guard. Each
+// resolution pass records the round-trip it just made, and if that row were left
+// open ALONGSIDE the one it re-asked, the next pass would find two questions, ask
+// the provider twice, and open two more. Work per retry doubles — during a
+// provider outage, which is the exact condition this feature exists for, so the
+// feature would turn an outage into a self-inflicted flood against the provider.
+func TestResolve_RepeatedSilenceDoesNotMultiplyTheWork(t *testing.T) {
+	svc, fp, prov, rec := newDoubtService()
+	ctx := context.Background()
+	const order = int64(77)
+
+	prov.chargeThenErr = context.DeadlineExceeded
+	if _, err := svc.CreateIntent(ctx, "k-storm-0", intentFor(order, 2000)); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("park err = %v, want ErrOutcomeUnknown", err)
+	}
+	pay, err := fp.FindByOrderID(ctx, order)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const passes = 5
+	for i := 1; i <= passes; i++ {
+		if _, err := svc.CreateIntent(ctx, fmt.Sprintf("k-storm-%d", i), intentFor(order, 2000)); !errors.Is(err, domain.ErrOutcomeUnknown) {
+			t.Fatalf("pass %d err = %v, want ErrOutcomeUnknown", i, err)
+		}
+	}
+	// One provider call per pass, plus the original. Doubling would be 63.
+	if prov.chargeCalls != passes+1 {
+		t.Fatalf("provider charge calls = %d, want %d — one question asked once per pass", prov.chargeCalls, passes+1)
+	}
+	open, _ := rec.ListOpenForPayment(ctx, pay.ID)
+	if len(open) != 1 {
+		t.Fatalf("open attempts after %d unresolved passes = %d, want exactly 1 — the doubt is one question, not many", passes, len(open))
+	}
+}
+
+// A resolution that loses its CAS to another resolver must answer like a no-op,
+// never like a rejection. `ErrStaleTransition` maps to FailedPrecondition, which
+// the saga treats as permanent: a race between two resolvers would make the caller
+// compensate a payment that had just been settled correctly.
+func TestResolve_LostRaceIsNotReportedAsARejection(t *testing.T) {
+	svc, fp, prov, _ := newDoubtService()
+	ctx := context.Background()
+
+	res, _ := svc.CreateIntent(ctx, "k-race", intent(2000))
+	prov.captureThenErr = context.DeadlineExceeded
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("park err = %v", err)
 	}
 	prov.captureThenErr = nil
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err == nil {
-		t.Fatal("resolution succeeded without an attempt log: it had no key to ask under")
+
+	// Somebody else settles the row between the resolution's read and its write.
+	fp.beforeTransition = func() {
+		fp.beforeTransition = nil
+		_ = fp.TransitionStatus(ctx, res.Payment.ID, domain.StatusProcessing, domain.StatusCaptured, nil)
+	}
+
+	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	if err != nil {
+		t.Fatalf("err = %v, want the lost race treated as a no-op", err)
+	}
+	if errors.Is(err, domain.ErrStaleTransition) || errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("err = %v, want no rejection: the saga compensates on those", err)
+	}
+	if got.Status != domain.StatusCaptured {
+		t.Fatalf("status = %s, want captured", got.Status)
 	}
 }

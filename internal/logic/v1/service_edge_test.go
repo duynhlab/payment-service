@@ -35,6 +35,9 @@ type failingProvider struct {
 	captureThenErr error
 	voidThenErr    error
 	refundThenErr  error
+	// chargeCalls counts provider charge round-trips, so a test can prove that a
+	// retry costs one call and not a doubling.
+	chargeCalls int
 	// captureErrs answers successive capture calls in order, then falls through to
 	// the Stub. Resolution and the operation that triggered it are two separate
 	// round-trips, so a test that cares about the difference needs to give them
@@ -66,6 +69,7 @@ func (f *failingProvider) Refund(ctx context.Context, id string, amt int64, key 
 }
 
 func (f *failingProvider) Charge(ctx context.Context, req provider.ChargeRequest) (*provider.Charge, error) {
+	f.chargeCalls++
 	if f.chargeErr != nil {
 		return nil, f.chargeErr
 	}
@@ -122,7 +126,7 @@ func (f *failingProvider) Void(ctx context.Context, id, idemKey string) error {
 func TestCreateRefund_ProviderUnknownNeverSealsTheKey(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), refundErr: errors.New("mockpay down")}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-unk", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -168,7 +172,7 @@ func TestCreateRefund_ProviderDeclineIsDefinite(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-dec", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -204,7 +208,7 @@ func TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-adopt", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -235,7 +239,7 @@ func TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess(t *testing.T) {
 func TestCreateRefund_UnknownReleasesKeyOnADeadContext(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), refundErr: context.DeadlineExceeded}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-dead", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -265,7 +269,7 @@ func TestCreateRefund_DefiniteFailureIsNotRetried(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		refundErr: fmt.Errorf("%w: mockpay refund: status 404", provider.ErrDefinite)}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-def", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -287,7 +291,7 @@ func TestCreateRefund_DefiniteFailureIsNotRetried(t *testing.T) {
 // 500 for a refund whose money already left.
 func TestCreateRefund_SettleFailureAfterMoneyMovedStaysOpen(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour)
+	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-settle", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -309,7 +313,7 @@ func TestCreateRefund_ReleaseFailureIsSurfacedNotSwallowed(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	fi.releaseErr = errors.New("db gone")
 	prov := &failingProvider{Stub: provider.NewStub(), refundErr: errors.New("mockpay down")}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-rel", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -332,7 +336,7 @@ func TestCreateRefund_DeclineRecordFailureReopensTheOutcome(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		refundErr: &provider.DeclinedError{Code: "refund_declined"}}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-drf", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -352,7 +356,7 @@ func TestCreateRefund_DeclineRecordFailureReopensTheOutcome(t *testing.T) {
 // arm: whatever state an adopted refund is in, only `succeeded` may be sealed.
 func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour)
+	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-weird", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -382,7 +386,7 @@ func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
 func TestCaptureVoid_CarryADeterministicProviderKey(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub()}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-key", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
@@ -446,7 +450,7 @@ func TestCapture_DecidedFailureRollsBackToAuthorized(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		captureErr: fmt.Errorf("%w: capture down", provider.ErrDefinite)}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
 	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "capture down") {
@@ -466,7 +470,7 @@ func TestVoid_DecidedFailureRollsBackToAuthorized(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(),
 		voidErr: fmt.Errorf("%w: void down", provider.ErrDefinite)}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
 	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "void down") {
@@ -489,7 +493,7 @@ func TestVoid_DecidedFailureRollsBackToAuthorized(t *testing.T) {
 func TestCapture_UnknownOutcomeParksInsteadOfReversing(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), captureErr: context.DeadlineExceeded}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cu", intent(2000))
 	_, err := svc.Capture(context.Background(), res.Payment.ID, 7)
@@ -515,7 +519,7 @@ func TestCapture_UnknownOutcomeParksInsteadOfReversing(t *testing.T) {
 func TestVoid_UnknownOutcomeParksInsteadOfRollingBack(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), voidErr: context.DeadlineExceeded}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-vu", intent(2000))
 	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
@@ -534,7 +538,7 @@ func TestVoid_UnknownOutcomeParksInsteadOfRollingBack(t *testing.T) {
 func TestAuthorize_UnknownOutcomeIsParkedNotLeftInvisible(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
 	prov := &failingProvider{Stub: provider.NewStub(), chargeErr: context.DeadlineExceeded}
-	svc := NewService(fp, fi, prov, 168*time.Hour)
+	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	_, err := svc.CreateIntent(context.Background(), "k-au", intent(2000))
 	if !errors.Is(err, domain.ErrOutcomeUnknown) {
@@ -594,22 +598,54 @@ func TestAttemptLog_RecordsOneRowPerRoundTripWithItsClass(t *testing.T) {
 	}
 }
 
-// A recorder that cannot write must not block the money state: the state is the
-// truth, the row is evidence about it, and losing the evidence is the lesser harm.
-func TestAttemptLog_WriteFailureDoesNotBlockTheStateChange(t *testing.T) {
+// TestAttemptLog_WriteFailureRefusesToPark: no evidence, no park.
+//
+// A `processing` row that no attempt explains is a dead end — no retry and no
+// sweep can work out which operation to re-ask or under which key — and only
+// manual SQL gets a payment out of it. So when the log refuses the write, the
+// pre-park state stands. That state is a claim the provider has not confirmed,
+// which reconciliation is built to detect; a dead end is not detectable by
+// anything.
+//
+// The answer stays an unknown outcome either way. The provider's silence is a
+// fact about the money and does not become a verdict because a table was down.
+func TestAttemptLog_WriteFailureRefusesToPark(t *testing.T) {
 	fp, fi := newFakePayments(), newFakeIdem()
-	rec := &recordingAttempts{err: errors.New("attempts table gone")}
-	prov := &failingProvider{Stub: provider.NewStub(), captureErr: context.DeadlineExceeded}
+	rec := &recordingAttempts{}
+	prov := &failingProvider{Stub: provider.NewStub()}
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(rec))
+	ctx := context.Background()
 
-	res, _ := svc.CreateIntent(context.Background(), "k-attfail", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
-		t.Fatalf("err = %v, want ErrOutcomeUnknown despite the lost row", err)
+	res, err := svc.CreateIntent(ctx, "k-attfail", intent(2000))
+	if err != nil {
+		t.Fatal(err)
 	}
-	got, _ := svc.Get(context.Background(), res.Payment.ID, 7)
-	if got.Status != domain.StatusProcessing {
-		t.Fatalf("status = %s, want processing — the state must land even without evidence", got.Status)
+	// The log breaks only now, so the capture's own park is the one that is refused.
+	rec.err = errors.New("attempts table gone")
+	prov.captureErr = context.DeadlineExceeded
+
+	capErr := mustCaptureErr(t, svc, ctx, res.Payment.ID)
+	if !errors.Is(capErr, domain.ErrOutcomeUnknown) {
+		t.Fatalf("err = %v, want ErrOutcomeUnknown", capErr)
 	}
+	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	if got.Status == domain.StatusProcessing {
+		t.Fatal("parked with no attempt row: nothing could ever resolve this payment")
+	}
+	if got.Status != domain.StatusCaptured {
+		t.Fatalf("status = %s, want the pre-park state to stand", got.Status)
+	}
+}
+
+// mustCaptureErr captures and requires an error, keeping the test above focused
+// on WHICH error rather than on the ceremony of demanding one.
+func mustCaptureErr(t *testing.T, svc *Service, ctx context.Context, paymentID int64) error {
+	t.Helper()
+	_, err := svc.Capture(ctx, paymentID, 7)
+	if err == nil {
+		t.Fatal("capture succeeded, want the unknown outcome reported")
+	}
+	return err
 }
 
 // recordingAttempts is an in-memory attempt log. It mirrors the PRODUCTION
@@ -866,7 +902,7 @@ func TestCreateIntent_AdoptFailedOrderReturns422NoRecharge(t *testing.T) {
 // cache a bogus 201.
 func TestCreateIntent_ChargeSucceededButRowNotAuthorizedRejects(t *testing.T) {
 	ep := &erroringPayments{fakePayments: newFakePayments(), transitionErr: domain.ErrStaleTransition}
-	svc := NewService(ep, newFakeIdem(), provider.NewStub(), 168*time.Hour)
+	svc := NewService(ep, newFakeIdem(), provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	_, err := svc.CreateIntent(context.Background(), "k-exp", intent(2000))
 	if !errors.Is(err, domain.ErrInvalidTransition) {

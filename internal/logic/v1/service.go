@@ -124,10 +124,10 @@ func (unwiredAttemptLog) Resolve(context.Context, int64, time.Time) error {
 //
 // A duplicate is a different animal and is not counted as a loss: the row the
 // database refused already exists, written by whoever got there first.
-func (s *Service) recordAttempt(ctx context.Context, a domain.Attempt) {
+func (s *Service) recordAttempt(ctx context.Context, a domain.Attempt) error {
 	_, err := s.attempts.Record(ctx, a)
 	if err == nil {
-		return
+		return nil
 	}
 	if !errors.Is(err, domain.ErrDuplicateAttempt) {
 		recordAttemptWriteFailure(ctx, string(a.Operation))
@@ -137,6 +137,7 @@ func (s *Service) recordAttempt(ctx context.Context, a domain.Attempt) {
 		attribute.String("payment.operation", string(a.Operation)),
 		attribute.String("payment.outcome_class", string(a.Outcome)),
 	))
+	return err
 }
 
 // chargeRef is the provider reference an authorize attempt can record. It is
@@ -329,11 +330,15 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 	})
 
 	class := classifyProviderOutcome(chErr)
-	s.recordAttempt(ctx, domain.Attempt{
-		PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
-		ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
-		IdempotencyKey: chargeKey,
-	})
+	if class != domain.OutcomeUnknown {
+		// A decided round-trip is history; park() records the undecided one, because
+		// there the evidence has to land before the state does.
+		_ = s.recordAttempt(ctx, domain.Attempt{
+			PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
+			ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
+			IdempotencyKey: chargeKey,
+		})
+	}
 
 	switch class {
 	case domain.OutcomeSuccess:
@@ -356,16 +361,11 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 		// retry under ANY key now resolves rather than charges.
 		recordAuthorization(ctx, authError, currencyLabel(in.Currency))
 		recordProviderUnknown(ctx, opAuthorize)
-		parkErr := s.payments.TransitionStatus(ctx, pay.ID,
-			domain.StatusPending, domain.StatusProcessing, nil)
-		unknown := fmt.Errorf("%w: authorize: %w", domain.ErrOutcomeUnknown, chErr)
-		if parkErr != nil {
-			// The park lost its CAS. The outcome is STILL unknown, so the error must
-			// stay an unknown one: reporting a precondition failure here is what made
-			// callers compensate an operation that may have succeeded.
-			unknown = fmt.Errorf("%w (parking it failed: %w)", unknown, parkErr)
-		}
-		return nil, s.withKeyReleased(ctx, key.ID, unknown)
+		return nil, s.withKeyReleased(ctx, key.ID, s.park(ctx, domain.StatusPending, domain.Attempt{
+			PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
+			ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
+			IdempotencyKey: chargeKey,
+		}, chErr))
 
 	case domain.OutcomeRetryableFailure:
 		// The provider refused this attempt outright and did nothing (429): the
@@ -510,12 +510,17 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		}
 		return nil, err
 	}
-	capErr := s.prov.Capture(ctx, pay.ProviderPaymentID, providerKey(providerOpCapture, pay.ID))
+	captureKey := providerKey(providerOpCapture, pay.ID)
+	capErr := s.prov.Capture(ctx, pay.ProviderPaymentID, captureKey)
 	class := classifyProviderOutcome(capErr)
-	s.recordAttempt(ctx, domain.Attempt{
+	attempt := domain.Attempt{
 		PaymentID: pay.ID, Operation: domain.AttemptCapture, Outcome: class,
 		ProviderRef: pay.ProviderPaymentID, ProviderStatus: providerStatusOf(capErr),
-	})
+		IdempotencyKey: captureKey,
+	}
+	if class != domain.OutcomeUnknown {
+		_ = s.recordAttempt(ctx, attempt)
+	}
 	switch class {
 	case domain.OutcomeSuccess:
 		recordOperation(ctx, opCapture, resultOK)
@@ -528,13 +533,16 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		// while the provider keeps it — revenue collected and then disowned, and
 		// internally balanced so Imbalance() cannot see it.
 		//
-		// So the capture ledger entry STAYS and the intent moves to `processing`.
-		// The doubt is now visible to the reconciler, which resolves it by asking
-		// the provider what it actually holds. A deliberate reversal may follow
-		// then; it is a conclusion, not a reflex.
+		// So the capture ledger entry STAYS and the intent moves to `processing`,
+		// with the round-trip recorded. The next call that touches this payment
+		// re-asks the provider under the same key (see resolveIntentDoubt); a
+		// deliberate reversal may follow then, as a conclusion rather than a reflex.
+		//
+		// A background sweep over the whole worklist is the phase's next slice; until
+		// it lands, the escape is a retry, not a timer.
 		recordProviderUnknown(ctx, opCapture)
 		recordOperation(ctx, opCapture, resultUnknown)
-		return nil, s.park(ctx, pay.ID, domain.StatusCaptured, opCapture, capErr)
+		return nil, s.park(ctx, domain.StatusCaptured, attempt, capErr)
 
 	case domain.OutcomeBusinessDecline:
 		// Decided no: nothing was captured. Reverse the row and post the
@@ -583,12 +591,17 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		}
 		return nil, err
 	}
-	voidErr := s.prov.Void(ctx, pay.ProviderPaymentID, providerKey(providerOpVoid, pay.ID))
+	voidKey := providerKey(providerOpVoid, pay.ID)
+	voidErr := s.prov.Void(ctx, pay.ProviderPaymentID, voidKey)
 	class := classifyProviderOutcome(voidErr)
-	s.recordAttempt(ctx, domain.Attempt{
+	attempt := domain.Attempt{
 		PaymentID: pay.ID, Operation: domain.AttemptVoid, Outcome: class,
 		ProviderRef: pay.ProviderPaymentID, ProviderStatus: providerStatusOf(voidErr),
-	})
+		IdempotencyKey: voidKey,
+	}
+	if class != domain.OutcomeUnknown {
+		_ = s.recordAttempt(ctx, attempt)
+	}
 	switch class {
 	case domain.OutcomeSuccess:
 		recordOperation(ctx, opVoid, resultOK)
@@ -598,10 +611,10 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		// Rolling back to `authorized` would assert the hold is still live. If the
 		// void did land, that leaves us believing we can capture money the
 		// provider has already released — the mirror image of the capture case.
-		// Park it instead and let the reconciler ask.
+		// Park it instead, and let the next call re-ask under the same key.
 		recordProviderUnknown(ctx, opVoid)
 		recordOperation(ctx, opVoid, resultUnknown)
-		return nil, s.park(ctx, pay.ID, domain.StatusVoided, opVoid, voidErr)
+		return nil, s.park(ctx, domain.StatusVoided, attempt, voidErr)
 
 	case domain.OutcomeBusinessDecline, domain.OutcomeRetryableFailure:
 		result := resultDeclined
@@ -796,7 +809,7 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, ref *domain.Refund, amountMinor int64, scopedKey string) error {
 	providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, amountMinor, scopedKey)
 	class := classifyProviderOutcome(provErr)
-	s.recordAttempt(ctx, domain.Attempt{
+	attemptErr := s.recordAttempt(ctx, domain.Attempt{
 		PaymentID: pay.ID, Operation: domain.AttemptRefund, Outcome: class,
 		RefundID: &ref.ID, ProviderRef: providerRefundID,
 		ProviderStatus: providerStatusOf(provErr), IdempotencyKey: scopedKey,
@@ -807,7 +820,7 @@ func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, 
 		s.closeRefundDoubt(ctx, pay.ID, ref.ID)
 	}
 	if provErr != nil {
-		return s.refundNotSucceeded(ctx, ref, class, provErr)
+		return s.refundNotSucceeded(ctx, ref, class, attemptErr, provErr)
 	}
 	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, providerRefundID); err != nil {
 		// The money MOVED but we could not record it. That is the ambiguous case
@@ -842,7 +855,7 @@ func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, 
 // TOTAL refunded against the capture, so it stops a same-money retry only when
 // the refund covers the whole remaining refundable amount. Sending the same key
 // is what makes a partial refund safe, which is why the error says so.
-func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, class domain.OutcomeClass, provErr error) error {
+func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, class domain.OutcomeClass, attemptErr, provErr error) error {
 	if class == domain.OutcomeRetryableFailure {
 		// The provider refused to take the request and did nothing with it, so the
 		// refund was never asked. It stays `pending` — still reserving its amount —
@@ -854,6 +867,14 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 	if class == domain.OutcomeUnknown {
 		recordOperation(ctx, opRefund, resultUnknown)
 		recordProviderUnknown(ctx, opRefund)
+		if attemptErr != nil {
+			// Same rule as the intent-level parks: no evidence, no park. A refund
+			// sitting in `processing` that no attempt row explains cannot be resolved
+			// by anything, and `pending` at least keeps the reserve and reads as
+			// "never asked" rather than as a question nobody can look up.
+			return fmt.Errorf("%w: %w (not parked: the attempt log refused the evidence: %w)",
+				domain.ErrRefundNotSettled, provErr, attemptErr)
+		}
 		// `processing`, not `pending`: both reserve the amount against a second
 		// refund of the same money, but only one says the provider was already
 		// asked. A resolver needs that distinction to know whether to ask what

@@ -280,6 +280,12 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 		  AND $2::bigint + COALESCE((SELECT SUM(r.amount_minor) FROM refunds r
 		                             WHERE r.payment_id = p.id AND r.status IN ('pending','processing','succeeded')), 0)
 		      <= p.amount_minor
+		  -- Fail closed while a refund's fate is unknown. The amount guard above only
+		  -- stops a SECOND refund that would exceed the capture, so two partials could
+		  -- both fit and both be paid — under different keys, so the provider replays
+		  -- neither. Until the open one is settled, nothing new goes out.
+		  AND NOT EXISTS (SELECT 1 FROM refunds open_r
+		                   WHERE open_r.payment_id = p.id AND open_r.status = 'processing')
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING `+refundColumns,
 		paymentID, amountMinor, reason, idemKey))
