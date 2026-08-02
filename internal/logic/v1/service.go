@@ -34,6 +34,9 @@ type PaymentRepo interface {
 	ExpireStaleAuthorizations(ctx context.Context, now time.Time) (int64, error)
 	CreateRefund(ctx context.Context, paymentID, amountMinor int64, reason, idemKey string) (*domain.Refund, error)
 	SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error
+	// FindRefundByID is the sweep's entry point into a parked refund: it carries the
+	// amount and the original key a replay must reuse.
+	FindRefundByID(ctx context.Context, id int64) (*domain.Refund, error)
 }
 
 // IdemRepo is the idempotency-key port (implemented by *idempotency.Repository
@@ -76,6 +79,9 @@ type AttemptLog interface {
 	// ListOpenForPayment returns this payment's unresolved UNKNOWN attempts,
 	// oldest-first — the questions still owed an answer.
 	ListOpenForPayment(ctx context.Context, paymentID int64) ([]domain.Attempt, error)
+	// ListOpen returns the whole worklist oldest-first, bounded. The sweep works it
+	// in that order so the doubt that has been open longest is settled first.
+	ListOpen(ctx context.Context, limit int) ([]domain.Attempt, error)
 	// Resolve stamps an attempt settled once a later round-trip answered it.
 	Resolve(ctx context.Context, attemptID int64, at time.Time) error
 }
@@ -106,6 +112,10 @@ func (unwiredAttemptLog) Record(context.Context, domain.Attempt) (int64, error) 
 }
 
 func (unwiredAttemptLog) ListOpenForPayment(context.Context, int64) ([]domain.Attempt, error) {
+	return nil, errAttemptLogUnwired
+}
+
+func (unwiredAttemptLog) ListOpen(context.Context, int) ([]domain.Attempt, error) {
 	return nil, errAttemptLogUnwired
 }
 

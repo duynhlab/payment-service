@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -41,7 +42,54 @@ var (
 		metric.WithDescription("Idempotency keys that could not be unlocked after a failed attempt; each one delays a caller's same-key retry until the takeover window"))
 	attemptResolutionCounter, _ = meter.Int64Counter("payment.attempt.resolution.total",
 		metric.WithDescription("Re-drives of an open UNKNOWN attempt, by operation and the class the provider answered with — `UNKNOWN` here means the doubt survived the round-trip"))
+	sweepFailureCounter, _ = meter.Int64Counter("payment.doubt.sweep_failures.total",
+		metric.WithDescription("Worklist entries the background sweep could not even attempt, by operation — doubt that nothing is currently working on"))
 )
+
+// recordSweepFailure counts a worklist entry the sweep could not act on at all
+// (its payment or refund would not load, or it carries no key to replay under).
+// Distinct from a resolution that ran and learned nothing: that one is progress,
+// this one means the automatic path is not running for that row.
+func recordSweepFailure(ctx context.Context, op string) {
+	sweepFailureCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(labelOperation, op)))
+}
+
+// ObserveDoubtBacklog registers the gauges that make unresolved doubt visible
+// without anyone querying for it: how many questions are open, and how old the
+// oldest one is.
+//
+// The AGE is the alertable one. A handful of open attempts at any moment is
+// normal — every provider timeout creates one — while an attempt still open an
+// hour later means the escape is not working for that payment, and money is
+// sitting somewhere nobody has looked. Count alone cannot tell those apart.
+func ObserveDoubtBacklog(count func(context.Context) (int64, error), oldest func(context.Context) (time.Duration, error)) error {
+	open, err := meter.Int64ObservableGauge("payment.doubt.open",
+		metric.WithDescription("Provider round-trips whose outcome is still unknown and unresolved"))
+	if err != nil {
+		return err
+	}
+	age, err := meter.Float64ObservableGauge("payment.doubt.oldest_age_seconds",
+		metric.WithDescription("Age of the oldest unresolved provider outcome; the escalation signal, since one fresh unknown is routine and an old one is not"))
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		n, cerr := count(ctx)
+		d, aerr := oldest(ctx)
+		if cerr != nil || aerr != nil {
+			// Returning an error here drops EVERY metric this process would have
+			// exported for the cycle, not just these two (the periodic reader aborts
+			// the whole collection). Observe nothing and let the gauges go stale
+			// instead — a stale gauge is a visible symptom, a blank scrape is a
+			// mystery.
+			return nil //nolint:nilerr // deliberate: one failed read must not blank the export
+		}
+		o.ObserveInt64(open, n)
+		o.ObserveFloat64(age, d.Seconds())
+		return nil
+	}, open, age)
+	return err
+}
 
 // recordResolution counts one attempt at closing existing doubt. It is the
 // counterpart to providerUnknownCounter: doubt created versus doubt settled, and

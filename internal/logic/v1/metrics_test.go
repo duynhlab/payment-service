@@ -50,14 +50,22 @@ func (f *fakeIdem) forceReDrive(key string) {
 	}
 }
 
+// testReader is the single metric reader for this package. The OTel global
+// delegate is FIRST-WINS: instruments are bound to whichever MeterProvider is
+// installed first, so a second install is silently ignored and any test that
+// brings its own reader collects nothing. One provider, installed once, is the
+// only arrangement that works.
+var testReader = func() sdkmetric.Reader {
+	r := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(r)))
+	return r
+}()
+
 // TestAuthorizationMetric drives the three authorization outcomes, then the two
 // exactly-once hazards (idempotent replay and crash-recovery re-drive), all on
-// one service and one MeterProvider — the OTel global delegate is first-wins,
-// so a single provider install per test binary is required, and the cumulative
-// counter is asserted at each step.
+// one service, with the cumulative counter asserted at each step.
 func TestAuthorizationMetric(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	reader := testReader
 
 	svc, _, fi, _ := newTestService()
 	ctx := context.Background()

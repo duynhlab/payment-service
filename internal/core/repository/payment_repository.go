@@ -315,6 +315,26 @@ func (r *PaymentRepository) CreateRefund(ctx context.Context, paymentID, amountM
 	return ref, nil
 }
 
+// FindRefundByID reads one refund. The doubt sweep needs it: an open refund
+// attempt names a refund id, and re-driving that refund needs its amount and the
+// key it was sent under — both live on the row, and both must be the ORIGINAL
+// values or the provider performs a new refund instead of replaying the old one.
+func (r *PaymentRepository) FindRefundByID(ctx context.Context, id int64) (*domain.Refund, error) {
+	var ref domain.Refund
+	err := r.pool.QueryRow(ctx,
+		`SELECT `+refundColumns+`, COALESCE(idempotency_key,'') FROM refunds WHERE id = $1`, id).
+		Scan(&ref.ID, &ref.PaymentID, &ref.AmountMinor, &ref.Status,
+			&ref.ProviderRefundID, &ref.Reason, &ref.CreatedAt, &ref.UpdatedAt,
+			&ref.IdempotencyKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find refund %d: %w", id, err)
+	}
+	return &ref, nil
+}
+
 // SettleRefund marks a pending refund succeeded/failed and, when refunds now
 // cover the full amount, flips the payment to refunded (derived -> stored).
 func (r *PaymentRepository) SettleRefund(ctx context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error {
