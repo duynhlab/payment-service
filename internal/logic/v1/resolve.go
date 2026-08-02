@@ -383,3 +383,154 @@ func (s *Service) closeRefundDoubt(ctx context.Context, paymentID, refundID int6
 		}
 	}
 }
+
+// ResolveOpenDoubt sweeps the doubt worklist and settles what the provider will
+// now answer. It returns how many attempts it closed.
+//
+// The request path already resolves a payment the moment anyone touches it, so
+// this sweep exists for the doubt NOBODY touches: an abandoned checkout, an order
+// whose saga gave up, a refund the customer is not watching. Those are exactly the
+// ones that strand money, because nothing else is going to ask.
+//
+// One pass per payment, not per attempt: resolveIntentDoubt already works through
+// everything open on a payment, and re-entering it per attempt would ask the
+// provider the same question several times in one sweep.
+//
+// A payment that will not resolve is left alone and stays on the worklist. The
+// sweep never gives up on doubt by declaring an outcome — that is the whole rule —
+// so the backlog gauge, not this function, is what escalates to a human.
+func (s *Service) ResolveOpenDoubt(ctx context.Context, limit int) (int64, error) {
+	open, err := s.attempts.ListOpen(ctx, limit)
+	if err != nil {
+		return 0, fmt.Errorf("sweep open doubt: %w", err)
+	}
+
+	var closed int64
+	swept := make(map[int64]bool, len(open))
+	for _, a := range open {
+		// A refund's doubt lives on the refund row, so it is resolved per refund;
+		// everything else is resolved per payment.
+		if a.Operation == domain.AttemptRefund {
+			if s.sweepRefund(ctx, a) {
+				closed++
+			}
+			continue
+		}
+		if swept[a.PaymentID] {
+			continue
+		}
+		swept[a.PaymentID] = true
+
+		pay, ferr := s.payments.FindByID(ctx, a.PaymentID, 0)
+		if ferr != nil {
+			recordSweepFailure(ctx, string(a.Operation))
+			continue
+		}
+		if pay.Status != domain.StatusProcessing {
+			// The payment is not parked but the question is still open — a park that
+			// lost its CAS, or an operator acting directly. The question is NOT moot:
+			// whatever the row says now, nobody ever learned what that round-trip did
+			// at the provider, and for a capture the ledger is already asserting
+			// revenue on the strength of it. Ask, then close on a decided answer.
+			if s.verifyStrayAttempt(ctx, pay, a) {
+				closed++
+			}
+			continue
+		}
+		before := pay.Status
+		settled, rerr := s.resolveIntentDoubt(ctx, pay)
+		if rerr != nil {
+			recordSweepFailure(ctx, string(a.Operation))
+			continue
+		}
+		if settled.Status != before {
+			closed++
+		}
+	}
+	return closed, nil
+}
+
+// verifyStrayAttempt settles an open question about a payment that is no longer
+// parked. It re-asks the provider and closes the attempt only on a decided answer;
+// it deliberately does NOT move the payment, because the row already reflects a
+// decision somebody else made and overruling it from here would be the reflex this
+// phase removed.
+//
+// Closing such an attempt unasked was tempting and would have been the worst of
+// both: it deletes the only work item pointing at an unverified provider call
+// while leaving the pre-posted ledger asserting revenue nobody confirmed.
+func (s *Service) verifyStrayAttempt(ctx context.Context, pay *domain.Payment, a domain.Attempt) bool {
+	if pay.ProviderPaymentID == "" {
+		// No charge reference: nothing to ask about, and no key-based replay that
+		// would not risk creating one.
+		recordSweepFailure(ctx, string(a.Operation))
+		return false
+	}
+	var (
+		key   string
+		class domain.OutcomeClass
+	)
+	switch a.Operation {
+	case domain.AttemptCapture:
+		key = attemptKey(a, providerOpCapture, pay.ID)
+		class = s.recordRoundTrip(ctx, withKey(a, key), pay.ProviderPaymentID,
+			s.prov.Capture(ctx, pay.ProviderPaymentID, key))
+	case domain.AttemptVoid:
+		key = attemptKey(a, providerOpVoid, pay.ID)
+		class = s.recordRoundTrip(ctx, withKey(a, key), pay.ProviderPaymentID,
+			s.prov.Void(ctx, pay.ProviderPaymentID, key))
+	case domain.AttemptAuthorize, domain.AttemptRefund:
+		// An authorize on a payment that already has a reference was answered by
+		// definition; refunds never reach here (they are swept per refund).
+		recordSweepFailure(ctx, string(a.Operation))
+		return false
+	}
+	if !class.Decided() {
+		return false
+	}
+	return s.closeAttempt(ctx, a) == nil
+}
+
+// sweepRefund re-drives one parked refund under its ORIGINAL key and settles what
+// comes back. It reports whether the refund reached a decided state.
+//
+// It deliberately does not go through CreateRefund: that path claims an
+// idempotency key on behalf of a caller, and there is no caller here. The refund
+// row already holds everything the provider needs — its amount and the key it was
+// first sent under — which is what makes replay rather than a second payout.
+func (s *Service) sweepRefund(ctx context.Context, a domain.Attempt) bool {
+	if a.RefundID == nil {
+		return false
+	}
+	ref, err := s.payments.FindRefundByID(ctx, *a.RefundID)
+	if err != nil {
+		recordSweepFailure(ctx, opRefund)
+		return false
+	}
+	if ref.Status != domain.RefundProcessing {
+		// Already settled by a caller's retry; the attempt is just stale.
+		return s.closeAttempt(ctx, a) == nil
+	}
+	if ref.IdempotencyKey == "" {
+		// Without the original key a re-drive is a second payout, not a replay.
+		recordSweepFailure(ctx, opRefund)
+		return false
+	}
+	pay, err := s.payments.FindByID(ctx, ref.PaymentID, 0)
+	if err != nil {
+		recordSweepFailure(ctx, opRefund)
+		return false
+	}
+
+	providerRefundID, provErr := s.prov.Refund(ctx, pay.ProviderPaymentID, ref.AmountMinor, ref.IdempotencyKey)
+	class := s.recordRoundTrip(ctx, a, providerRefundID, provErr)
+	switch class {
+	case domain.OutcomeSuccess:
+		return s.payments.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, providerRefundID) == nil
+	case domain.OutcomeBusinessDecline:
+		return s.payments.SettleRefund(ctx, ref.ID, domain.RefundFailed, "") == nil
+	case domain.OutcomeRetryableFailure, domain.OutcomeUnknown:
+		return false
+	}
+	return false
+}

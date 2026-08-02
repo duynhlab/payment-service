@@ -218,6 +218,17 @@ func (f *fakePayments) CreateRefund(_ context.Context, paymentID, amountMinor in
 	return &out, nil
 }
 
+func (f *fakePayments) FindRefundByID(_ context.Context, id int64) (*domain.Refund, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.refs[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	out := *r
+	return &out, nil
+}
+
 func (f *fakePayments) SettleRefund(_ context.Context, refundID int64, status domain.RefundStatus, providerRefundID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

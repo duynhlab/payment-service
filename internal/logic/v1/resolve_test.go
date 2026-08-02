@@ -465,3 +465,127 @@ func TestRefund_UnknownOutcomeIsRecognisableAsDoubt(t *testing.T) {
 		t.Fatalf("err = %v, want the refund's own sentinel kept as well", err)
 	}
 }
+
+// The sweep exists for doubt nobody retries: an abandoned checkout, a saga that
+// gave up, a refund the customer is not watching. Those are exactly the ones that
+// strand money, because nothing else is going to ask.
+func TestSweep_SettlesDoubtNobodyIsRetrying(t *testing.T) {
+	svc, _, prov, rec := newDoubtService()
+	ctx := context.Background()
+
+	res, err := svc.CreateIntent(ctx, "k-sweep", intent(2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov.captureThenErr = context.DeadlineExceeded
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("park err = %v", err)
+	}
+	prov.captureThenErr = nil
+
+	closed, err := svc.ResolveOpenDoubt(ctx, 10)
+	if err != nil {
+		t.Fatalf("sweep err = %v", err)
+	}
+	if closed != 1 {
+		t.Fatalf("closed = %d, want 1", closed)
+	}
+	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	if got.Status != domain.StatusCaptured {
+		t.Fatalf("status = %s, want captured", got.Status)
+	}
+	if open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID); len(open) != 0 {
+		t.Fatalf("open attempts = %d, want 0", len(open))
+	}
+}
+
+// A parked refund is swept under the key the refund row already holds — not a
+// fresh one. A fresh key is a second payout, which is the failure this whole
+// mechanism is built to avoid.
+func TestSweep_ReplaysAParkedRefundUnderItsOriginalKey(t *testing.T) {
+	svc, _, prov, _ := newDoubtService()
+	ctx := context.Background()
+
+	res, _ := svc.CreateIntent(ctx, "k-sweep-ref", intent(2000))
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	prov.refundThenErr = context.DeadlineExceeded
+	if _, _, err := svc.CreateRefund(ctx, "rk-sweep", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("park err = %v", err)
+	}
+	prov.refundThenErr = nil
+
+	if _, err := svc.ResolveOpenDoubt(ctx, 10); err != nil {
+		t.Fatalf("sweep err = %v", err)
+	}
+	unique := map[string]bool{}
+	for _, k := range prov.refundKeys {
+		unique[k] = true
+	}
+	if len(unique) != 1 {
+		t.Fatalf("provider refund keys = %v, want exactly one — a second key is a second payout", prov.refundKeys)
+	}
+}
+
+// An open question about a payment that is no longer parked is still a question.
+// Discarding it deletes the only work item pointing at an unverified provider
+// call, while the capture ledger keeps asserting revenue nobody confirmed.
+func TestSweep_VerifiesAStrayAttemptInsteadOfDiscardingIt(t *testing.T) {
+	svc, fp, prov, rec := newDoubtService()
+	ctx := context.Background()
+
+	res, _ := svc.CreateIntent(ctx, "k-stray", intent(2000))
+	prov.captureThenErr = context.DeadlineExceeded
+	// The park CAS loses, so the row stays `captured` while the question stays open.
+	fp.transitionErr = domain.ErrStaleTransition
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
+	}
+	fp.transitionErr = nil
+	if open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID); len(open) != 1 {
+		t.Fatalf("open attempts = %d, want the question recorded", len(open))
+	}
+
+	prov.captureThenErr = nil
+	before := prov.gotCaptureKey
+	if _, err := svc.ResolveOpenDoubt(ctx, 10); err != nil {
+		t.Fatalf("sweep err = %v", err)
+	}
+	if prov.gotCaptureKey == "" || before == "" {
+		t.Fatal("the sweep closed the question without asking the provider anything")
+	}
+	if open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID); len(open) != 0 {
+		t.Fatalf("open attempts = %d, want 0 once the answer is known", len(open))
+	}
+}
+
+// Doubt that survives the sweep stays on the worklist. The sweep never settles a
+// question by declaring an outcome — that is the entire rule — so an unresolvable
+// entry escalates through the backlog gauge, not by being quietly closed.
+func TestSweep_LeavesUnresolvedDoubtOnTheWorklist(t *testing.T) {
+	svc, _, prov, rec := newDoubtService()
+	ctx := context.Background()
+
+	res, _ := svc.CreateIntent(ctx, "k-sweep-silent", intent(2000))
+	prov.captureThenErr = context.DeadlineExceeded
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("park err = %v", err)
+	}
+	// The provider stays silent through the sweep as well.
+	closed, err := svc.ResolveOpenDoubt(ctx, 10)
+	if err != nil {
+		t.Fatalf("sweep err = %v", err)
+	}
+	if closed != 0 {
+		t.Fatalf("closed = %d, want 0 — nothing was learned", closed)
+	}
+	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	if got.Status != domain.StatusProcessing {
+		t.Fatalf("status = %s, want processing", got.Status)
+	}
+	open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID)
+	if len(open) != 1 {
+		t.Fatalf("open attempts = %d, want exactly 1 — still one question, still open", len(open))
+	}
+}

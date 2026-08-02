@@ -54,6 +54,15 @@ const (
 	outboxRelayBatch    = 100
 	reconcileInterval   = 5 * time.Minute
 	reconcilePageSize   = 100
+	// resolveDoubtInterval paces the doubt sweep. Every operation already resolves
+	// its own payment on the request path, so this only picks up doubt nobody is
+	// retrying — which is why a minute is frequent enough, and why it must not be
+	// so frequent that a provider outage turns into a poll loop against a provider
+	// that is already struggling.
+	resolveDoubtInterval = time.Minute
+	// resolveDoubtBatch bounds one sweep. Each entry is a provider round-trip, so
+	// the batch is the ceiling on how much traffic one tick can generate.
+	resolveDoubtBatch = 50
 	// Published events are pruned after this window; the durable audit trail is
 	// the ledger, so the outbox only needs a short replay buffer.
 	outboxPublishedRetention = 7 * 24 * time.Hour
@@ -145,6 +154,16 @@ func run() error {
 		logicv1.WithAttempts(attemptRepo))
 	paymentHandler := v1.NewHandler(paymentService)
 
+	// Unresolved doubt has to be visible without anyone querying for it: how much
+	// is open, and how old the oldest is. The age is the alertable one — a fresh
+	// unknown is routine, an hour-old one means money is sitting somewhere nobody
+	// has looked.
+	if err := logicv1.ObserveDoubtBacklog(attemptRepo.CountOpen, func(ctx context.Context) (time.Duration, error) {
+		return attemptRepo.OldestOpenAge(ctx, time.Now())
+	}); err != nil {
+		return fmt.Errorf("register doubt-backlog gauges: %w", err)
+	}
+
 	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
@@ -198,9 +217,11 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 	expiry := time.NewTicker(time.Minute)
 	reap := time.NewTicker(time.Hour)
 	outbox := time.NewTicker(outboxRelayInterval)
+	doubt := time.NewTicker(resolveDoubtInterval)
 	defer expiry.Stop()
 	defer reap.Stop()
 	defer outbox.Stop()
+	defer doubt.Stop()
 
 	// Reconciliation only ticks when a provider ledger is available (recon != nil).
 	// A nil channel blocks forever, so the select arm is simply never taken.
@@ -219,6 +240,13 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 			runJob(ctx, "Reconcile payments vs provider", logger, func(jctx context.Context) (int64, error) {
 				_, found, err := recon.Run(jctx, reconcilePageSize)
 				return int64(found), err
+			})
+		case <-doubt.C:
+			// The request path resolves a payment the moment anyone touches it; this
+			// is for the doubt nobody touches — an abandoned checkout, a saga that
+			// gave up, a refund the customer is not watching.
+			runJob(ctx, "Resolve unknown provider outcomes", logger, func(jctx context.Context) (int64, error) {
+				return svc.ResolveOpenDoubt(jctx, resolveDoubtBatch)
 			})
 		case <-expiry.C:
 			runJob(ctx, "Expire stale authorizations", logger, func(jctx context.Context) (int64, error) {

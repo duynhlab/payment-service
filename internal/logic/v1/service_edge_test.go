@@ -35,6 +35,10 @@ type failingProvider struct {
 	captureThenErr error
 	voidThenErr    error
 	refundThenErr  error
+	// refundKeys records every key a refund round-trip was sent under. A SECOND
+	// distinct key for one refund is a second payout, so the set — not the count —
+	// is what a test must assert on.
+	refundKeys []string
 	// chargeCalls counts provider charge round-trips, so a test can prove that a
 	// retry costs one call and not a doubling.
 	chargeCalls int
@@ -56,6 +60,7 @@ func (f *failingProvider) nextCaptureErr() (error, bool) {
 }
 
 func (f *failingProvider) Refund(ctx context.Context, id string, amt int64, key string) (string, error) {
+	f.refundKeys = append(f.refundKeys, key)
 	if f.refundErr != nil {
 		return "", f.refundErr
 	}
@@ -682,6 +687,23 @@ func (r *recordingAttempts) ListOpenForPayment(_ context.Context, paymentID int6
 	for _, a := range r.got {
 		if a.PaymentID == paymentID && a.Open() {
 			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (r *recordingAttempts) ListOpen(_ context.Context, limit int) ([]domain.Attempt, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	var out []domain.Attempt
+	for _, a := range r.got {
+		if !a.Open() {
+			continue
+		}
+		out = append(out, a)
+		if len(out) == limit {
+			break
 		}
 	}
 	return out, nil
