@@ -883,7 +883,11 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 			return fmt.Errorf("%w: parking the refund failed: %w", domain.ErrRefundNotSettled, err)
 		}
 		ref.Status = domain.RefundProcessing
-		return fmt.Errorf("%w: %w", domain.ErrRefundNotSettled, provErr)
+		// Wraps BOTH sentinels. ErrRefundNotSettled says which operation is open;
+		// ErrOutcomeUnknown says what kind of open it is, and that is the one every
+		// caller tests to tell doubt from a decided no. A refund is not exempt from
+		// that question just because it has an error of its own.
+		return fmt.Errorf("%w: %w: %w", domain.ErrRefundNotSettled, domain.ErrOutcomeUnknown, provErr)
 	}
 	recordOperation(ctx, opRefund, resultDeclined)
 	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundFailed, ""); err != nil {

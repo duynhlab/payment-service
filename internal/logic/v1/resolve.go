@@ -108,29 +108,31 @@ func (s *Service) resolveAuthorize(ctx context.Context, pay *domain.Payment, a d
 
 	switch class {
 	case domain.OutcomeSuccess:
-		if err := s.transitionParked(ctx, pay.ID, domain.StatusAuthorized,
+		err := s.transitionParked(ctx, pay.ID, domain.StatusAuthorized,
 			map[string]any{
 				colProviderPaymentID: charge.ProviderPaymentID,
 				colAuthorizedAt:      s.now(),
 				colExpiresAt:         s.now().Add(s.holdTTL),
-			}); err != nil {
-			return err
-		}
+			})
 		// An automatic-capture intent authorizes and captures together; the park
 		// happened before either landed, so the capture leg is posted here.
-		if pay.CaptureMethod == domain.CaptureAutomatic {
-			if err := s.payments.CaptureWithLedger(ctx, pay.ID, s.now()); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
-				return err
+		if err == nil && pay.CaptureMethod == domain.CaptureAutomatic {
+			if cerr := s.payments.CaptureWithLedger(ctx, pay.ID, s.now()); cerr != nil && !errors.Is(cerr, domain.ErrStaleTransition) {
+				err = cerr
 			}
 		}
-		recordAuthorization(ctx, authAuthorized, currencyLabel(pay.Currency))
+		if err == nil {
+			recordAuthorization(ctx, authAuthorized, currencyLabel(pay.Currency))
+		}
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeBusinessDecline:
-		if err := s.transitionParked(ctx, pay.ID, domain.StatusFailed,
-			map[string]any{colDeclineCode: declineCode(chErr)}); err != nil {
-			return err
+		err := s.transitionParked(ctx, pay.ID, domain.StatusFailed,
+			map[string]any{colDeclineCode: declineCode(chErr)})
+		if err == nil {
+			recordAuthorization(ctx, authDeclined, currencyLabel(pay.Currency))
 		}
-		recordAuthorization(ctx, authDeclined, currencyLabel(pay.Currency))
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeRetryableFailure, domain.OutcomeUnknown:
 		// Still no answer, and the payment stays parked. The doubt carries over to
@@ -151,19 +153,24 @@ func (s *Service) resolveCapture(ctx context.Context, pay *domain.Payment, a dom
 
 	switch class {
 	case domain.OutcomeSuccess:
-		if err := s.transitionParked(ctx, pay.ID, domain.StatusCaptured, nil); err != nil {
-			return err
+		err := s.transitionParked(ctx, pay.ID, domain.StatusCaptured, nil)
+		if err == nil {
+			recordOperation(ctx, opCapture, resultOK)
 		}
-		recordOperation(ctx, opCapture, resultOK)
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeBusinessDecline:
 		// The provider says this capture did not happen and cannot. ReverseCapture
 		// moves processing→authorized and posts the compensating ledger legs, so the
 		// books stop asserting revenue nobody collected.
-		if err := s.payments.ReverseCapture(ctx, pay.ID); err != nil && !errors.Is(err, domain.ErrStaleTransition) {
-			return err
+		err := s.payments.ReverseCapture(ctx, pay.ID)
+		if errors.Is(err, domain.ErrStaleTransition) {
+			err = nil // another resolver reached the same conclusion first
 		}
-		recordOperation(ctx, opCapture, resultDeclined)
+		if err == nil {
+			recordOperation(ctx, opCapture, resultDeclined)
+		}
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeRetryableFailure, domain.OutcomeUnknown:
 		return nil
@@ -185,16 +192,18 @@ func (s *Service) resolveVoid(ctx context.Context, pay *domain.Payment, a domain
 
 	switch class {
 	case domain.OutcomeSuccess:
-		if err := s.transitionParked(ctx, pay.ID, domain.StatusVoided, nil); err != nil {
-			return err
+		err := s.transitionParked(ctx, pay.ID, domain.StatusVoided, nil)
+		if err == nil {
+			recordOperation(ctx, opVoid, resultOK)
 		}
-		recordOperation(ctx, opVoid, resultOK)
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeBusinessDecline:
-		if err := s.transitionParked(ctx, pay.ID, domain.StatusAuthorized, nil); err != nil {
-			return err
+		err := s.transitionParked(ctx, pay.ID, domain.StatusAuthorized, nil)
+		if err == nil {
+			recordOperation(ctx, opVoid, resultDeclined)
 		}
-		recordOperation(ctx, opVoid, resultDeclined)
+		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeRetryableFailure, domain.OutcomeUnknown:
 		return nil
@@ -211,15 +220,16 @@ func (s *Service) resolveVoid(ctx context.Context, pay *domain.Payment, a domain
 // keeps UNKNOWN because that is genuinely what it returned, and history is not
 // rewritten to look wiser than it was.
 //
-// Closing the original is what keeps the worklist BOUNDED, and it matters most
-// when the answer is still UNKNOWN. Leaving both rows open means the next pass
-// finds two questions, asks the provider twice, and opens two more: the work per
-// retry doubles, and a provider outage — the exact condition this feature is for —
-// turns into a self-inflicted retry storm against that provider.
+// It also keeps the worklist BOUNDED. When the answer is still UNKNOWN, the new
+// row inherits the question and the original is closed immediately: leaving both
+// open means the next pass finds two questions, asks the provider twice, and opens
+// two more, so the work per retry doubles. A provider outage — the exact condition
+// this feature is for — would become a self-inflicted flood against that provider.
 //
-// The order is deliberate. The new row lands first, so a failed write leaves the
-// original open and the doubt survives; closing first would risk a payment parked
-// with nothing to resolve.
+// When the answer is DECIDED the original stays open until the verdict has been
+// applied (see closeAfterVerdict). Closing it here instead would mean a crash
+// between the close and the transition leaves a parked payment with nothing on the
+// worklist to explain it: unresolvable, which is the one outcome worse than doubt.
 func (s *Service) recordRoundTrip(ctx context.Context, prior domain.Attempt, ref string, err error) domain.OutcomeClass {
 	class := classifyProviderOutcome(err)
 	op := prior.Operation
@@ -232,7 +242,8 @@ func (s *Service) recordRoundTrip(ctx context.Context, prior domain.Attempt, ref
 		IdempotencyKey: prior.IdempotencyKey,
 		RefundID:       prior.RefundID,
 	})
-	if recordErr == nil {
+	if recordErr == nil && class == domain.OutcomeUnknown {
+		// The doubt carried over to the row just written; this one is superseded.
 		_ = s.closeAttempt(ctx, prior)
 	}
 	recordResolution(ctx, string(op), class)
@@ -240,6 +251,17 @@ func (s *Service) recordRoundTrip(ctx context.Context, prior domain.Attempt, ref
 		recordProviderUnknown(ctx, string(op))
 	}
 	return class
+}
+
+// closeAfterVerdict closes the question a decided answer settled, and is called
+// only once that answer has been written to the payment. A crash before this point
+// leaves the attempt open, so the next pass re-asks and reaches the same
+// conclusion — the redo is free, because it asks under the same key.
+func (s *Service) closeAfterVerdict(ctx context.Context, a domain.Attempt, applied error) error {
+	if applied != nil {
+		return applied
+	}
+	return s.closeAttempt(ctx, a)
 }
 
 // transitionParked applies a resolution's verdict to a parked row. A lost CAS is

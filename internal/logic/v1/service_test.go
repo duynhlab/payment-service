@@ -33,6 +33,9 @@ type fakePayments struct {
 	// beforeTransition runs before each CAS, so a test can slip a competing writer
 	// into the window between a resolution's read and its write.
 	beforeTransition func()
+	// transitionErr, when set, fails every CAS — the crash window between learning
+	// the provider's answer and writing it down.
+	transitionErr error
 }
 
 func newFakePayments() *fakePayments {
@@ -105,6 +108,9 @@ func (f *fakePayments) ListByUser(_ context.Context, userID int64, limit, offset
 func (f *fakePayments) TransitionStatus(_ context.Context, id int64, from, to domain.Status, set map[string]any) error {
 	if hook := f.beforeTransition; hook != nil {
 		hook()
+	}
+	if f.transitionErr != nil {
+		return f.transitionErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

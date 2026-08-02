@@ -395,3 +395,73 @@ func TestResolve_LostRaceIsNotReportedAsARejection(t *testing.T) {
 		t.Fatalf("status = %s, want captured", got.Status)
 	}
 }
+
+// TestResolve_VerdictNotWrittenKeepsTheQuestionOpen guards the crash window
+// between learning the provider's answer and writing it down.
+//
+// Closing the attempt at the moment the answer arrives looks tidy and is wrong: if
+// the write then fails, the payment stays parked with nothing on the worklist to
+// explain it — unresolvable, the one outcome worse than doubt. The question stays
+// open until the verdict lands, so a redo simply asks again under the same key and
+// reaches the same conclusion.
+func TestResolve_VerdictNotWrittenKeepsTheQuestionOpen(t *testing.T) {
+	svc, fp, prov, rec := newDoubtService()
+	ctx := context.Background()
+
+	res, err := svc.CreateIntent(ctx, "k-crashwindow", intent(2000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov.captureThenErr = context.DeadlineExceeded
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("park err = %v", err)
+	}
+
+	// The provider now answers, but the answer cannot be persisted.
+	prov.captureThenErr = nil
+	fp.transitionErr = errors.New("database went away")
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err == nil {
+		t.Fatal("resolution reported success while its verdict was not written")
+	}
+
+	open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID)
+	if len(open) == 0 {
+		t.Fatal("the question was closed before the verdict landed: the payment is now parked with nothing to resolve it")
+	}
+
+	// And once the write works, the redo settles it.
+	fp.transitionErr = nil
+	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	if err != nil {
+		t.Fatalf("redo err = %v", err)
+	}
+	if got.Status != domain.StatusCaptured {
+		t.Fatalf("status = %s, want captured", got.Status)
+	}
+	if still, _ := rec.ListOpenForPayment(ctx, res.Payment.ID); len(still) != 0 {
+		t.Fatalf("open attempts = %d, want 0", len(still))
+	}
+}
+
+// A refund whose outcome is unknown must answer the same question every other
+// operation answers. The saga branches on `errors.Is(err, ErrOutcomeUnknown)` to
+// tell doubt from a decided no, and a refund is not exempt from that just because
+// it carries an error of its own.
+func TestRefund_UnknownOutcomeIsRecognisableAsDoubt(t *testing.T) {
+	svc, _, prov, _ := newDoubtService()
+	ctx := context.Background()
+
+	res, _ := svc.CreateIntent(ctx, "k-ref-doubt", intent(2000))
+	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	prov.refundThenErr = context.DeadlineExceeded
+
+	_, _, err := svc.CreateRefund(ctx, "rk-doubt", res.Payment.ID, 7, 500, "")
+	if !errors.Is(err, domain.ErrOutcomeUnknown) {
+		t.Fatalf("err = %v, want it to satisfy errors.Is(ErrOutcomeUnknown)", err)
+	}
+	if !errors.Is(err, domain.ErrRefundNotSettled) {
+		t.Fatalf("err = %v, want the refund's own sentinel kept as well", err)
+	}
+}
