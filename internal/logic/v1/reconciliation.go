@@ -17,6 +17,16 @@ const (
 	// maxReconTransactions bounds one pass against a provider that returns full
 	// pages indefinitely (a bug, or an inflated Total from a hostile provider).
 	maxReconTransactions = 1_000_000
+	// reconLookback re-covers a trailing slice of already-compared ground on every
+	// pass. A `missing_provider` can be nothing worse than an authorize still in
+	// flight, and a window that never looks back would freeze that snapshot into a
+	// permanent discrepancy. Anything older than this is the alert's problem, not
+	// the sweep's.
+	reconLookback = time.Hour
+	// reconSettlementLag holds the window short of now. A payment created seconds
+	// ago may legitimately not have reached the provider yet, and calling that
+	// missing would make the report cry wolf on healthy traffic.
+	reconSettlementLag = 5 * time.Minute
 	// finishGrace bounds the FinishRun write. It runs on a context detached from
 	// the caller's (see finish) so a cancelled trigger request or a shutdown
 	// can't strand the run row in 'running' forever.
@@ -28,15 +38,19 @@ const (
 // so only the real HTTP provider needs to implement it — the in-process Stub,
 // used with no provider to reconcile against, does not.
 type ProviderLedger interface {
-	GetTransactions(ctx context.Context, page, pageSize int) (*provider.TransactionsPage, error)
+	GetTransactions(ctx context.Context, page, pageSize int, from, to time.Time) (*provider.TransactionsPage, error)
 }
 
 // ReconRepo is reconciliation's persistence port: the internal side to compare
 // (ListReconcilable) plus the run/discrepancy record it writes.
 type ReconRepo interface {
-	// ListReconcilable returns every payment that has a provider_payment_id — the
-	// internal rows to match against the provider ledger.
-	ListReconcilable(ctx context.Context) ([]domain.ReconRow, error)
+	// ListReconcilable returns the payments inside the window that have a
+	// provider_payment_id — the internal rows to match against the provider ledger.
+	ListReconcilable(ctx context.Context, window domain.ReconWindow) ([]domain.ReconRow, error)
+	// Watermark is where the last completed pass finished; zero means none has.
+	Watermark(ctx context.Context) (time.Time, error)
+	// AdvanceWatermark records that everything before `through` has been compared.
+	AdvanceWatermark(ctx context.Context, through time.Time) error
 	CreateRun(ctx context.Context) (int64, error)
 	SaveDiscrepancies(ctx context.Context, runID int64, ds []domain.Discrepancy) error
 	// MarkResolved records what a heal pass did about one discrepancy, keyed by
@@ -63,6 +77,17 @@ type Reconciler struct {
 	ledger ProviderLedger
 	healer Healer      // nil = detect-only (the default)
 	logger *zap.Logger // heal-path diagnostics; Nop unless WithLogger is set
+	now    func() time.Time
+}
+
+// WithClock overrides the clock. The window is computed from it, so a test can
+// place a payment inside or outside the pass without sleeping.
+func WithClock(now func() time.Time) ReconcilerOption {
+	return func(r *Reconciler) {
+		if now != nil {
+			r.now = now
+		}
+	}
 }
 
 // ReconcilerOption configures an optional Reconciler capability.
@@ -87,23 +112,52 @@ func WithLogger(l *zap.Logger) ReconcilerOption {
 // NewReconciler wires the reconciler onto its persistence port and the provider
 // ledger it pages. Detect-only unless WithHealer is passed.
 func NewReconciler(repo ReconRepo, ledger ProviderLedger, opts ...ReconcilerOption) *Reconciler {
-	r := &Reconciler{repo: repo, ledger: ledger, logger: zap.NewNop()}
+	r := &Reconciler{repo: repo, ledger: ledger, logger: zap.NewNop(), now: time.Now}
 	for _, opt := range opts {
 		opt(r)
 	}
 	return r
 }
 
-// Run performs one reconciliation pass: open a run, detect discrepancies, persist
-// them, and close the run. Returns the run id and the number of discrepancies.
-// A detection or persistence error marks the run failed and is returned.
+// Run performs one reconciliation pass over the automatic window: from where the
+// last completed pass finished (less a lookback) up to a settlement lag short of
+// now. Returns the run id and the number of discrepancies. A detection or
+// persistence error marks the run failed and is returned.
 func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found int, err error) {
+	window, err := r.nextWindow(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	return r.RunWindow(ctx, pageSize, window)
+}
+
+// RunWindow performs one pass over an explicit window — the manual backfill path,
+// and how a caller re-examines a stretch of history without waiting for the
+// frontier to come back around.
+//
+// A run over an explicit window still advances the watermark, because the
+// watermark means "everything before this has been compared" and that is now
+// true. Monotonic advance in the repository keeps an older backfill from pulling
+// the frontier backwards.
+func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.ReconWindow) (runID int64, found int, err error) {
+	start := r.now()
 	runID, err = r.repo.CreateRun(ctx)
 	if err != nil {
+		recordReconRun(ctx, reconRunResultError, 0)
 		return 0, 0, fmt.Errorf("create reconciliation run: %w", err)
 	}
+	// Every return path below records the run's outcome and duration. Without them
+	// a reconciler that has silently stopped looks exactly like one that keeps
+	// finding nothing — which is why "is it running at all?" had no answer before.
+	defer func() {
+		result := reconRunResultCompleted
+		if err != nil {
+			result = reconRunResultFailed
+		}
+		recordReconRun(ctx, result, r.now().Sub(start))
+	}()
 
-	discrepancies, internal, scanned, err := r.detect(ctx, pageSize)
+	discrepancies, internal, scanned, err := r.detect(ctx, pageSize, window)
 	if err != nil {
 		r.finish(ctx, runID, scanned, 0, domain.ReconRunFailed)
 		return runID, 0, fmt.Errorf("detect discrepancies: %w", err)
@@ -128,6 +182,16 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 		// Heal runs after the report is persisted, so the run always records what
 		// was found before any correction. No-op unless a Healer is wired.
 		r.heal(ctx, runID, discrepancies, internal)
+	}
+
+	// The frontier moves only for a pass that compared its whole window. A failed
+	// pass leaves it, so the next one re-covers the same ground rather than
+	// stepping over a stretch nobody checked.
+	if !window.Through.IsZero() {
+		if werr := r.repo.AdvanceWatermark(ctx, window.Through); werr != nil {
+			r.logger.Error("reconciliation watermark did not advance; the next pass will re-cover this window",
+				zap.Int64("run_id", runID), zap.Time("through", window.Through), zap.Error(werr))
+		}
 	}
 
 	if ferr := r.repo.FinishRun(ctx, runID, scanned, len(discrepancies), domain.ReconRunCompleted); ferr != nil {
@@ -155,8 +219,8 @@ func (r *Reconciler) finish(ctx context.Context, runID int64, scanned, found int
 // the two sides. Returns the discrepancies, the internal rows keyed by
 // provider_payment_id (so heal can resolve a discrepancy to its payment id), and
 // the number of provider transactions scanned.
-func (r *Reconciler) detect(ctx context.Context, pageSize int) ([]domain.Discrepancy, map[string]domain.ReconRow, int, error) {
-	rows, err := r.repo.ListReconcilable(ctx)
+func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.ReconWindow) ([]domain.Discrepancy, map[string]domain.ReconRow, int, error) {
+	rows, err := r.repo.ListReconcilable(ctx, window)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -170,7 +234,7 @@ func (r *Reconciler) detect(ctx context.Context, pageSize int) ([]domain.Discrep
 	}
 	var txns []provider.Transaction
 	for page := 1; ; page++ {
-		p, perr := r.ledger.GetTransactions(ctx, page, pageSize)
+		p, perr := r.ledger.GetTransactions(ctx, page, pageSize, window.From, window.Through)
 		if perr != nil {
 			return nil, nil, 0, perr
 		}
@@ -218,6 +282,7 @@ func (r *Reconciler) heal(ctx context.Context, runID int64, discrepancies []doma
 		switch {
 		case err != nil:
 			res = domain.ResolutionFailed
+			recordReconHealFailure(ctx, string(d.Class))
 			r.logger.Error("reconciliation heal failed",
 				zap.Int64("run_id", runID), zap.String("provider_payment_id", d.ProviderPaymentID), zap.Error(err))
 		case converged:
@@ -339,4 +404,30 @@ func statusReconciled(row domain.ReconRow, providerStatus string) bool {
 	default:
 		return false
 	}
+}
+
+// nextWindow is the automatic pass's bounds.
+//
+// The lower bound is the watermark less a lookback, so every pass re-judges a
+// trailing slice it has already seen: a `missing_provider` may have been nothing
+// worse than an authorize in flight, and a frontier that never looks back would
+// freeze that snapshot into a permanent discrepancy.
+//
+// The upper bound stops short of now by a settlement lag, because a payment
+// created seconds ago may legitimately not have reached the provider yet. Without
+// it the report cries wolf on healthy traffic — and a report that cries wolf is a
+// report nobody reads.
+//
+// With no watermark the lower bound is unbounded, so the very first pass covers
+// everything once.
+func (r *Reconciler) nextWindow(ctx context.Context) (domain.ReconWindow, error) {
+	mark, err := r.repo.Watermark(ctx)
+	if err != nil {
+		return domain.ReconWindow{}, err
+	}
+	w := domain.ReconWindow{Through: r.now().Add(-reconSettlementLag)}
+	if !mark.IsZero() {
+		w.From = mark.Add(-reconLookback)
+	}
+	return w, nil
 }

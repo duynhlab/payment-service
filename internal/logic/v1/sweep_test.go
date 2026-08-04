@@ -411,3 +411,33 @@ func assertStillOpen(t *testing.T, ctx context.Context, svc *Service, rec *recor
 		t.Fatal("the sweep closed an entry it could not act on")
 	}
 }
+
+// The reconciliation frontier's age is the "is it running at all?" signal, and it
+// has to be a gauge for a specific reason: a reconciler that has STOPPED emits no
+// runs, so a counter cannot tell stopped from quiet. Only something derived from
+// stored state can.
+func TestObserveReconciliationWatermark(t *testing.T) {
+	reader := testReader
+	var readFails bool
+
+	if err := ObserveReconciliationWatermark(func(context.Context) (time.Duration, error) {
+		if readFails {
+			return 0, errors.New("watermark unreadable")
+		}
+		return 12 * time.Minute, nil
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if got := collectGauges(t, reader)["payment.reconciliation.watermark_age_seconds"]; got != 720 {
+		t.Errorf("watermark age = %v, want 720", got)
+	}
+
+	// Same rule as the doubt gauges: a failed read goes stale rather than taking
+	// the whole export cycle down with it.
+	readFails = true
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect returned %v — one failed read blanked the cycle", err)
+	}
+}

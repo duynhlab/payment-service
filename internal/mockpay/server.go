@@ -13,9 +13,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"sync"
@@ -61,6 +63,11 @@ type Server struct {
 	voided        map[string]bool            // voided ids — makes void idempotent under retry
 	refunded      map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
 	amounts       map[string]int64           // provider_payment_id -> amount (for GET /transactions)
+	// createdAt is when the provider first saw each charge. Reconciliation reads
+	// it to bound a pass to a time window: without it a caller can only ask for
+	// EVERY transaction the provider has ever recorded, which is the scan that
+	// grows forever.
+	createdAt map[string]time.Time
 	refundsByKey  map[string]string          // refund idempotency key -> provider_refund_id
 	transientSeen map[string]bool            // charge keys that already hit the transient trigger once
 	// mutationKeys binds an idempotency key to the (operation, charge) it was
@@ -81,6 +88,7 @@ func New(logger *zap.Logger, emitter Emitter) *Server {
 		voided:        map[string]bool{},
 		refunded:      map[string]bool{},
 		amounts:       map[string]int64{},
+		createdAt:     map[string]time.Time{},
 		refundsByKey:  map[string]string{},
 		mutationKeys:  map[string]mutationBinding{},
 		transientSeen: map[string]bool{},
@@ -135,18 +143,39 @@ func (s *Server) transactionStatus(id string) string {
 // a stable total order so a paged sweep sees every row exactly once (it is not
 // chronological: `mp_10` sorts before `mp_2`). Defaults: page 1, page_size 50
 // (capped at 200).
+// handleTransactions serves the reconciliation ledger, optionally bounded to a
+// half-open time window [from, to). A real provider offers the same thing for the
+// same reason: without it every reconciliation pass has to read the provider's
+// entire history, so the cost of checking today's payments grows with every
+// payment ever made.
+//
+// Malformed timestamps are refused rather than ignored. Silently dropping an
+// unparseable `from` would widen the window to everything and answer a question
+// nobody asked — and the caller would compare that against a narrow internal set
+// and report every older charge as missing on our side.
 func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
 	const maxPage = 1_000_000 // a mock; this many pages is far beyond any test
 	page := atoiDefault(r.URL.Query().Get("page"), 1, 1, maxPage)
 	pageSize := atoiDefault(r.URL.Query().Get("page_size"), 50, 1, 200)
 
+	from, to, err := timeWindow(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "", err.Error())
+		return
+	}
+
 	s.mu.Lock()
 	txns := make([]provider.Transaction, 0, len(s.amounts))
 	for id, amt := range s.amounts {
+		created := s.createdAt[id]
+		if !inWindow(created, from, to) {
+			continue
+		}
 		txns = append(txns, provider.Transaction{
 			ProviderPaymentID: id,
 			AmountMinor:       amt,
 			Status:            s.transactionStatus(id),
+			CreatedAt:         created,
 		})
 	}
 	s.mu.Unlock()
@@ -262,6 +291,7 @@ func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
 	}
 	s.captured[c.ProviderPaymentID] = req.AutoCapture
 	s.amounts[c.ProviderPaymentID] = req.AmountMinor
+	s.createdAt[c.ProviderPaymentID] = time.Now().UTC()
 	s.logger.Info("charge", zap.String("id", c.ProviderPaymentID),
 		zap.Int64("amount_minor", req.AmountMinor), zap.Bool("captured", c.Captured))
 	eventType := "charge.authorized"
@@ -435,4 +465,37 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		zap.String("charge", req.ProviderPaymentID), zap.Int64("amount_minor", req.AmountMinor))
 	s.emit("refund.succeeded", req.ProviderPaymentID, req.AmountMinor)
 	writeJSON(w, http.StatusOK, provider.RefundResponse{ProviderRefundID: refundID})
+}
+
+// timeWindow parses the optional from/to query parameters as RFC 3339 instants.
+// A zero time means "unbounded on that side".
+func timeWindow(q url.Values) (from, to time.Time, err error) {
+	for name, dst := range map[string]*time.Time{"from": &from, "to": &to} {
+		raw := q.Get(name)
+		if raw == "" {
+			continue
+		}
+		t, perr := time.Parse(time.RFC3339, raw)
+		if perr != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("%s must be an RFC 3339 timestamp", name)
+		}
+		*dst = t
+	}
+	if !from.IsZero() && !to.IsZero() && to.Before(from) {
+		return time.Time{}, time.Time{}, errors.New("to must not precede from")
+	}
+	return from, to, nil
+}
+
+// inWindow reports whether created falls in the half-open range [from, to).
+// Half-open on purpose: consecutive windows that share a boundary must not both
+// claim the charge sitting exactly on it.
+func inWindow(created, from, to time.Time) bool {
+	if !from.IsZero() && created.Before(from) {
+		return false
+	}
+	if !to.IsZero() && !created.Before(to) {
+		return false
+	}
+	return true
 }

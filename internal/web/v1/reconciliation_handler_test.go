@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -19,9 +20,19 @@ type fakeRunner struct {
 	runID int64
 	found int
 	err   error
+	// gotWindow records the window a backfill asked for, and windowed records
+	// whether the backfill entry point was taken at all — an explicit window must
+	// never be reachable by accident.
+	gotWindow domain.ReconWindow
+	windowed  bool
 }
 
 func (f *fakeRunner) Run(context.Context, int) (int64, int, error) { return f.runID, f.found, f.err }
+
+func (f *fakeRunner) RunWindow(_ context.Context, _ int, w domain.ReconWindow) (int64, int, error) {
+	f.gotWindow, f.windowed = w, true
+	return f.runID, f.found, f.err
+}
 
 type fakeReconReader struct {
 	run                 *domain.ReconRun
@@ -235,4 +246,65 @@ func TestCombinedRouter_StaticAndWildcardSiblings(t *testing.T) {
 			t.Errorf("%s %s not routed (got 404)", tc.method, tc.path)
 		}
 	}
+}
+
+// The trigger endpoint can be pointed at a stretch of history — the backfill
+// path. Two properties matter and both are about NOT guessing.
+func TestTriggerRun_Window(t *testing.T) {
+	t.Run("an explicit window takes the backfill path", func(t *testing.T) {
+		runner := &fakeRunner{runID: 5}
+		r := newReconRouter(runner, &fakeReconReader{run: &domain.ReconRun{ID: 5}})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost,
+			reconRunsPath+"?from=2026-08-01T00:00:00Z&through=2026-08-02T00:00:00Z", nil))
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", w.Code)
+		}
+		if !runner.windowed {
+			t.Fatal("an explicit window did not reach RunWindow")
+		}
+		if runner.gotWindow.From.Format(time.RFC3339) != "2026-08-01T00:00:00Z" ||
+			runner.gotWindow.Through.Format(time.RFC3339) != "2026-08-02T00:00:00Z" {
+			t.Fatalf("window = %+v, want exactly what was asked for", runner.gotWindow)
+		}
+	})
+
+	t.Run("no window takes the automatic path", func(t *testing.T) {
+		runner := &fakeRunner{runID: 6}
+		r := newReconRouter(runner, &fakeReconReader{run: &domain.ReconRun{ID: 6}})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, reconRunsPath, nil))
+
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", w.Code)
+		}
+		if runner.windowed {
+			t.Fatal("the backfill path was taken without anyone asking for a window")
+		}
+	})
+
+	// Refused, not ignored. A dropped bound widens the pass to everything and
+	// compares that against the provider's bounded answer, turning a typo into a
+	// report full of discrepancies that do not exist.
+	t.Run("a malformed or inverted window is refused before the pass starts", func(t *testing.T) {
+		for name, q := range map[string]string{
+			"unparseable from":    "?from=yesterday",
+			"unparseable through": "?through=soon",
+			"inverted":            "?from=2026-08-02T00:00:00Z&through=2026-08-01T00:00:00Z",
+			"zero width":          "?from=2026-08-01T00:00:00Z&through=2026-08-01T00:00:00Z",
+		} {
+			runner := &fakeRunner{runID: 9}
+			r := newReconRouter(runner, &fakeReconReader{run: &domain.ReconRun{ID: 9}})
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, reconRunsPath+q, nil))
+
+			if w.Code != http.StatusBadRequest {
+				t.Errorf("%s: status = %d, want 400", name, w.Code)
+			}
+			if runner.windowed {
+				t.Errorf("%s: a pass ran on a window that could not be parsed", name)
+			}
+		}
+	})
 }

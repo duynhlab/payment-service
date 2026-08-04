@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -132,8 +133,21 @@ func (c *HTTPClient) Capture(ctx context.Context, providerPaymentID, idempotency
 
 // GetTransactions pages the provider's ledger (GET /transactions) — the food
 // source for reconciliation. Returns one page; the caller pages to exhaustion.
-func (c *HTTPClient) GetTransactions(ctx context.Context, page, pageSize int) (*TransactionsPage, error) {
-	path := fmt.Sprintf("/transactions?page=%d&page_size=%d", page, pageSize)
+//
+// The window is half-open, [from, to), and either side may be zero for
+// unbounded. Bounding it is what stops the cost of reconciling today's payments
+// from growing with every payment ever made.
+func (c *HTTPClient) GetTransactions(ctx context.Context, page, pageSize int, from, to time.Time) (*TransactionsPage, error) {
+	q := url.Values{}
+	q.Set("page", strconv.Itoa(page))
+	q.Set("page_size", strconv.Itoa(pageSize))
+	if !from.IsZero() {
+		q.Set("from", from.UTC().Format(time.RFC3339))
+	}
+	if !to.IsZero() {
+		q.Set("to", to.UTC().Format(time.RFC3339))
+	}
+	path := "/transactions?" + q.Encode()
 	status, body, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err

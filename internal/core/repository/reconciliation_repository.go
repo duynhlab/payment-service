@@ -27,25 +27,30 @@ func NewReconciliationRepository(pool *pgxpool.Pool) *ReconciliationRepository {
 // — the internal rows with a provider record to reconcile against, each with its
 // applied refund total (to tell a benign partial refund from missed refund drift).
 //
-// v1 does a full scan and the reconciler holds both this result AND the fully
-// paged provider ledger in memory for one pass. That set grows monotonically for
-// the life of the service, so before prod scale this must window by created_at /
-// id (a rolling recent window + a slower full sweep), the same way the outbox
-// relay documents its single-writer assumption.
+// The pass is bounded by a half-open window on created_at, matching the window
+// the provider ledger is asked for. Both sides must use the SAME bounds: compare
+// a narrow internal set against the provider's whole history and every older
+// charge reads as missing on our side.
+//
+// A zero bound means unbounded on that side, which is how the very first pass
+// (before any watermark exists) still covers everything once.
 //
 // Payments parked in `processing` are excluded. Their drift is not drift — it is a
 // question the attempt log already owns, with a resolution path of its own. Left
 // in, every parked row matches no provider status and re-reports the same
 // status_mismatch on every single run, burying the real discrepancies in the one
 // signal that is supposed to surface them.
-func (r *ReconciliationRepository) ListReconcilable(ctx context.Context) ([]domain.ReconRow, error) {
+func (r *ReconciliationRepository) ListReconcilable(ctx context.Context, window domain.ReconWindow) ([]domain.ReconRow, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT p.id, p.provider_payment_id, p.amount_minor, p.status,
 		       COALESCE((SELECT SUM(rf.amount_minor) FROM refunds rf
 		                 WHERE rf.payment_id = p.id AND rf.status IN ('pending', 'processing', 'succeeded')), 0) AS refunded_minor
 		FROM payments p
 		WHERE p.provider_payment_id IS NOT NULL AND p.provider_payment_id <> ''
-		  AND p.status <> 'processing'`)
+		  AND p.status <> 'processing'
+		  AND ($1::timestamptz IS NULL OR p.created_at >= $1)
+		  AND ($2::timestamptz IS NULL OR p.created_at <  $2)`,
+		nullTime(window.From), nullTime(window.Through))
 	if err != nil {
 		return nil, fmt.Errorf("list reconcilable payments: %w", err)
 	}
@@ -181,6 +186,46 @@ func (r *ReconciliationRepository) FinishRun(ctx context.Context, runID int64, s
 		SET status = $2, transactions_scanned = $3, discrepancies_found = $4, finished_at = now()
 		WHERE id = $1`, runID, string(status), scanned, found); err != nil {
 		return fmt.Errorf("finish reconciliation run %d: %w", runID, err)
+	}
+	return nil
+}
+
+// nullTime renders a zero time as SQL NULL, so an unbounded window side becomes
+// an always-true predicate rather than a comparison against year zero.
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
+
+// Watermark returns where the last completed pass finished, or the zero time when
+// no pass has completed yet — which the caller reads as "cover everything".
+func (r *ReconciliationRepository) Watermark(ctx context.Context) (time.Time, error) {
+	var t time.Time
+	err := r.pool.QueryRow(ctx, `SELECT through_time FROM reconciliation_watermark WHERE id`).Scan(&t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read reconciliation watermark: %w", err)
+	}
+	return t, nil
+}
+
+// AdvanceWatermark records that everything before `through` has been compared.
+// Monotonic by construction: GREATEST means a late-arriving pass over an older
+// window can never pull the frontier backwards and cause the ground in between to
+// be re-read forever.
+func (r *ReconciliationRepository) AdvanceWatermark(ctx context.Context, through time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO reconciliation_watermark (id, through_time, updated_at)
+		VALUES (TRUE, $1, now())
+		ON CONFLICT (id) DO UPDATE
+		   SET through_time = GREATEST(reconciliation_watermark.through_time, EXCLUDED.through_time),
+		       updated_at   = now()`, through)
+	if err != nil {
+		return fmt.Errorf("advance reconciliation watermark: %w", err)
 	}
 	return nil
 }

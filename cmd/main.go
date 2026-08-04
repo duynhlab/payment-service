@@ -154,17 +154,12 @@ func run() error {
 		logicv1.WithAttempts(attemptRepo))
 	paymentHandler := v1.NewHandler(paymentService)
 
-	// Unresolved doubt has to be visible without anyone querying for it: how much
-	// is open, and how old the oldest is. The age is the alertable one — a fresh
-	// unknown is routine, an hour-old one means money is sitting somewhere nobody
-	// has looked.
-	if err := logicv1.ObserveDoubtBacklog(attemptRepo.CountOpen, func(ctx context.Context) (time.Duration, error) {
-		return attemptRepo.OldestOpenAge(ctx, time.Now())
-	}); err != nil {
-		return fmt.Errorf("register doubt-backlog gauges: %w", err)
-	}
 
 	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)
+
+	if err := registerBacklogGauges(attemptRepo, reconRepo); err != nil {
+		return err
+	}
 
 	// Internal gRPC server (:9090) — the order-fulfillment saga's money transport.
 	// A bind failure is fatal: the pod must not report healthy on HTTP while its
@@ -204,6 +199,41 @@ func run() error {
 	var isShuttingDown atomic.Bool
 	srv := setupServer(cfg, logger, verifier, paymentHandler, webhookHandler, reconHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
+	return nil
+}
+
+// registerBacklogGauges publishes the two backlogs nobody would otherwise query:
+// unresolved provider outcomes, and how far behind reconciliation is.
+//
+// Both are gauges derived from stored state rather than counters, for the same
+// reason: a process that has STOPPED doing the work emits no events at all, so
+// only something read from the database can tell "stopped" from "quiet". And in
+// both the AGE is the alertable half — one fresh unknown is routine, an old one
+// means money is sitting somewhere nobody has looked.
+func registerBacklogGauges(attempts *repository.AttemptRepository, recon *repository.ReconciliationRepository) error {
+	if err := logicv1.ObserveDoubtBacklog(attempts.CountOpen, func(ctx context.Context) (time.Duration, error) {
+		return attempts.OldestOpenAge(ctx, time.Now())
+	}); err != nil {
+		return fmt.Errorf("register doubt-backlog gauges: %w", err)
+	}
+
+	// startedAt anchors the watermark gauge before the first pass has ever landed.
+	startedAt := time.Now()
+	if err := logicv1.ObserveReconciliationWatermark(func(ctx context.Context) (time.Duration, error) {
+		mark, merr := recon.Watermark(ctx)
+		if merr != nil {
+			return 0, merr
+		}
+		if mark.IsZero() {
+			// No pass has ever completed. Reporting zero would read as perfectly
+			// fresh, so report the service's own age instead: it grows until the
+			// first pass lands, which is exactly the alert we want.
+			return time.Since(startedAt), nil
+		}
+		return time.Since(mark), nil
+	}); err != nil {
+		return fmt.Errorf("register reconciliation watermark gauge: %w", err)
+	}
 	return nil
 }
 

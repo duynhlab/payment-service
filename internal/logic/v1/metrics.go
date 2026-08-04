@@ -44,7 +44,61 @@ var (
 		metric.WithDescription("Re-drives of an open UNKNOWN attempt, by operation and the class the provider answered with — `UNKNOWN` here means the doubt survived the round-trip"))
 	sweepFailureCounter, _ = meter.Int64Counter("payment.doubt.sweep_failures.total",
 		metric.WithDescription("Worklist entries the background sweep could not even attempt, by operation — doubt that nothing is currently working on"))
+	reconRunCounter, _ = meter.Int64Counter("payment.reconciliation.runs.total",
+		metric.WithDescription("Reconciliation passes by outcome — the answer to 'is the reconciler running at all', which a discrepancy count alone cannot give"))
+	reconRunDuration, _ = meter.Float64Histogram("payment.reconciliation.run.duration",
+		metric.WithDescription("How long a reconciliation pass takes; a window that stops draining shows up here before it shows up in staleness"),
+		metric.WithUnit("s"))
+	reconHealFailureCounter, _ = meter.Int64Counter("payment.reconciliation.heal_failures.total",
+		metric.WithDescription("Heal attempts that errored, by discrepancy class — previously only logged, so a heal that never worked was invisible"))
 )
+
+// Reconciliation run outcomes (bounded).
+const (
+	reconRunResultCompleted = "completed"
+	reconRunResultFailed    = "failed"
+	// reconRunResultError is a pass that could not even open a run row, so it has
+	// no id and never reached the provider. Distinct from `failed`, which did.
+	reconRunResultError = "error"
+)
+
+// recordReconRun counts one pass and times it. A zero duration is recorded for a
+// pass that never started, so the counter and the histogram stay comparable.
+func recordReconRun(ctx context.Context, result string, d time.Duration) {
+	reconRunCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+	reconRunDuration.Record(ctx, d.Seconds(), metric.WithAttributes(attribute.String("result", result)))
+}
+
+// recordReconHealFailure counts a heal that errored. The discrepancy stays in the
+// report as `failed`, but a rate here is what says the heal path itself is broken
+// rather than the drift being unusual.
+func recordReconHealFailure(ctx context.Context, class string) {
+	reconHealFailureCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", class)))
+}
+
+// ObserveReconciliationWatermark publishes how far behind the reconciliation
+// frontier is. This is the staleness signal, and it is a gauge rather than a
+// counter for a reason: a reconciler that has stopped emits no runs at all, so
+// only something derived from stored state can tell "stopped" from "quiet".
+func ObserveReconciliationWatermark(age func(context.Context) (time.Duration, error)) error {
+	g, err := meter.Float64ObservableGauge("payment.reconciliation.watermark_age_seconds",
+		metric.WithDescription("How far behind now the reconciliation frontier is; grows without bound if the reconciler stops"))
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		d, rerr := age(ctx)
+		if rerr != nil {
+			// As with the doubt gauges: returning an error drops the whole export
+			// cycle, so a failed read must go stale rather than take everything else
+			// down with it.
+			return nil //nolint:nilerr // deliberate: one failed read must not blank the export
+		}
+		o.ObserveFloat64(g, d.Seconds())
+		return nil
+	}, g)
+	return err
+}
 
 // recordSweepFailure counts a worklist entry the sweep could not act on at all
 // (its payment or refund would not load, or it carries no key to replay under).
