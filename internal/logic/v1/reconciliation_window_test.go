@@ -228,3 +228,29 @@ func TestRecon_LeaseIsReleasedOnEveryPath(t *testing.T) {
 		}
 	})
 }
+
+// A lease that will not release must not change what the pass reports. The pass
+// already did its work correctly; the lease is bookkeeping around it, and letting
+// a cleanup failure overwrite a good result would make an operator chase the wrong
+// problem. The failure is logged instead — and the connection behind it is
+// discarded by the lease itself, so nothing is left holding the lock.
+func TestRecon_LeaseReleaseFailureDoesNotChangeTheOutcome(t *testing.T) {
+	l := &fakeLease{releaseErr: errors.New("connection went away")}
+	repo := &fakeReconRepo{runID: 4}
+	rec := NewReconciler(repo, &fakeLedger{page: &provider.TransactionsPage{}},
+		WithClock(func() time.Time { return fixedNow }), WithLease(&fakeLeaser{lease: l}))
+
+	runID, found, err := rec.Run(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("err = %v, want the pass's own (successful) outcome", err)
+	}
+	if runID != 4 || found != 0 {
+		t.Fatalf("run = %d found = %d, want the real result reported", runID, found)
+	}
+	if l.releases != 1 {
+		t.Fatalf("releases = %d, want the release attempted exactly once", l.releases)
+	}
+	if !repo.advancedTo.Equal(fixedNow.Add(-reconSettlementLag)) {
+		t.Fatal("the frontier did not advance: a cleanup failure must not undo a completed pass")
+	}
+}

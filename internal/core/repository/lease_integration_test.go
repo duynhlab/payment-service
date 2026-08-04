@@ -11,6 +11,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/duynhlab/payment-service/internal/core/domain"
 )
 
@@ -77,6 +79,56 @@ func TestLease_Integration(t *testing.T) {
 		}
 		if err := l.Release(ctx); err == nil {
 			t.Fatal("a second release reported success: the acquire/release pairing is unchecked")
+		}
+	})
+
+	// TestLease_UnlockFailureDoesNotRecycleTheConnection is the subtle one, and the
+	// reason it matters is reference counting: advisory locks are counted PER
+	// SESSION, so a connection handed back to the pool while still holding the lock
+	// would let a later pass that drew the same connection acquire the "held" lease
+	// again — two writers, each certain it is alone.
+	//
+	// A cancelled context is the realistic trigger: a shutdown mid-pass. The unlock
+	// then cannot run, so the connection must be discarded rather than recycled, and
+	// the lease must still be obtainable afterwards because ending the session is
+	// what frees the lock.
+	t.Run("a failed unlock discards the connection instead of recycling it", func(t *testing.T) {
+		l, err := leases.TryAcquire(ctx, domain.LeaseReconciliation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dead, cancel := context.WithCancel(ctx)
+		cancel()
+
+		if err := l.Release(dead); err == nil {
+			t.Fatal("release reported success with a cancelled context")
+		}
+
+		// The session is gone, so the server has freed the lock and the next holder
+		// can take it. If the connection had been recycled with the lock still on it,
+		// this would either fail or — worse — succeed on the same session and hand
+		// out a lease somebody else still believes they hold.
+		next, err := leases.TryAcquire(ctx, domain.LeaseReconciliation)
+		if err != nil {
+			t.Fatalf("acquire after a failed unlock = %v, want the lock freed with the session", err)
+		}
+		if err := next.Release(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// An unusable pool fails at acquire, before any lock is attempted.
+	t.Run("an unreachable database reports rather than pretends", func(t *testing.T) {
+		broken, err := pgxpool.New(ctx, "postgres://nobody:nobody@127.0.0.1:1/nothing?sslmode=disable")
+		if err != nil {
+			t.Fatalf("build pool: %v", err)
+		}
+		defer broken.Close()
+
+		if _, err := NewLeaseRepository(broken).TryAcquire(ctx, domain.LeaseReconciliation); err == nil {
+			t.Fatal("TryAcquire reported a lease against an unreachable database")
+		} else if errors.Is(err, domain.ErrLeaseHeld) {
+			t.Fatalf("err = %v, want a real failure — ErrLeaseHeld would tell the caller to stand down", err)
 		}
 	})
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -92,22 +93,48 @@ func (r *LeaseRepository) TryAcquire(ctx context.Context, key int64) (domain.Lea
 // for its own sake: pgxpool panics on a double connection release, so one stray
 // defer would turn a bookkeeping mistake into a crashed payment service.
 //
-// The connection goes back to the pool either way. Leaking it to avoid reporting
-// an error would trade a visible problem for an invisible one.
+// If the unlock itself fails, the connection is DISCARDED rather than returned to
+// the pool. This is the subtle one. Advisory locks are reference counted per
+// session, so a connection handed back while still holding the lock would let a
+// later pass that happened to draw the same pooled connection acquire the "held"
+// lease again — two writers, each certain it is alone, which is the exact failure
+// this type exists to prevent. Ending the session is what frees the lock
+// ("automatically cleaned up by the server at the end of the session"), so
+// dropping the connection is both the fix and the cleanup.
 func (l *lease) Release(ctx context.Context) error {
 	if !l.released.CompareAndSwap(false, true) {
 		return fmt.Errorf("release lease %d: already released", l.key)
 	}
-	defer l.conn.Release()
 
 	var released bool
 	if err := l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, l.key).Scan(&released); err != nil {
-		// The connection is closed on release, and the server frees the lock when
-		// the session ends, so the lease is not stuck — only unaccounted for.
+		l.discard()
 		return fmt.Errorf("release lease %d: %w", l.key, err)
 	}
+	l.conn.Release()
 	if !released {
+		// The session did not hold it, so there is nothing to leak — but the
+		// acquire/release pairing is broken somewhere, and silence is how that
+		// stays a bug.
 		return fmt.Errorf("release lease %d: the lock was not held by this session", l.key)
 	}
 	return nil
+}
+
+// discardGrace bounds the close of a connection we no longer trust. Short: it is
+// cleanup on a failure path, and the server will end the session regardless.
+const discardGrace = 3 * time.Second
+
+// discard removes the connection from the pool for good and closes it, ending the
+// session and with it any advisory lock the session still holds.
+//
+// It runs on a context detached from the caller's, because the canonical reason
+// the unlock failed is that the caller's context was already cancelled — closing
+// on that same dead context would fail too, and the connection would go back to
+// the pool by finalizer with the lock still on it.
+func (l *lease) discard() {
+	raw := l.conn.Hijack() // takes the connection out of the pool; we own it now
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), discardGrace)
+	defer cancel()
+	_ = raw.Close(ctx)
 }
