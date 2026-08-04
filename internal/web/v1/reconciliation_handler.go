@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -74,13 +73,14 @@ type reconReader interface {
 // ReconciliationHandler serves the internal reconciliation API: trigger a run,
 // read a run's report. Internal audience — cluster-only, NetworkPolicy is the
 // fence, never routed through the gateway.
+// Single-flighting is NOT done here. It used to be a process-local flag, which
+// two replicas — or a manual trigger racing the ticker — would each read as "I am
+// alone". The reconciler now takes a database lease, so the guard is one guard
+// with one meaning at every entry point, and this handler simply reports the
+// answer it gets.
 type ReconciliationHandler struct {
 	runner ReconRunner // nil = reconciliation disabled
 	reader reconReader
-	// running single-flights the trigger endpoint: one pass costs a full table
-	// scan plus paging the whole provider ledger, so concurrent POSTs answer 409
-	// instead of multiplying that load (the 5-minute ticker covers freshness).
-	running atomic.Bool
 }
 
 // NewReconciliationHandler wires the handler. runner may be nil (stub provider);
@@ -110,13 +110,6 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 		return
 	}
 
-	if !h.running.CompareAndSwap(false, true) {
-		httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict,
-			"A reconciliation run is already in progress")
-		return
-	}
-	defer h.running.Store(false)
-
 	window, werr := parseReconWindow(c)
 	if werr != nil {
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, werr.Error())
@@ -134,6 +127,14 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	runID, found, err := h.runner.Run(runCtx, 0)
 	if window.Bounded() {
 		runID, found, err = h.runner.RunWindow(runCtx, 0, window)
+	}
+	if errors.Is(err, domain.ErrLeaseHeld) {
+		// Somebody else is mid-pass. Not a failure — 409 says "not now", and the
+		// single-writer lease is what makes that answer true across processes rather
+		// than only within this one.
+		httpx.RespondError(c, http.StatusConflict, httpx.CodeConflict,
+			"A reconciliation run is already in progress")
+		return
 	}
 	if err != nil {
 		span.RecordError(err)

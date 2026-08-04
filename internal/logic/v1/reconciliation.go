@@ -78,6 +78,21 @@ type Reconciler struct {
 	healer Healer      // nil = detect-only (the default)
 	logger *zap.Logger // heal-path diagnostics; Nop unless WithLogger is set
 	now    func() time.Time
+	// lease makes the reconciler a single writer across PROCESSES. Nil keeps the
+	// pre-lease behaviour, which is safe only while exactly one process ever runs
+	// a pass — see WithLease.
+	lease domain.Leaser
+}
+
+// WithLease makes every pass take a single-writer lease first.
+//
+// Before it, the only guard was a process-local flag on the HTTP handler: two
+// replicas, or a manual trigger racing the ticker, would each believe they were
+// alone. Two concurrent passes are not merely wasteful — they both page the
+// provider ledger, both write discrepancy rows for the same charges, and both try
+// to heal them, so the report double-counts and the heal path races itself.
+func WithLease(l domain.Leaser) ReconcilerOption {
+	return func(r *Reconciler) { r.lease = l }
 }
 
 // WithClock overrides the clock. The window is computed from it, so a test can
@@ -141,6 +156,27 @@ func (r *Reconciler) Run(ctx context.Context, pageSize int) (runID int64, found 
 // the frontier backwards.
 func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.ReconWindow) (runID int64, found int, err error) {
 	start := r.now()
+
+	// The lease is taken BEFORE the run row exists. Opening a run first would leave
+	// a `running` row behind for every tick that stood down, so the runs table would
+	// fill with passes that never happened and the report would be unreadable.
+	if r.lease != nil {
+		lease, lerr := r.lease.TryAcquire(ctx, domain.LeaseReconciliation)
+		if lerr != nil {
+			// ErrLeaseHeld reaches the caller unwrapped: standing down is a normal
+			// outcome, and the HTTP path answers 409 for it rather than 500.
+			return 0, 0, lerr
+		}
+		defer func() {
+			if rerr := lease.Release(ctx); rerr != nil {
+				// The connection closes and the server frees the lock at session end,
+				// so the lease is not stuck — but a broken acquire/release pairing is a
+				// bug, and silence here is how it would stay one.
+				r.logger.Error("reconciliation lease release failed", zap.Error(rerr))
+			}
+		}()
+	}
+
 	runID, err = r.repo.CreateRun(ctx)
 	if err != nil {
 		recordReconRun(ctx, reconRunResultError, 0)

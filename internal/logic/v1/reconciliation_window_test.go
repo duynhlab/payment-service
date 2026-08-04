@@ -145,3 +145,86 @@ func TestRecon_BackfillAdvancesMonotonically(t *testing.T) {
 			repo.advancedTo, recent.Through)
 	}
 }
+
+// fakeLease records whether the pass took and returned its lease.
+type fakeLease struct {
+	held       bool
+	releases   int
+	releaseErr error
+}
+
+func (l *fakeLease) Release(context.Context) error {
+	l.releases++
+	return l.releaseErr
+}
+
+type fakeLeaser struct {
+	lease   *fakeLease
+	err     error
+	gotKey  int64
+	tryCall int
+}
+
+func (f *fakeLeaser) TryAcquire(_ context.Context, key int64) (domain.Lease, error) {
+	f.gotKey = key
+	f.tryCall++
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.lease.held = true
+	return f.lease, nil
+}
+
+// TestRecon_LeaseHeldStandsDownWithoutOpeningARun: standing down must leave no
+// trace. Opening the run row first and then discovering the lease is taken would
+// fill the runs table with passes that never happened, and the report is the thing
+// an operator reads when money is missing.
+func TestRecon_LeaseHeldStandsDownWithoutOpeningARun(t *testing.T) {
+	repo := &fakeReconRepo{runID: 1}
+	ledger := &fakeLedger{page: &provider.TransactionsPage{}}
+	leaser := &fakeLeaser{err: domain.ErrLeaseHeld}
+	rec := NewReconciler(repo, ledger, WithClock(func() time.Time { return fixedNow }), WithLease(leaser))
+
+	_, _, err := rec.Run(context.Background(), 10)
+	if !errors.Is(err, domain.ErrLeaseHeld) {
+		t.Fatalf("err = %v, want ErrLeaseHeld reaching the caller unwrapped enough to match", err)
+	}
+	if repo.finishCalls != 0 || repo.gotWindow.Bounded() {
+		t.Fatal("a pass that stood down still touched its sources")
+	}
+	if leaser.gotKey != domain.LeaseReconciliation {
+		t.Errorf("lease key = %d, want the reconciliation key", leaser.gotKey)
+	}
+}
+
+// The lease is returned on every path, including the failing ones. A pass holds a
+// pooled connection for its whole duration, so a leak per failed pass would
+// exhaust the pool within an hour of ticking.
+func TestRecon_LeaseIsReleasedOnEveryPath(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("after a completed pass", func(t *testing.T) {
+		l := &fakeLease{}
+		rec := NewReconciler(&fakeReconRepo{runID: 1}, &fakeLedger{page: &provider.TransactionsPage{}},
+			WithClock(func() time.Time { return fixedNow }), WithLease(&fakeLeaser{lease: l}))
+		if _, _, err := rec.Run(ctx, 10); err != nil {
+			t.Fatal(err)
+		}
+		if l.releases != 1 {
+			t.Fatalf("releases = %d, want exactly 1", l.releases)
+		}
+	})
+
+	t.Run("after a failed pass", func(t *testing.T) {
+		l := &fakeLease{}
+		rec := NewReconciler(&fakeReconRepo{runID: 1, listErr: errors.New("database went away")},
+			&fakeLedger{page: &provider.TransactionsPage{}},
+			WithClock(func() time.Time { return fixedNow }), WithLease(&fakeLeaser{lease: l}))
+		if _, _, err := rec.Run(ctx, 10); err == nil {
+			t.Fatal("expected the detection failure to surface")
+		}
+		if l.releases != 1 {
+			t.Fatalf("releases = %d, want exactly 1 even when the pass failed", l.releases)
+		}
+	})
+}
