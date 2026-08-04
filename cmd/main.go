@@ -269,6 +269,12 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 		case <-reconcile:
 			runJob(ctx, "Reconcile payments vs provider", logger, func(jctx context.Context) (int64, error) {
 				_, found, err := recon.Run(jctx, reconcilePageSize)
+				if errors.Is(err, domain.ErrLeaseHeld) {
+					// Somebody else is mid-pass. Standing down is the correct outcome for
+					// a single-writer role, so it must not be logged as a failure — a tick
+					// that reports an error every minute is a tick nobody reads.
+					return 0, nil
+				}
 				return int64(found), err
 			})
 		case <-doubt.C:
@@ -340,7 +346,15 @@ func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpo
 	if !ok {
 		return nil, v1.NewReconciliationHandler(nil, reconRepo), reconRepo
 	}
-	opts := []logicv1.ReconcilerOption{logicv1.WithLogger(logger)}
+	// The lease makes the reconciler a single writer across PROCESSES, so the
+	// trigger endpoint and the ticker cannot both run a pass, and neither can two
+	// replicas. It does NOT make the service scalable on its own: migration 000007
+	// (idempotency_keys.payment_id → subject_id) is not rolling-safe, so
+	// replicaCount stays 1 regardless of this.
+	opts := []logicv1.ReconcilerOption{
+		logicv1.WithLogger(logger),
+		logicv1.WithLease(repository.NewLeaseRepository(pool)),
+	}
 	if cfg.Payment.ReconHealEnabled {
 		opts = append(opts, logicv1.WithHealer(logicv1.NewCaptureHealer(capturer, time.Now)))
 		logger.Info("Reconciliation auto-heal enabled (RECON_HEAL_ENABLED)")

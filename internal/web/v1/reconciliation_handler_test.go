@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -88,18 +89,21 @@ func TestTriggerRun_OK(t *testing.T) {
 	}
 }
 
-func TestTriggerRun_SingleFlightIs409(t *testing.T) {
-	h := NewReconciliationHandler(&fakeRunner{runID: 1}, &fakeReconReader{run: completedRun(1, 0)})
-	h.running.Store(true) // a pass is in flight
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	RegisterReconciliationRoutes(r, h)
+// A pass already running elsewhere answers 409, and "elsewhere" now genuinely
+// means any process: the guard is a database lease, not a flag in this replica's
+// memory. The handler's job is only to report the answer, which is why this test
+// drives it through the runner's error rather than through handler state.
+func TestTriggerRun_LeaseHeldIs409(t *testing.T) {
+	runner := &fakeRunner{runID: 1, err: fmt.Errorf("recon: %w", domain.ErrLeaseHeld)}
+	r := newReconRouter(runner, &fakeReconReader{run: completedRun(1, 0)})
+
 	rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (%s)", rec.Code, rec.Body)
 	}
-	// The guard releases: once the in-flight pass finishes, triggers work again.
-	h.running.Store(false)
+
+	// Once the other holder is done, triggers work again.
+	runner.err = nil
 	if rec := doRecon(r, http.MethodPost, "/payment/v1/internal/payments/reconciliation/runs"); rec.Code != http.StatusCreated {
 		t.Fatalf("after release: status = %d, want 201 (%s)", rec.Code, rec.Body)
 	}
