@@ -5,6 +5,7 @@
 package provider
 
 import (
+	"time"
 	"context"
 	"errors"
 	"fmt"
@@ -86,6 +87,11 @@ type Transaction struct {
 	ProviderPaymentID string `json:"provider_payment_id"`
 	AmountMinor       int64  `json:"amount_minor"`
 	Status            string `json:"status"`
+	// CreatedAt is when the provider first recorded the charge. It is what makes a
+	// reconciliation pass boundable: matched against the internal window, it keeps
+	// a charge from being reported missing on our side merely because it is older
+	// than the window we asked about.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // TransactionsPage is the paged GET /transactions response — the reconciliation

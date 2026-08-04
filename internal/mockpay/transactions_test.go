@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -144,4 +146,50 @@ func TestServer_Transactions_Paging(t *testing.T) {
 	if floor := getTransactions(t, url+"/transactions?page=0&page_size=0"); floor.Page != 1 || floor.PageSize != 1 {
 		t.Errorf("floor clamp: page=%d size=%d, want 1/1", floor.Page, floor.PageSize)
 	}
+}
+
+// TestServer_TransactionsWindow: the ledger has to be askable for a slice of
+// history, because otherwise every reconciliation pass must read all of it and
+// the cost of checking today's payments grows with every payment ever made.
+func TestServer_TransactionsWindow(t *testing.T) {
+	base := newServer(t)
+
+	req := provider.ChargeRequest{IdempotencyKey: "win-1", AmountMinor: 1000, Currency: "USD"}
+	if st, _ := post(t, base+"/charges", req); st != http.StatusOK {
+		t.Fatalf("charge status %d", st)
+	}
+
+	t.Run("a window ending in the future includes it", func(t *testing.T) {
+		page := getTransactions(t, base+"/transactions?to="+url.QueryEscape(time.Now().Add(time.Hour).Format(time.RFC3339)))
+		if len(page.Transactions) != 1 {
+			t.Fatalf("transactions = %d, want 1", len(page.Transactions))
+		}
+		if page.Transactions[0].CreatedAt.IsZero() {
+			t.Error("created_at is zero: without it a caller cannot bound anything")
+		}
+	})
+
+	t.Run("a window that closed before it existed excludes it", func(t *testing.T) {
+		page := getTransactions(t, base+"/transactions?from="+url.QueryEscape(time.Now().Add(-48*time.Hour).Format(time.RFC3339))+
+			"&to="+url.QueryEscape(time.Now().Add(-24*time.Hour).Format(time.RFC3339)))
+		if len(page.Transactions) != 0 {
+			t.Fatalf("transactions = %d, want 0", len(page.Transactions))
+		}
+	})
+
+	// Refused, not ignored. Dropping an unparseable bound would widen the answer
+	// to everything — and the caller would compare that against a narrow internal
+	// set and report every older charge as missing on its side.
+	t.Run("a malformed bound is refused", func(t *testing.T) {
+		for _, q := range []string{"from=yesterday", "to=not-a-time", "from=2026-01-02T00:00:00Z&to=2026-01-01T00:00:00Z"} {
+			resp, err := http.Get(base + "/transactions?" + q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s → status %d, want 400", q, resp.StatusCode)
+			}
+		}
+	})
 }

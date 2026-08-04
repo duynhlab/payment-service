@@ -20,7 +20,7 @@ import (
 // fakeLedger serves canned provider transaction pages.
 type fakeLedger struct{ pages []*provider.TransactionsPage }
 
-func (f *fakeLedger) GetTransactions(_ context.Context, page, _ int) (*provider.TransactionsPage, error) {
+func (f *fakeLedger) GetTransactions(_ context.Context, page, _ int, _, _ time.Time) (*provider.TransactionsPage, error) {
 	if page-1 < len(f.pages) {
 		return f.pages[page-1], nil
 	}
@@ -54,7 +54,12 @@ func TestReconciliation_Integration(t *testing.T) {
 		},
 	}}}
 
-	runID, found, err := logicv1.NewReconciler(NewReconciliationRepository(pool), ledger).Run(ctx, 100)
+	// The AUTOMATIC window deliberately stops short of now: a payment created
+	// seconds ago may legitimately not have reached the provider yet, so calling it
+	// missing would make the report cry wolf. These payments were created by this
+	// test a moment ago, so the pass is asked for a window that covers them.
+	runID, found, err := logicv1.NewReconciler(NewReconciliationRepository(pool), ledger).
+		RunWindow(ctx, 100, testWindow())
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -202,7 +207,8 @@ func TestReconciliationHeal_Integration(t *testing.T) {
 	}}}
 
 	healer := logicv1.NewCaptureHealer(payRepo, time.Now)
-	runID, found, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).Run(ctx, 100)
+	runID, found, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).
+		RunWindow(ctx, 100, testWindow())
 	if err != nil {
 		t.Fatalf("run with heal: %v", err)
 	}
@@ -252,7 +258,8 @@ func TestReconciliationHeal_Integration(t *testing.T) {
 
 	// Idempotent: with mp_heal now captured, the drift is gone — a re-run finds
 	// only the amount drift and never re-captures (no double posting).
-	_, found2, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).Run(ctx, 100)
+	_, found2, err := logicv1.NewReconciler(reconRepo, ledger, logicv1.WithHealer(healer)).
+		RunWindow(ctx, 100, testWindow())
 	if err != nil {
 		t.Fatalf("second run: %v", err)
 	}
@@ -271,4 +278,90 @@ func TestReconciliationHeal_Integration(t *testing.T) {
 	if captureTxns != 1 {
 		t.Fatalf("heal must post exactly one capture txn, got %d", captureTxns)
 	}
+}
+
+// TestWatermark_MonotonicAndWindowed covers the two SQL facts the windowed pass
+// rests on, and both are the kind that only a real database can confirm.
+//
+// The frontier must move forward only. GREATEST in the UPSERT is what stops a
+// late backfill over older ground from dragging it back — after which the sweep
+// would re-read the same stretch forever, quietly, while looking healthy.
+//
+// And the internal list must honour the window's half-open bounds, because the
+// provider ledger is asked for the same shape. Compare a narrow internal set
+// against a wide provider answer and every older charge reads as missing on our
+// side: a report full of discrepancies that are artefacts of the question.
+func TestWatermark_MonotonicAndWindowed(t *testing.T) {
+	pool := newTestDB(t)
+	ctx := context.Background()
+	repo := NewReconciliationRepository(pool)
+	payments := NewPaymentRepository(pool)
+
+	if mark, err := repo.Watermark(ctx); err != nil || !mark.IsZero() {
+		t.Fatalf("initial watermark = %v err %v, want the zero time", mark, err)
+	}
+
+	mid := time.Now().UTC().Truncate(time.Second)
+	if err := repo.AdvanceWatermark(ctx, mid); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	if err := repo.AdvanceWatermark(ctx, mid.Add(-time.Hour)); err != nil {
+		t.Fatalf("advance backwards: %v", err)
+	}
+	got, err := repo.Watermark(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(mid) {
+		t.Fatalf("watermark = %v, want it to stay at %v — the frontier only moves forward", got, mid)
+	}
+
+	// A payment created now sits inside a window that ends in the future and
+	// outside one that ended before it existed.
+	pay, err := payments.Create(ctx, &domain.Payment{
+		UserID: 31, AmountMinor: 1000, Currency: "USD",
+		Status: domain.StatusPending, CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := payments.TransitionStatus(ctx, pay.ID, domain.StatusPending, domain.StatusAuthorized,
+		map[string]any{"provider_payment_id": "ch_window"}); err != nil {
+		t.Fatal(err)
+	}
+
+	inside, err := repo.ListReconcilable(ctx, domain.ReconWindow{Through: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsPayment(inside, pay.ID) {
+		t.Fatal("a payment created now was excluded from a window ending in the future")
+	}
+
+	outside, err := repo.ListReconcilable(ctx, domain.ReconWindow{
+		From:    time.Now().Add(-48 * time.Hour),
+		Through: time.Now().Add(-24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsPayment(outside, pay.ID) {
+		t.Fatal("a payment created now was included in a window that closed yesterday")
+	}
+}
+
+func containsPayment(rows []domain.ReconRow, id int64) bool {
+	for _, r := range rows {
+		if r.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// testWindow covers everything up to an hour from now, so a pass sees the rows the
+// test just created. Production uses the automatic window instead, which lags now
+// on purpose — see nextWindow.
+func testWindow() domain.ReconWindow {
+	return domain.ReconWindow{Through: time.Now().Add(time.Hour)}
 }

@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -58,6 +59,9 @@ const (
 // in-process provider stub has no ledger to reconcile against).
 type ReconRunner interface {
 	Run(ctx context.Context, pageSize int) (runID int64, found int, err error)
+	// RunWindow covers an explicit stretch of history — the backfill path, for
+	// re-examining ground the automatic frontier has already passed.
+	RunWindow(ctx context.Context, pageSize int, window domain.ReconWindow) (runID int64, found int, err error)
 }
 
 // reconReader is the report side: the persisted run + its discrepancies.
@@ -113,10 +117,24 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	}
 	defer h.running.Store(false)
 
+	window, werr := parseReconWindow(c)
+	if werr != nil {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, werr.Error())
+		return
+	}
+
 	runCtx, cancel := context.WithTimeout(ctx, reconRunTimeout)
 	defer cancel()
 	// Page size 0 → the reconciler's own default; one source of truth.
+	//
+	// No window means the automatic one: from the frontier, less a lookback, up to
+	// a settlement lag short of now. An explicit window is a backfill, and it is a
+	// separate entry point so that asking for one can never be the accidental
+	// result of a typo in a query parameter.
 	runID, found, err := h.runner.Run(runCtx, 0)
+	if window.Bounded() {
+		runID, found, err = h.runner.RunWindow(runCtx, 0, window)
+	}
 	if err != nil {
 		span.RecordError(err)
 		log.Error(msgRunFailed, zap.Int64(fieldRunID, runID), zap.Error(err))
@@ -192,4 +210,29 @@ func discrepancyPage(c *gin.Context) (limit, offset int) {
 		offset = v
 	}
 	return limit, offset
+}
+
+// parseReconWindow reads the optional `from` and `through` query parameters as
+// RFC 3339 instants.
+//
+// Malformed input is REFUSED, never ignored. Dropping an unparseable bound would
+// silently widen the pass to everything and compare that against the provider's
+// bounded answer — turning a typo into a report full of invented discrepancies.
+func parseReconWindow(c *gin.Context) (domain.ReconWindow, error) {
+	var w domain.ReconWindow
+	for name, dst := range map[string]*time.Time{"from": &w.From, "through": &w.Through} {
+		raw := c.Query(name)
+		if raw == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return domain.ReconWindow{}, fmt.Errorf("%s must be an RFC 3339 timestamp", name)
+		}
+		*dst = t
+	}
+	if w.Empty() {
+		return domain.ReconWindow{}, errors.New("through must be after from")
+	}
+	return w, nil
 }

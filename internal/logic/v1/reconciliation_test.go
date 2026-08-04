@@ -3,6 +3,7 @@ package v1
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
@@ -78,10 +79,35 @@ type fakeReconRepo struct {
 
 	finishErrOnce bool // fail the first FinishRun (e.g. a cancelled caller ctx)
 	finishCalls   int
+
+	// The windowing side: what the pass was asked for, where the frontier stood,
+	// and where it was moved to.
+	gotWindow    domain.ReconWindow
+	watermark    time.Time
+	watermarkErr error
+	advancedTo   time.Time
+	advanceErr   error
 }
 
-func (f *fakeReconRepo) ListReconcilable(context.Context) ([]domain.ReconRow, error) {
+func (f *fakeReconRepo) ListReconcilable(_ context.Context, w domain.ReconWindow) ([]domain.ReconRow, error) {
+	f.gotWindow = w
 	return f.rows, f.listErr
+}
+
+func (f *fakeReconRepo) Watermark(context.Context) (time.Time, error) {
+	return f.watermark, f.watermarkErr
+}
+
+func (f *fakeReconRepo) AdvanceWatermark(_ context.Context, through time.Time) error {
+	if f.advanceErr != nil {
+		return f.advanceErr
+	}
+	// Mirror the production UPDATE's GREATEST: the frontier only ever moves
+	// forward, so a late pass over older ground cannot pull it back.
+	if through.After(f.advancedTo) {
+		f.advancedTo = through
+	}
+	return nil
 }
 func (f *fakeReconRepo) CreateRun(context.Context) (int64, error) { return f.runID, f.createErr }
 func (f *fakeReconRepo) SaveDiscrepancies(_ context.Context, _ int64, ds []domain.Discrepancy) error {
@@ -108,9 +134,14 @@ func (f *fakeReconRepo) FinishRun(_ context.Context, _ int64, scanned, found int
 type fakeLedger struct {
 	page *provider.TransactionsPage
 	err  error
+	// gotFrom/gotTo record the window the ledger was asked for. Both sides of the
+	// comparison must use the SAME bounds — a narrow internal set against the
+	// provider's whole history reports every older charge as missing on our side.
+	gotFrom, gotTo time.Time
 }
 
-func (f *fakeLedger) GetTransactions(_ context.Context, page, _ int) (*provider.TransactionsPage, error) {
+func (f *fakeLedger) GetTransactions(_ context.Context, page, _ int, from, to time.Time) (*provider.TransactionsPage, error) {
+	f.gotFrom, f.gotTo = from, to
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -229,7 +260,7 @@ func TestClassify_StatusEquivalence(t *testing.T) {
 
 type pagedLedger struct{ pages []*provider.TransactionsPage }
 
-func (p *pagedLedger) GetTransactions(_ context.Context, page, _ int) (*provider.TransactionsPage, error) {
+func (p *pagedLedger) GetTransactions(_ context.Context, page, _ int, _, _ time.Time) (*provider.TransactionsPage, error) {
 	if page-1 < len(p.pages) {
 		return p.pages[page-1], nil
 	}

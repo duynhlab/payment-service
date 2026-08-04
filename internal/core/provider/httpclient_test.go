@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -32,7 +33,7 @@ func TestHTTPClient_GetTransactions(t *testing.T) {
 	if _, err := c.Charge(ctx, provider.ChargeRequest{AmountMinor: 2000, Currency: "USD", PaymentMethod: "tok_visa"}); err != nil {
 		t.Fatal(err)
 	}
-	page, err := c.GetTransactions(ctx, 1, 50)
+	page, err := c.GetTransactions(ctx, 1, 50, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatalf("get transactions: %v", err)
 	}
@@ -52,7 +53,7 @@ func TestHTTPClient_GetTransactions_Errors(t *testing.T) {
 	ctx := context.Background()
 
 	// Transport failure (unreachable) → error.
-	if _, err := provider.NewHTTPClient("http://127.0.0.1:1").GetTransactions(ctx, 1, 50); err == nil {
+	if _, err := provider.NewHTTPClient("http://127.0.0.1:1").GetTransactions(ctx, 1, 50, time.Time{}, time.Time{}); err == nil {
 		t.Error("want error on unreachable provider")
 	}
 
@@ -61,7 +62,7 @@ func TestHTTPClient_GetTransactions_Errors(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer ts.Close()
-	if _, err := provider.NewHTTPClient(ts.URL).GetTransactions(ctx, 1, 50); err == nil {
+	if _, err := provider.NewHTTPClient(ts.URL).GetTransactions(ctx, 1, 50, time.Time{}, time.Time{}); err == nil {
 		t.Error("want error on non-200")
 	}
 
@@ -70,7 +71,7 @@ func TestHTTPClient_GetTransactions_Errors(t *testing.T) {
 		_, _ = w.Write([]byte("not json"))
 	}))
 	defer ts2.Close()
-	if _, err := provider.NewHTTPClient(ts2.URL).GetTransactions(ctx, 1, 50); err == nil {
+	if _, err := provider.NewHTTPClient(ts2.URL).GetTransactions(ctx, 1, 50, time.Time{}, time.Time{}); err == nil {
 		t.Error("want error on malformed body")
 	}
 }

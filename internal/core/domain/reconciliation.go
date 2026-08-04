@@ -110,3 +110,26 @@ type Discrepancy struct {
 	Resolution Resolution `json:"resolution"`
 	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
 }
+
+// ReconWindow bounds one reconciliation pass to a half-open interval on the time
+// a charge was created, [From, Through). A zero bound is unbounded on that side.
+//
+// Half-open on purpose: consecutive windows share a boundary, and both claiming
+// the charge that sits exactly on it would double-report it. Both sides of the
+// comparison — the internal payments and the provider ledger — must be asked for
+// the SAME window, or the mismatch is an artefact of the question rather than a
+// fact about the money.
+type ReconWindow struct {
+	From    time.Time
+	Through time.Time
+}
+
+// Bounded reports whether the window excludes anything at all. An unbounded
+// window is legitimate exactly once: the first pass, before any watermark exists.
+func (w ReconWindow) Bounded() bool { return !w.From.IsZero() || !w.Through.IsZero() }
+
+// Empty reports whether the window cannot contain anything, which means there is
+// nothing to compare and a pass would be pure overhead.
+func (w ReconWindow) Empty() bool {
+	return !w.From.IsZero() && !w.Through.IsZero() && !w.Through.After(w.From)
+}
