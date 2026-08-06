@@ -15,23 +15,22 @@ permissions:
 
 jobs:
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
       integration: true
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
-    secrets: inherit
 
   gitleaks:
-    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     permissions:
       contents: read
       security-events: write
 
   sonar:
     needs: [go-check, gitleaks]
-    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       project-key: 'duynhlab_${{ github.event.repository.name }}'
       organization: 'duynhlab'
@@ -42,14 +41,13 @@ jobs:
 
   docker-build:
     needs: [go-check, sonar]
-    uses: duynhlab/gha-workflows/.github/workflows/docker-build-go.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/docker-build-go.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       image-name: ${{ github.event.repository.name }}
       push: true
       scan-before-push: true
       scan-severity: 'CRITICAL,HIGH'
       scan-exit-code: '1'
-    secrets: inherit
     permissions:
       contents: read
       packages: write
@@ -58,13 +56,16 @@ jobs:
   trivy-report:
     needs: [docker-build]
     if: needs.docker-build.outputs.scan-status == 'pass'
-    uses: duynhlab/gha-workflows/.github/workflows/trivy-scan.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/trivy-scan.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       image-ref: ghcr.io/${{ github.repository }}/${{ github.event.repository.name }}@${{ needs.docker-build.outputs.digest }}
       severity: 'CRITICAL,HIGH,MEDIUM'
       exit-code: '0'
       ignore-unfixed: true
-    secrets: inherit
+    # Named, not inherited: the only secrets this workflow declares.
+    secrets:
+      GSHEET_CLIENT_EMAIL: ${{ secrets.GSHEET_CLIENT_EMAIL }}
+      GSHEET_PRIVATE_KEY: ${{ secrets.GSHEET_PRIVATE_KEY }}
     permissions:
       contents: read
       packages: read
@@ -72,11 +73,10 @@ jobs:
 
   docker-sign:
     needs: [docker-build]
-    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       tags: ${{ needs.docker-build.outputs.tags }}
       digest: ${{ needs.docker-build.outputs.digest }}
-    secrets: inherit
     permissions:
       contents: read
       packages: write
@@ -87,8 +87,7 @@ jobs:
   release-binary:
     needs: [go-check, sonar]
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@main
-    secrets: inherit
+    uses: duynhlab/gha-workflows/.github/workflows/goreleaser.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     permissions:
       contents: write
       id-token: write
@@ -96,7 +95,7 @@ jobs:
   notify:
     if: always()
     needs: [go-check, gitleaks, sonar, docker-build, trivy-report, docker-sign, release-binary]
-    uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       slack_channel_id: "C0AD82A9A74"
       gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"

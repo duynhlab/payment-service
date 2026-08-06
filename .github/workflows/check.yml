@@ -11,30 +11,29 @@ permissions:
 
 jobs:
   pr-checks:
-    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       slack_channel_id: "C0AD82A9A74"
     secrets:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
       integration: true
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
-    secrets: inherit
 
   gitleaks:
-    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     permissions:
       contents: read
       security-events: write
 
   sonar:
     needs: [go-check, gitleaks]
-    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       project-key: 'duynhlab_${{ github.event.repository.name }}'
       organization: 'duynhlab'
@@ -48,7 +47,7 @@ jobs:
     # fail there — skip instead of painting every deps PR red.
     if: always() && github.actor != 'dependabot[bot]'
     needs: [pr-checks, go-check, gitleaks, sonar]
-    uses: duynhlab/gha-workflows/.github/workflows/status.yml@main
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
     with:
       slack_channel_id: "C0AD82A9A74"
       slack_thread_ts: ${{ needs.pr-checks.outputs.slack_thread_ts }}
