@@ -370,7 +370,7 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 		// The lock is released either way, so a same-key retry can make progress; a
 		// retry under ANY key now resolves rather than charges.
 		recordAuthorization(ctx, authError, currencyLabel(in.Currency))
-		recordProviderUnknown(ctx, opAuthorize)
+		recordProviderUnknown(ctx, opAuthorize, unknownStagePark)
 		return nil, s.withKeyReleased(ctx, key.ID, s.park(ctx, domain.StatusPending, domain.Attempt{
 			PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
 			ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
@@ -550,7 +550,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 		//
 		// A background sweep over the whole worklist is the phase's next slice; until
 		// it lands, the escape is a retry, not a timer.
-		recordProviderUnknown(ctx, opCapture)
+		recordProviderUnknown(ctx, opCapture, unknownStagePark)
 		recordOperation(ctx, opCapture, resultUnknown)
 		return nil, s.park(ctx, domain.StatusCaptured, attempt, capErr)
 
@@ -622,7 +622,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 		// void did land, that leaves us believing we can capture money the
 		// provider has already released — the mirror image of the capture case.
 		// Park it instead, and let the next call re-ask under the same key.
-		recordProviderUnknown(ctx, opVoid)
+		recordProviderUnknown(ctx, opVoid, unknownStagePark)
 		recordOperation(ctx, opVoid, resultUnknown)
 		return nil, s.park(ctx, domain.StatusVoided, attempt, voidErr)
 
@@ -876,7 +876,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 	}
 	if class == domain.OutcomeUnknown {
 		recordOperation(ctx, opRefund, resultUnknown)
-		recordProviderUnknown(ctx, opRefund)
+		recordProviderUnknown(ctx, opRefund, unknownStagePark)
 		if attemptErr != nil {
 			// Same rule as the intent-level parks: no evidence, no park. A refund
 			// sitting in `processing` that no attempt row explains cannot be resolved

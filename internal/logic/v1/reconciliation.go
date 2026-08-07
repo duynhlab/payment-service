@@ -193,10 +193,13 @@ func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.
 		recordReconRun(ctx, result, r.now().Sub(start))
 	}()
 
-	discrepancies, internal, scanned, err := r.detect(ctx, pageSize, window)
+	discrepancies, internal, scanned, violations, err := r.detect(ctx, pageSize, window)
 	if err != nil {
 		r.finish(ctx, runID, scanned, 0, domain.ReconRunFailed)
 		return runID, 0, fmt.Errorf("detect discrepancies: %w", err)
+	}
+	if violations > 0 {
+		recordReconWindowViolations(ctx, int64(violations))
 	}
 
 	// Count what detection found, grouped by the bounded discrepancy class —
@@ -222,8 +225,15 @@ func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.
 
 	// The frontier moves only for a pass that compared its whole window. A failed
 	// pass leaves it, so the next one re-covers the same ground rather than
-	// stepping over a stretch nobody checked.
-	if !window.Through.IsZero() {
+	// stepping over a stretch nobody checked. A pass whose provider answer
+	// violated its bounds is treated the same way: the comparison completed,
+	// but against an answer that cannot be trusted to be the window's — the
+	// next pass re-covers it, and the violation counter is the alert signal.
+	if violations > 0 {
+		r.logger.Error("reconciliation watermark held: the provider returned rows outside the requested window",
+			zap.Int64("run_id", runID), zap.Int("violations", violations))
+	}
+	if violations == 0 && !window.Through.IsZero() {
 		if werr := r.repo.AdvanceWatermark(ctx, window.Through); werr != nil {
 			r.logger.Error("reconciliation watermark did not advance; the next pass will re-cover this window",
 				zap.Int64("run_id", runID), zap.Time("through", window.Through), zap.Error(werr))
@@ -253,12 +263,21 @@ func (r *Reconciler) finish(ctx context.Context, runID int64, scanned, found int
 
 // detect loads the internal rows, pages the full provider ledger, and classifies
 // the two sides. Returns the discrepancies, the internal rows keyed by
-// provider_payment_id (so heal can resolve a discrepancy to its payment id), and
-// the number of provider transactions scanned.
-func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.ReconWindow) ([]domain.Discrepancy, map[string]domain.ReconRow, int, error) {
+// provider_payment_id (so heal can resolve a discrepancy to its payment id), the
+// number of provider transactions scanned, and how many of them violated the
+// requested window.
+//
+// The violation check is the lesson of the first GameDay (G5/F1): a provider
+// that ignores its bounds — mockpay 1.0.0 discarded from/to outright — makes a
+// bounded internal set face the provider's WHOLE ledger, and every older charge
+// reads as missing_internal. The pass was request-symmetric but never verified
+// the answer. Violating rows are excluded from classification (they cannot
+// manufacture phantoms) and counted, and the caller refuses to advance the
+// watermark over a window whose answer it could not trust.
+func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.ReconWindow) ([]domain.Discrepancy, map[string]domain.ReconRow, int, int, error) {
 	rows, err := r.repo.ListReconcilable(ctx, window)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, 0, err
 	}
 	internal := make(map[string]domain.ReconRow, len(rows))
 	for _, row := range rows {
@@ -269,12 +288,26 @@ func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.Rec
 		pageSize = defaultReconPageSize
 	}
 	var txns []provider.Transaction
+	violations := 0
 	for page := 1; ; page++ {
 		p, perr := r.ledger.GetTransactions(ctx, page, pageSize, window.From, window.Through)
 		if perr != nil {
-			return nil, nil, 0, perr
+			return nil, nil, 0, violations, perr
 		}
-		txns = append(txns, p.Transactions...)
+		for _, tx := range p.Transactions {
+			// Half-open [From, Through), the same predicate the request asked
+			// the provider to apply; a zero bound means that side is unbounded.
+			if (!window.From.IsZero() && tx.CreatedAt.Before(window.From)) ||
+				(!window.Through.IsZero() && !tx.CreatedAt.Before(window.Through)) {
+				violations++
+				r.logger.Warn("provider transaction outside the requested window; excluded from classification",
+					zap.String("provider_payment_id", tx.ProviderPaymentID),
+					zap.Time("created_at", tx.CreatedAt),
+					zap.Time("from", window.From), zap.Time("through", window.Through))
+				continue
+			}
+			txns = append(txns, tx)
+		}
 		// Terminate on a short (or empty) page. The provider's Total is advisory
 		// only — trusting it risks stopping early on an under-stated Total (which
 		// would drop whole pages and falsely flag their payments missing_provider).
@@ -282,13 +315,14 @@ func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.Rec
 			break
 		}
 		// Hard cap against a runaway/hostile provider (full pages + inflated
-		// Total): bound memory/time rather than paging forever.
-		if len(txns) > maxReconTransactions {
-			return nil, nil, 0, fmt.Errorf("reconciliation aborted: provider returned more than %d transactions", maxReconTransactions)
+		// Total): bound memory/time rather than paging forever. Counted over
+		// everything received, violations included.
+		if len(txns)+violations > maxReconTransactions {
+			return nil, nil, 0, violations, fmt.Errorf("reconciliation aborted: provider returned more than %d transactions", maxReconTransactions)
 		}
 	}
 
-	return classify(internal, txns), internal, len(txns), nil
+	return classify(internal, txns), internal, len(txns) + violations, violations, nil
 }
 
 // heal is the ADR-012 auto-heal pass: converge the one safe drift class and

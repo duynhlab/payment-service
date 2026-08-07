@@ -33,9 +33,9 @@ var (
 	operationCounter, _ = meter.Int64Counter("payment.operation.total",
 		metric.WithDescription("Money-lifecycle operations (capture/void/refund) by outcome"))
 	reconDiscrepancyCounter, _ = meter.Int64Counter("payment.reconciliation.discrepancies.total",
-		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by kind"))
+		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by class"))
 	providerUnknownCounter, _ = meter.Int64Counter("payment.provider.unknown.total",
-		metric.WithDescription("Provider calls that returned no verdict, by operation — each one leaves an intent in doubt until it is resolved"))
+		metric.WithDescription("Provider calls that returned no verdict, by operation and stage — stage=park is a NEW doubt (an intent enters processing), stage=resolve is a re-ask that ALSO answered nothing (existing doubt surviving). The first GameDay read 2 against one parked row because both round-trips counted indistinguishably"))
 	attemptWriteFailureCounter, _ = meter.Int64Counter("payment.attempt.write_failures.total",
 		metric.WithDescription("Attempt rows that could not be written, by operation — the money state is still correct, but its evidence is missing"))
 	keyReleaseFailureCounter, _ = meter.Int64Counter("payment.idempotency.release_failures.total",
@@ -49,6 +49,8 @@ var (
 	reconRunDuration, _ = meter.Float64Histogram("payment.reconciliation.run.duration",
 		metric.WithDescription("How long a reconciliation pass takes; a window that stops draining shows up here before it shows up in staleness"),
 		metric.WithUnit("s"))
+	reconWindowViolationCounter, _ = meter.Int64Counter("payment.reconciliation.window_violations.total",
+		metric.WithDescription("Provider transactions outside the window the pass asked for — a provider ignoring its bounds can manufacture phantom missing_internal discrepancies (first GameDay, F1), so violating rows are excluded and the watermark holds"))
 	reconHealFailureCounter, _ = meter.Int64Counter("payment.reconciliation.heal_failures.total",
 		metric.WithDescription("Heal attempts that errored, by discrepancy class — previously only logged, so a heal that never worked was invisible"))
 )
@@ -69,11 +71,20 @@ func recordReconRun(ctx context.Context, result string, d time.Duration) {
 	reconRunDuration.Record(ctx, d.Seconds(), metric.WithAttributes(attribute.String("result", result)))
 }
 
+// recordReconWindowViolations counts provider rows outside the requested
+// window in one pass.
+func recordReconWindowViolations(ctx context.Context, n int64) {
+	if n <= 0 {
+		return
+	}
+	reconWindowViolationCounter.Add(ctx, n)
+}
+
 // recordReconHealFailure counts a heal that errored. The discrepancy stays in the
 // report as `failed`, but a rate here is what says the heal path itself is broken
 // rather than the drift being unusual.
 func recordReconHealFailure(ctx context.Context, class string) {
-	reconHealFailureCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("kind", class)))
+	reconHealFailureCounter.Add(ctx, 1, metric.WithAttributes(attribute.String("class", class)))
 }
 
 // ObserveReconciliationWatermark publishes how far behind the reconciliation
@@ -161,9 +172,16 @@ func recordResolution(ctx context.Context, op string, class domain.OutcomeClass)
 // from the operation counter's `unknown` result because this is the signal an
 // alert watches: a rising rate means doubt is being created faster than it is
 // resolved, which no per-outcome ratio makes obvious.
-func recordProviderUnknown(ctx context.Context, op string) {
-	providerUnknownCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(labelOperation, op)))
+func recordProviderUnknown(ctx context.Context, op, stage string) {
+	providerUnknownCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String(labelOperation, op), attribute.String("stage", stage)))
 }
+
+// Provider-unknown stages (bounded).
+const (
+	unknownStagePark    = "park"    // the round-trip that created the doubt
+	unknownStageResolve = "resolve" // a re-ask that also answered nothing
+)
 
 // recordAttemptWriteFailure counts a lost attempt row. Deliberately visible: the
 // attempt log is what makes an unknown outcome resolvable, so silently losing
@@ -249,12 +267,14 @@ func recordOperation(ctx context.Context, op, result string) {
 }
 
 // recordReconDiscrepancies counts discrepancies found in one reconciliation run,
-// grouped by kind. This is a per-run DETECTION count: a standing un-healed
-// discrepancy is re-counted on every scheduled run, so read it as a detection
-// rate (rate()/per-run), not a cumulative sum of distinct drifts.
-func recordReconDiscrepancies(ctx context.Context, kind string, n int64) {
+// grouped by class — the label matches the DB column and the RFC vocabulary
+// (it was emitted as `kind` until the first GameDay caught the drift between
+// code, runbook and design records). This is a per-run DETECTION count: a
+// standing un-healed discrepancy is re-counted on every scheduled run, so read
+// it as a detection rate (rate()/per-run), not a cumulative sum of drifts.
+func recordReconDiscrepancies(ctx context.Context, class string, n int64) {
 	if n <= 0 {
 		return
 	}
-	reconDiscrepancyCounter.Add(ctx, n, metric.WithAttributes(attribute.String("kind", kind)))
+	reconDiscrepancyCounter.Add(ctx, n, metric.WithAttributes(attribute.String("class", class)))
 }
