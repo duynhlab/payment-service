@@ -328,3 +328,69 @@ func TestClassify_NoDiscrepancies(t *testing.T) {
 		t.Fatalf("want no discrepancies, got %+v", got)
 	}
 }
+
+// The lesson of the first GameDay (G5/F1): a provider that ignores its window
+// bounds — mockpay 1.0.0 discarded from/to — made every older charge read as
+// missing_internal. The pass now VERIFIES the answer: out-of-window rows are
+// excluded from classification (no phantoms), counted, and the watermark
+// holds so the next pass re-covers the window.
+func TestReconciler_RunWindow_ProviderIgnoresBounds(t *testing.T) {
+	from := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	through := from.Add(time.Hour)
+	window := domain.ReconWindow{From: from, Through: through}
+
+	repo := &fakeReconRepo{runID: 9, rows: []domain.ReconRow{
+		{ProviderPaymentID: "mp_in", AmountMinor: 100, Status: domain.StatusCaptured},
+	}}
+	ledger := &fakeLedger{page: &provider.TransactionsPage{Total: 3, Transactions: []provider.Transaction{
+		// In-window and matching: no discrepancy.
+		{ProviderPaymentID: "mp_in", AmountMinor: 100, Status: provider.TxnCaptured, CreatedAt: from.Add(time.Minute)},
+		// The phantom-manufacturers: before From and at/after Through
+		// (half-open — a row AT Through is outside).
+		{ProviderPaymentID: "mp_old", AmountMinor: 999, Status: provider.TxnCaptured, CreatedAt: from.Add(-time.Hour)},
+		{ProviderPaymentID: "mp_edge", AmountMinor: 999, Status: provider.TxnCaptured, CreatedAt: through},
+	}}}
+
+	_, found, err := NewReconciler(repo, ledger).RunWindow(context.Background(), 100, window)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if found != 0 {
+		t.Fatalf("found = %d — out-of-window rows manufactured discrepancies", found)
+	}
+	if repo.saved != nil {
+		t.Fatalf("saved = %+v, want none (mp_old/mp_edge must not classify)", repo.saved)
+	}
+	if !repo.advancedTo.IsZero() {
+		t.Fatalf("watermark advanced to %v — a violated window must be re-covered", repo.advancedTo)
+	}
+	if repo.finished != domain.ReconRunCompleted {
+		t.Fatalf("finished = %s, want completed (the pass ran; only the frontier held)", repo.finished)
+	}
+	// Scanned counts everything the provider returned, violations included —
+	// the run report must not hide that rows arrived and were rejected.
+	if repo.scanned != 3 {
+		t.Fatalf("scanned = %d, want 3", repo.scanned)
+	}
+}
+
+// The control: an honest provider (all rows in-window) advances the frontier
+// exactly as before — the verification must not tax the healthy path.
+func TestReconciler_RunWindow_HonestProviderAdvances(t *testing.T) {
+	from := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	through := from.Add(time.Hour)
+	repo := &fakeReconRepo{runID: 10, rows: []domain.ReconRow{
+		{ProviderPaymentID: "mp_1", AmountMinor: 100, Status: domain.StatusCaptured},
+	}}
+	ledger := &fakeLedger{page: &provider.TransactionsPage{Total: 1, Transactions: []provider.Transaction{
+		{ProviderPaymentID: "mp_1", AmountMinor: 100, Status: provider.TxnCaptured, CreatedAt: from.Add(30 * time.Minute)},
+	}}}
+
+	if _, _, err := NewReconciler(repo, ledger).RunWindow(context.Background(), 100,
+		domain.ReconWindow{From: from, Through: through}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !repo.advancedTo.Equal(through) {
+		t.Fatalf("watermark = %v, want %v", repo.advancedTo, through)
+	}
+}

@@ -248,7 +248,7 @@ func (s *Service) recordRoundTrip(ctx context.Context, prior domain.Attempt, ref
 	}
 	recordResolution(ctx, string(op), class)
 	if class == domain.OutcomeUnknown {
-		recordProviderUnknown(ctx, string(op))
+		recordProviderUnknown(ctx, string(op), unknownStageResolve)
 	}
 	return class
 }
