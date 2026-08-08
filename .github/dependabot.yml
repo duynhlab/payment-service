@@ -7,6 +7,10 @@ updates:
       interval: "daily"
     open-pull-requests-limit: 10
     labels: ["dependencies", "go"]
+    groups:
+      duynhlab-pkg:
+        patterns:
+          - "github.com/duynhlab/pkg/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
