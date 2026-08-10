@@ -33,7 +33,7 @@ jobs:
 
   sonar:
     needs: [go-check, gitleaks]
-    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@6b1c155968c3212b10f0415a07e6e8e3cf04d5a9 # v1.0.1
     with:
       project-key: 'duynhlab_${{ github.event.repository.name }}'
       organization: 'duynhlab'
