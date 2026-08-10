@@ -47,7 +47,7 @@ jobs:
     # fail there — skip instead of painting every deps PR red.
     if: always() && github.actor != 'dependabot[bot]'
     needs: [pr-checks, go-check, gitleaks, sonar]
-    uses: duynhlab/gha-workflows/.github/workflows/status.yml@b271f01094ee7f16271b14575539e62907a50724 # v1.0.0
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@6b1c155968c3212b10f0415a07e6e8e3cf04d5a9 # v1.0.1
     with:
       slack_channel_id: "C0AD82A9A74"
       slack_thread_ts: ${{ needs.pr-checks.outputs.slack_thread_ts }}
