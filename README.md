@@ -1,121 +1,73 @@
 # payment-service
 
-Payment service for the duynhlab microservices platform: Stripe-style
-PaymentIntents with mandatory idempotency keys, an auth/capture state machine,
-partial refunds derived from data, and a deterministic mock provider for
-reproducible failure testing.
+Authorises, captures, voids and refunds payments, and keeps the double-entry
+ledger that explains every movement of money.
 
-## Features
+## Responsibilities
 
-- **PaymentIntents** — authorize now, capture later (`capture_method: manual`,
-  the default) or auth+capture in one call (`automatic`); authorized holds
-  carry a TTL and expire automatically
-- **Idempotency keys** — every money-moving request requires an
-  `Idempotency-Key` header; the first response is cached and replayed, the
-  same key with a different body is rejected, concurrent duplicates are
-  serialized, and crashed attempts are recovered from checkpointed progress
-- **State machine** — transitions are a whitelist (`pending → authorized →
-  captured`, `void ≠ refund`) enforced in the logic layer *and* as a
-  database compare-and-swap, so concurrent transitions cannot both win
-- **Refunds** — first-class objects, partial and repeatable;
-  `partially_refunded` is derived from `SUM(refunds)` rather than stored
-- **Deterministic failure triggers** — magic amount suffixes make failure paths
-  reproducible in tests and demos. Charges: `…02` generic decline, `…95`
-  insufficient funds, `…19` transient error that succeeds on retry. Refunds have
-  their own suffix, `…07` refund declined — the saga refunds the amount it
-  charged, so a shared suffix could never produce "charge succeeded, refund
-  refused". `…13` makes the provider **go silent**: the charge is created and
-  then the response is withheld past the client timeout, reproducing the
-  lost-response window without destroying the charge (killing the provider would
-  take the charge with it, which is a different case)
+- **Owns:** payment state, refunds, the ledger, webhook event records,
+  idempotency keys, the provider attempt log, and reconciliation runs. Nothing
+  else writes payment state or the ledger.
+- **Does not own:** orders, carts or checkout sessions; the saga itself — payment
+  is a participant the order workflow calls over gRPC; token issuance; and the
+  platform manifests, which live in homelab.
 
-## API Endpoints
+## Tech
 
-| Method | Path | Audience | Description |
-|--------|------|----------|-------------|
-| POST | `/payment/v1/private/payments` | private (JWT) | Create a PaymentIntent — `Idempotency-Key` required |
-| GET | `/payment/v1/private/payments/{id}` | private (JWT) | Fetch one payment (owner-only) |
-| GET | `/payment/v1/private/payments` | private (JWT) | Paginated payment history |
-| POST | `/payment/v1/internal/payments/{id}/refunds` | internal | Create a (partial) refund — `Idempotency-Key` required |
-| POST | `/payment/v1/public/payments/webhooks/mockpay` | public | Provider webhook — the HMAC-signed body is the credential (`Mockpay-Signature: t=…,v1=…`, ±5 min tolerance, fail-closed on empty secret) |
-| POST | `/payment/v1/internal/payments/reconciliation/runs` | internal | Trigger one reconciliation pass (single-flighted; 409 when one is running) |
-| GET | `/payment/v1/internal/payments/reconciliation/runs/{id}` | internal | Reconciliation run report + discrepancies |
-| GET | `/health`, `/ready`, `/metrics` | — | Probes + Prometheus metrics |
+| Area | Technology |
+|------|------------|
+| Runtime | Go 1.26 |
+| Transports | HTTP (private, internal, and a public webhook) · gRPC (east-west) |
+| Data | PostgreSQL |
+| Platform libraries | `authmw`, `dbx`, `grpcx`, `httpx`, `idempotency`, `logger/zapx`, `migratex`, `obsx`, `proto` |
 
-Amounts are always **integer minor units** (`2000` = $20.00) with an ISO-4217
-currency; payment methods are opaque test tokens — PAN-like data is never
-accepted, stored, or logged.
+Alongside the two servers the process runs background jobs on their own tickers:
+reconciliation, doubt resolution, hold expiry, retention reaping, and the outbox
+relay.
 
-## gRPC (east-west, `:9090`)
+## API
 
-The order saga's money transport — `payment.v1.PaymentService`, served
-unconditionally on `GRPC_PORT` (reflection off in-cluster):
+- **Canonical contract:** [`homelab/docs/api/payments.md`](https://github.com/duynhlab/homelab/blob/main/docs/api/payments.md)
+- **Shared conventions:** [`homelab/docs/api/api.md`](https://github.com/duynhlab/homelab/blob/main/docs/api/api.md)
+- **Surfaces:** JWT-protected HTTP for customer-facing reads and refunds, a
+  cluster-only internal group, an anonymous public webhook authenticated by HMAC,
+  and `payment.v1.PaymentService` east-west for the order saga. HTTP `:8080` also
+  carries `/health` and `/ready`.
 
-| RPC | Caller | Purpose |
-|-----|--------|---------|
-| `Authorize` | order-worker (saga) | Pre-pivot hold — a decline is a business response, not a gRPC error; idempotent by `order:<id>` |
-| `Capture` | order-worker (saga) | Capture before the pivot; idempotent |
-| `Void` | order-worker (compensation) | Release a pre-capture hold; idempotent |
-| `Refund` | order-worker (compensation) | Post-pivot refund; idempotent by `refund:order:<id>` |
-| `GetPayment` | order (API) | Payment snapshot by order id for order-details enrichment |
+Routes, payloads, error codes and idempotency headers live in the contract, so
+there is one place to change when they change.
 
-The same shared validators run on both the HTTP and gRPC paths, so the two
-surfaces cannot drift.
+## Run locally
 
-## Architecture — 3-layer
+Prefer the homelab **local-stack** — payment is only interesting with a checkout
+in front of it and a provider behind it.
 
-```
-internal/web/v1    Gin handlers: validation, JWT auth, error translation
-internal/logic/v1  Business rules: state machine, idempotent flows (owns ports)
-internal/core      domain · repository (Postgres/pgx) · provider port · database
-```
-
-Strict dependency direction: web → logic → core. The provider port ships with
-an in-memory stub; **mockpay** (the deterministic mock provider) is a
-subcommand of this binary (`go run ./cmd mockpay`), run as a second deployment.
-Background loops: the **transactional-outbox relay** (10 s, single-writer) and
-the **reconciliation ticker** (5 min, detect-only; `RECON_HEAL_ENABLED`
-flag-gates the one auto-heal class) — both are why the service runs
-**single-replica by design**.
-
-## Tech Stack
-
-Go 1.26 · Gin · PostgreSQL (pgx/v5, golang-migrate embedded) ·
-OpenTelemetry (traces via shared middleware) · Prometheus RED metrics ·
-Pyroscope profiling · shared `github.com/duynhlab/pkg` (authmw, httpx,
-migratex, obsx)
-
-## Configuration
-
-| Env | Default | Description |
-|-----|---------|-------------|
-| `PORT` | `8080` | HTTP listen port |
-| `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | — | Postgres (pooled) |
-| `DB_POOL_MAX_CONNECTIONS` | `30` | pgx pool cap |
-| `AUTH_JWKS_URL` / `JWT_ISSUER` / `JWT_AUDIENCE` | auth defaults | JWT verification (authmw) |
-| `AUTH_HOLD_TTL` | `168h` | Authorized-hold expiry |
-| `IDEMPOTENCY_KEY_TTL` | `24h` | Key retention before reaping |
-| `IDEMPOTENCY_LOCK_TAKEOVER` | `90s` | Stale in-flight lock takeover threshold |
-| `MOCKPAY_URL` | `""` | External provider URL (empty = in-memory stub, reconciliation disabled) |
-| `MOCKPAY_WEBHOOK_URL` / `MOCKPAY_WEBHOOK_SECRET` | `""` | Where mockpay POSTs signed webhooks + the shared HMAC secret |
-| `GRPC_PORT` | `9090` | gRPC listen port (`PaymentService`) |
-| `RECON_HEAL_ENABLED` | `false` | Flag-gated reconciliation auto-heal (ADR-012); default detect-only |
-| `OTEL_*`, `TRACING_ENABLED`, `PROFILING_ENABLED` | platform defaults | Observability |
-
-## Development
+The same binary also runs the mock provider, as a second deployment:
 
 ```bash
-go build ./...                       # build
-go test -race ./...                  # unit tests (no Docker)
-golangci-lint run                    # lint (must pass before PR)
-go test -tags=integration ./internal/core/repository/...  # repository tests (Docker)
-
-go run ./cmd migrate                 # apply schema
-go run ./cmd                         # serve :8080
+go run cmd/main.go migrate   # apply schema migrations
+go run cmd/main.go           # serve HTTP :8080 + gRPC :9090 + background jobs
+go run cmd/main.go mockpay   # run the mock payment provider instead
 ```
 
-### Pre-push checklist
+There is no `seed` subcommand — payment ships no demo data.
 
-`go build ./... && go vet ./... && golangci-lint run && go test -race ./...`,
-integration tests green, and the local-stack e2e pass (see the platform's
-`local-stack/README.md`).
+## Verify
+
+The commands CI runs, so a green local run means a green pipeline:
+
+```bash
+go build ./...
+go test -race ./...
+go test -tags=integration ./internal/core/repository/...   # needs Docker (testcontainers)
+golangci-lint run
+```
+
+## Docs
+
+- [Canonical contract](https://github.com/duynhlab/homelab/blob/main/docs/api/payments.md)
+- [local-stack guide](https://github.com/duynhlab/homelab/blob/main/local-stack/README.md)
+
+## License
+
+MIT
