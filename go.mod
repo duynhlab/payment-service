@@ -3,7 +3,7 @@ module github.com/duynhlab/payment-service
 go 1.26.2
 
 require (
-	github.com/duynhlab/pkg/authmw v0.37.0
+	github.com/duynhlab/pkg/authmw v0.37.1
 	github.com/duynhlab/pkg/dbx v0.36.1
 	github.com/duynhlab/pkg/grpcx v0.36.1
 	github.com/duynhlab/pkg/httpx v0.36.1
