@@ -134,10 +134,15 @@ func run() error {
 	defer pool.Close()
 	logger.Info("Database connection pool established")
 
-	// Local RS256 JWT verification (cached JWKS) is the only credential — no
-	// gRPC fallback. NewVerifier does not block on an unreachable JWKS — it
-	// refreshes in the background, so a verifier is safe to build at startup.
-	verifier, err := authmw.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.JWTAudience)
+	// Local RS256 OIDC JWT verification (cached JWKS) is the only credential —
+	// no gRPC fallback. The JWKS URL is derived from the Keycloak issuer unless
+	// OIDC_JWKS_URL overrides it. NewVerifier does not block on an unreachable
+	// JWKS — it refreshes in the background, so it is safe to build at startup.
+	verifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCJWKSURL,
+	})
 	if err != nil {
 		return fmt.Errorf("JWKS verifier init: %w", err)
 	}

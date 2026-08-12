@@ -27,7 +27,7 @@ func parkedCapture(t *testing.T, svc *Service, prov *failingProvider, key string
 		t.Fatal(err)
 	}
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("park err = %v, want ErrOutcomeUnknown", err)
 	}
 	prov.captureThenErr = nil
@@ -73,11 +73,11 @@ func TestSweep_UnreadableRefundLeavesTheEntryOpen(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-unreadable", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-unreadable", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-unreadable", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("park err = %v", err)
 	}
 	prov.refundThenErr = nil
@@ -98,11 +98,11 @@ func TestSweep_AlreadySettledRefundClosesWithoutAsking(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-settled", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-settled", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-settled", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("park err = %v", err)
 	}
 	// A caller's retry settles it while the entry is still open.
@@ -131,11 +131,11 @@ func TestSweep_DefinitivelyRefusedRefundIsRecordedFailed(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-refused", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-refused", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-refused", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("park err = %v", err)
 	}
 	prov.refundThenErr = nil
@@ -171,20 +171,20 @@ func TestSweep_StrayVoidIsAskedAndTheRowIsLeftAlone(t *testing.T) {
 			fp.transitionErr = domain.ErrStaleTransition
 		}
 	}
-	if _, err := svc.Void(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Void(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
 	}
 	fp.beforeTransition, fp.transitionErr = nil, nil
 	prov.voidThenErr = nil
 
-	statusBefore, _ := svc.Get(ctx, res.Payment.ID, 7)
+	statusBefore, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if _, err := svc.ResolveOpenDoubt(ctx, 10); err != nil {
 		t.Fatalf("sweep err = %v", err)
 	}
 	if prov.gotVoidKey == "" {
 		t.Fatal("the sweep closed the question without asking the provider")
 	}
-	after, _ := svc.Get(ctx, res.Payment.ID, 7)
+	after, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if after.Status != statusBefore.Status {
 		t.Fatalf("status moved %s -> %s; a stray answer must not overrule the row", statusBefore.Status, after.Status)
 	}
@@ -358,11 +358,11 @@ func TestSweep_SilentRefundStaysParked(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-silent", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-silent", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-silent", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("park err = %v", err)
 	}
 	// The provider is still silent when the sweep runs.
@@ -388,7 +388,7 @@ func capturedForSweep(t *testing.T, svc *Service, key string) *domain.Payment {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	return res.Payment

@@ -22,7 +22,7 @@ type erroringIdem struct {
 	claimErr, checkpointErr, finishErr, releaseErr error
 }
 
-func (e *erroringIdem) Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error) {
+func (e *erroringIdem) Claim(ctx context.Context, userID, key, method, path, hash string) (*idempotency.Record, bool, error) {
 	if e.claimErr != nil {
 		return nil, false, e.claimErr
 	}
@@ -83,7 +83,7 @@ func (e *erroringPayments) Create(ctx context.Context, p *domain.Payment) (*doma
 	return e.fakePayments.Create(ctx, p)
 }
 
-func (e *erroringPayments) FindByID(ctx context.Context, id, userID int64) (*domain.Payment, error) {
+func (e *erroringPayments) FindByID(ctx context.Context, id int64, userID string) (*domain.Payment, error) {
 	if e.findErr != nil {
 		return nil, e.findErr
 	}
@@ -137,7 +137,7 @@ func TestFinishIntent_FindErrorPropagates(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 	ep.findErr = errBoom
-	if _, err := svc.Get(context.Background(), res.Payment.ID, 7); !errors.Is(err, errBoom) {
+	if _, err := svc.Get(context.Background(), res.Payment.ID, "7"); !errors.Is(err, errBoom) {
 		t.Fatalf("find error must propagate, got %v", err)
 	}
 }
@@ -169,7 +169,7 @@ func TestCreateIntent_MapsIdempotencySentinels(t *testing.T) {
 func TestCreateRefund_MapsIdempotencySentinels(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: idempotency.ErrLocked}
 	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, domain.ErrKeyLocked) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, "7", 100, ""); !errors.Is(err, domain.ErrKeyLocked) {
 		t.Fatalf("want domain.ErrKeyLocked, got %v", err)
 	}
 }
@@ -178,7 +178,7 @@ func TestCreateRefund_ClaimError(t *testing.T) {
 	ei := &erroringIdem{fakeIdem: newFakeIdem(), claimErr: errBoom}
 	svc := NewService(&erroringPayments{fakePayments: newFakePayments()}, ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, 7, 100, ""); !errors.Is(err, errBoom) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 1, "7", 100, ""); !errors.Is(err, errBoom) {
 		t.Fatalf("claim error must propagate, got %v", err)
 	}
 }
@@ -186,7 +186,7 @@ func TestCreateRefund_ClaimError(t *testing.T) {
 func TestCreateRefund_PaymentLookupError(t *testing.T) {
 	svc := NewService(newFakePayments(), newFakeIdem(), provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, 7, 100, ""); !errors.Is(err, domain.ErrNotFound) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", 999, "7", 100, ""); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("missing payment must surface ErrNotFound, got %v", err)
 	}
 }
@@ -196,11 +196,11 @@ func TestCreateRefund_FinishError(t *testing.T) {
 	svc := NewService(newFakePayments(), ei, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-rf", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	ei.finishErr = errBoom
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 100, ""); !errors.Is(err, errBoom) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, "7", 100, ""); !errors.Is(err, errBoom) {
 		t.Fatalf("finish error must propagate, got %v", err)
 	}
 }
@@ -232,7 +232,7 @@ func TestCreateIntent_AdoptPendingOrderCompletesCharge(t *testing.T) {
 	svc, fp, _, stub := newTestService()
 	order := int64(61)
 	if _, err := fp.Create(context.Background(), &domain.Payment{
-		UserID: 7, OrderID: &order, AmountMinor: 2000, Currency: "USD",
+		UserID: "7", OrderID: &order, AmountMinor: 2000, Currency: "USD",
 		CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa",
 	}); err != nil {
 		t.Fatal(err)
@@ -279,7 +279,7 @@ func TestCreateIntent_AdoptCheckpointErrorPropagates(t *testing.T) {
 	order := int64(51)
 	// Seed a pending payment for the order directly (a prior crashed attempt).
 	if _, err := ep.fakePayments.Create(context.Background(), &domain.Payment{
-		UserID: 7, OrderID: &order, AmountMinor: 2000, Currency: "USD",
+		UserID: "7", OrderID: &order, AmountMinor: 2000, Currency: "USD",
 		CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa",
 	}); err != nil {
 		t.Fatal(err)
@@ -305,7 +305,7 @@ func TestCreateIntent_ReentryFindErrorPropagates(t *testing.T) {
 	fi.mu.Lock()
 	fi.seq++
 	fi.keys["k-re"] = &idempotency.Record{
-		ID: fi.seq, UserID: 7, Key: "k-re",
+		ID: fi.seq, UserID: "7", Key: "k-re",
 		RequestMethod: "POST", RequestPath: "/payment/v1/private/payments",
 		RequestHash: hashJSON(intent(2000)),
 		LockedAt:    time.Unix(0, 0), SubjectID: &pid,
@@ -329,7 +329,7 @@ func TestCapture_ProviderFailAndRollbackFail(t *testing.T) {
 	res, _ := svc.CreateIntent(context.Background(), "k-cf", intent(2000))
 	// Fail only the captured→authorized reversal.
 	ep.reverseErr = errBoom
-	_, err := svc.Capture(context.Background(), res.Payment.ID, 7)
+	_, err := svc.Capture(context.Background(), res.Payment.ID, "7")
 	if err == nil || !strings.Contains(err.Error(), "rollback failed") || !errors.Is(err, errBoom) {
 		t.Fatalf("want wrapped rollback-failed error, got %v", err)
 	}
@@ -347,7 +347,7 @@ func TestVoid_ProviderFailAndRollbackFail(t *testing.T) {
 		}
 		return nil
 	}
-	_, err := svc.Void(context.Background(), res.Payment.ID, 7)
+	_, err := svc.Void(context.Background(), res.Payment.ID, "7")
 	if err == nil || !strings.Contains(err.Error(), "rollback failed") || !errors.Is(err, errBoom) {
 		t.Fatalf("want wrapped rollback-failed error, got %v", err)
 	}
@@ -362,7 +362,7 @@ func TestReloadAfterRace_FindError(t *testing.T) {
 	// Force the CAS to lose while the status is in fact unchanged (still
 	// authorized): reloadAfterRace must report the conflict, not succeed.
 	ep.captureErr = domain.ErrStaleTransition
-	pay, err := svc.Capture(context.Background(), res.Payment.ID, 7)
+	pay, err := svc.Capture(context.Background(), res.Payment.ID, "7")
 	if err == nil || pay != nil {
 		t.Fatalf("stale CAS with unchanged state must conflict, got pay=%v err=%v", pay, err)
 	}

@@ -15,7 +15,7 @@ import (
 // transaction, keyed by internal payment id.
 type LedgerCapturer interface {
 	CaptureWithLedger(ctx context.Context, id int64, capturedAt time.Time) error
-	FindByID(ctx context.Context, id, userID int64) (*domain.Payment, error)
+	FindByID(ctx context.Context, id int64, userID string) (*domain.Payment, error)
 }
 
 // CaptureHealer is the ADR-012 convergence for the lost-capture-response window:
@@ -45,7 +45,7 @@ func (h *CaptureHealer) HealCapture(ctx context.Context, paymentID int64) (bool,
 	case err == nil:
 		return true, nil
 	case errors.Is(err, domain.ErrStaleTransition):
-		p, ferr := h.capturer.FindByID(ctx, paymentID, 0)
+		p, ferr := h.capturer.FindByID(ctx, paymentID, "")
 		if ferr != nil {
 			return false, ferr
 		}

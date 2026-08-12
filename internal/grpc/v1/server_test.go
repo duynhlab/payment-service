@@ -35,10 +35,12 @@ type fakeLogic struct {
 	gotInput    logicv1.CreateIntentInput
 	gotRefundID string
 
-	// captured call args, to lock the sagaUserID=0 + looked-up-paymentID wiring
-	gotCapPayID, gotCapUserID       int64
-	gotRefundPayID, gotRefundUserID int64
-	gotByOrderID                    int64
+	// captured call args, to lock the sagaUserID="" + looked-up-paymentID wiring
+	gotCapPayID    int64
+	gotCapUserID   string
+	gotRefundPayID int64
+	gotRefundUser  string
+	gotByOrderID   int64
 }
 
 func (f *fakeLogic) CreateIntent(_ context.Context, idemKey string, in logicv1.CreateIntentInput) (*logicv1.IntentResult, error) {
@@ -49,20 +51,20 @@ func (f *fakeLogic) GetByOrderID(_ context.Context, orderID int64) (*domain.Paym
 	f.gotByOrderID = orderID
 	return f.byOrder, f.byOrderErr
 }
-func (f *fakeLogic) Capture(_ context.Context, paymentID, userID int64) (*domain.Payment, error) {
+func (f *fakeLogic) Capture(_ context.Context, paymentID int64, userID string) (*domain.Payment, error) {
 	f.gotCapPayID, f.gotCapUserID = paymentID, userID
 	return f.captured, f.captureErr
 }
-func (f *fakeLogic) Void(_ context.Context, _, _ int64) (*domain.Payment, error) {
+func (f *fakeLogic) Void(_ context.Context, _ int64, _ string) (*domain.Payment, error) {
 	return f.voided, f.voidErr
 }
-func (f *fakeLogic) CreateRefund(_ context.Context, idemKey string, paymentID, userID, _ int64, _ string) (*domain.Refund, bool, error) {
-	f.gotRefundID, f.gotRefundPayID, f.gotRefundUserID = idemKey, paymentID, userID
+func (f *fakeLogic) CreateRefund(_ context.Context, idemKey string, paymentID int64, userID string, _ int64, _ string) (*domain.Refund, bool, error) {
+	f.gotRefundID, f.gotRefundPayID, f.gotRefundUser = idemKey, paymentID, userID
 	return f.refund, false, f.refundErr
 }
 
 func authReq() *paymentv1.AuthorizeRequest {
-	return &paymentv1.AuthorizeRequest{OrderId: 42, UserId: 7, AmountMinor: 5000, Currency: "USD", PaymentMethod: "tok_visa"}
+	return &paymentv1.AuthorizeRequest{OrderId: 42, UserId: "a11ce000-0000-4000-8000-000000000001", AmountMinor: 5000, Currency: "USD", PaymentMethod: "tok_visa"}
 }
 
 func TestAuthorize_OK(t *testing.T) {
@@ -82,6 +84,9 @@ func TestAuthorize_OK(t *testing.T) {
 	if f.gotInput.CaptureMethod != domain.CaptureManual {
 		t.Fatalf("saga authorize must be manual capture, got %q", f.gotInput.CaptureMethod)
 	}
+	if f.gotInput.UserID != "a11ce000-0000-4000-8000-000000000001" {
+		t.Fatalf("the opaque string subject must pass through verbatim, got %q", f.gotInput.UserID)
+	}
 }
 
 func TestAuthorize_DeclineIsNotAnError(t *testing.T) {
@@ -99,15 +104,18 @@ func TestAuthorize_DeclineIsNotAnError(t *testing.T) {
 
 func TestAuthorize_Validation(t *testing.T) {
 	// The gRPC path must enforce the same money invariants as the HTTP path:
-	// positive ids, amount within the ledger ceiling, valid currency, PCI-safe token.
+	// positive order id, a non-empty bounded subject (the <=0 check died with
+	// the numeric user id — ADR-042), amount within the ledger ceiling, valid
+	// currency, PCI-safe token.
 	for _, r := range []*paymentv1.AuthorizeRequest{
-		{OrderId: 0, UserId: 7, AmountMinor: 1, PaymentMethod: "tok_visa"},
-		{OrderId: 1, UserId: 0, AmountMinor: 1, PaymentMethod: "tok_visa"},
-		{OrderId: 1, UserId: 7, AmountMinor: 0, PaymentMethod: "tok_visa"},
-		{OrderId: 1, UserId: 7, AmountMinor: logicv1.MaxAmountMinor + 1, PaymentMethod: "tok_visa"}, // over ceiling
-		{OrderId: 1, UserId: 7, AmountMinor: 5000, Currency: "US", PaymentMethod: "tok_visa"},       // bad currency
-		{OrderId: 1, UserId: 7, AmountMinor: 5000, PaymentMethod: "tok_4111111111111111"},           // PAN, not a token
-		{OrderId: 1, UserId: 7, AmountMinor: 5000, PaymentMethod: ""},                               // missing token
+		{OrderId: 0, UserId: "7", AmountMinor: 1, PaymentMethod: "tok_visa"},
+		{OrderId: 1, UserId: "", AmountMinor: 1, PaymentMethod: "tok_visa"},                              // empty subject
+		{OrderId: 1, UserId: strings.Repeat("x", maxUserIDLen+1), AmountMinor: 1, PaymentMethod: "tok_visa"}, // over the VARCHAR(255) bound
+		{OrderId: 1, UserId: "7", AmountMinor: 0, PaymentMethod: "tok_visa"},
+		{OrderId: 1, UserId: "7", AmountMinor: logicv1.MaxAmountMinor + 1, PaymentMethod: "tok_visa"}, // over ceiling
+		{OrderId: 1, UserId: "7", AmountMinor: 5000, Currency: "US", PaymentMethod: "tok_visa"},       // bad currency
+		{OrderId: 1, UserId: "7", AmountMinor: 5000, PaymentMethod: "tok_4111111111111111"},           // PAN, not a token
+		{OrderId: 1, UserId: "7", AmountMinor: 5000, PaymentMethod: ""},                               // missing token
 	} {
 		if _, err := NewServer(&fakeLogic{}).Authorize(context.Background(), r); status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("want InvalidArgument for %+v, got %v", r, err)
@@ -119,7 +127,7 @@ func TestAuthorize_DefaultsCurrencyToUSD(t *testing.T) {
 	oid := int64(42)
 	f := &fakeLogic{intent: &logicv1.IntentResult{Code: 201, Payment: &domain.Payment{
 		ID: 1, OrderID: &oid, Status: domain.StatusAuthorized}}}
-	req := &paymentv1.AuthorizeRequest{OrderId: 42, UserId: 7, AmountMinor: 5000, Currency: "", PaymentMethod: "tok_visa"}
+	req := &paymentv1.AuthorizeRequest{OrderId: 42, UserId: "7", AmountMinor: 5000, Currency: "", PaymentMethod: "tok_visa"}
 	if _, err := NewServer(f).Authorize(context.Background(), req); err != nil {
 		t.Fatalf("authorize: %v", err)
 	}
@@ -155,8 +163,8 @@ func TestCapture(t *testing.T) {
 		if err != nil || resp.GetPayment().GetStatus() != "captured" {
 			t.Fatalf("capture: %v %+v", err, resp.GetPayment())
 		}
-		if f.gotCapPayID != pay.ID || f.gotCapUserID != 0 {
-			t.Fatalf("capture must use the looked-up payment id as the unscoped saga owner, got id=%d user=%d", f.gotCapPayID, f.gotCapUserID)
+		if f.gotCapPayID != pay.ID || f.gotCapUserID != "" {
+			t.Fatalf("capture must use the looked-up payment id as the unscoped saga owner, got id=%d user=%q", f.gotCapPayID, f.gotCapUserID)
 		}
 	})
 	t.Run("unknown order → NotFound", func(t *testing.T) {
@@ -213,8 +221,8 @@ func TestRefund(t *testing.T) {
 		if f.gotRefundID != "refund:order:42" {
 			t.Fatalf("refund key must be refund:order:42, got %q", f.gotRefundID)
 		}
-		if f.gotRefundPayID != pay.ID || f.gotRefundUserID != 0 {
-			t.Fatalf("refund must use the looked-up payment id as the unscoped saga owner, got id=%d user=%d", f.gotRefundPayID, f.gotRefundUserID)
+		if f.gotRefundPayID != pay.ID || f.gotRefundUser != "" {
+			t.Fatalf("refund must use the looked-up payment id as the unscoped saga owner, got id=%d user=%q", f.gotRefundPayID, f.gotRefundUser)
 		}
 	})
 	t.Run("rejected → FailedPrecondition", func(t *testing.T) {

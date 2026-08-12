@@ -67,12 +67,12 @@ func (r *PaymentRepository) Create(ctx context.Context, p *domain.Payment) (*dom
 	return created, err
 }
 
-// FindByID fetches one payment scoped to its owner (userID 0 = unscoped,
+// FindByID fetches one payment scoped to its owner (userID "" = unscoped,
 // for internal/saga callers).
-func (r *PaymentRepository) FindByID(ctx context.Context, id, userID int64) (*domain.Payment, error) {
+func (r *PaymentRepository) FindByID(ctx context.Context, id int64, userID string) (*domain.Payment, error) {
 	q := `SELECT ` + paymentColumns + ` FROM payments WHERE id = $1`
 	args := []any{id}
-	if userID != 0 {
+	if userID != "" {
 		q += ` AND user_id = $2`
 		args = append(args, userID)
 	}
@@ -86,7 +86,7 @@ func (r *PaymentRepository) FindByOrderID(ctx context.Context, orderID int64) (*
 }
 
 // ListByUser returns a page of the user's payments plus the total count.
-func (r *PaymentRepository) ListByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Payment, int, error) {
+func (r *PaymentRepository) ListByUser(ctx context.Context, userID string, limit, offset int) ([]domain.Payment, int, error) {
 	rows, err := r.pool.Query(ctx,
 		`SELECT `+paymentColumns+` FROM payments
 		 WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,

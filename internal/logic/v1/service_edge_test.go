@@ -134,11 +134,11 @@ func TestCreateRefund_ProviderUnknownNeverSealsTheKey(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-unk", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, 7, 500, "")
+	_, _, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("unknown provider outcome err = %v, want ErrRefundNotSettled", err)
 	}
@@ -156,7 +156,7 @@ func TestCreateRefund_ProviderUnknownNeverSealsTheKey(t *testing.T) {
 	// The same key must re-drive the provider rather than replay a sealed
 	// verdict. With the provider recovered, the retry settles for real.
 	prov.refundErr = nil
-	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, 7, 500, "")
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-unk", res.Payment.ID, "7", 500, "")
 	if err != nil {
 		t.Fatalf("retry after recovery: %v", err)
 	}
@@ -180,11 +180,11 @@ func TestCreateRefund_ProviderDeclineIsDefinite(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-dec", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 
-	_, _, err := svc.CreateRefund(context.Background(), "rk-dec", res.Payment.ID, 7, 500, "")
+	_, _, err := svc.CreateRefund(context.Background(), "rk-dec", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrRefundDeclined) {
 		t.Fatalf("declined refund err = %v, want ErrRefundDeclined", err)
 	}
@@ -199,7 +199,7 @@ func TestCreateRefund_ProviderDeclineIsDefinite(t *testing.T) {
 
 	// A definite decline released the reserve, so the full amount is refundable.
 	prov.refundErr = nil
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-dec2", res.Payment.ID, 7, 2000, ""); err != nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-dec2", res.Payment.ID, "7", 2000, ""); err != nil {
 		t.Fatalf("full refund after a definite decline must pass, got %v", err)
 	}
 }
@@ -216,10 +216,10 @@ func TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-adopt", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
 		t.Fatalf("first attempt err = %v, want ErrRefundDeclined", err)
 	}
 
@@ -228,7 +228,7 @@ func TestCreateRefund_RetryAfterDeclineIsNotACachedSuccess(t *testing.T) {
 	// the DECLINE's certainty, so the saga stops instead of retrying a decision
 	// the provider already made.
 	prov.refundErr = nil
-	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, 7, 500, "")
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk-adopt", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrRefundDeclined) {
 		t.Fatalf("retry of a declined refund err = %v (ref %+v, replayed %v), want ErrRefundDeclined",
 			err, ref, replayed)
@@ -247,20 +247,20 @@ func TestCreateRefund_UnknownReleasesKeyOnADeadContext(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-dead", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 
 	// A context that is already cancelled when the refund attempt gives up.
 	dead, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, err := svc.CreateRefund(dead, "rk-dead", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(dead, "rk-dead", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("err = %v, want ErrRefundNotSettled", err)
 	}
 
 	// The key must be usable again on a live context — not locked out.
 	prov.refundErr = nil
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-dead", res.Payment.ID, 7, 500, ""); err != nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-dead", res.Payment.ID, "7", 500, ""); err != nil {
 		t.Fatalf("same-key retry after a dead-context failure: %v (key left locked?)", err)
 	}
 }
@@ -277,10 +277,10 @@ func TestCreateRefund_DefiniteFailureIsNotRetried(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-def", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-def", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-def", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundDeclined) {
 		t.Fatalf("definite failure err = %v, want ErrRefundDeclined (not retryable)", err)
 	}
 	for _, r := range fp.refs {
@@ -299,11 +299,11 @@ func TestCreateRefund_SettleFailureAfterMoneyMovedStaysOpen(t *testing.T) {
 	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-settle", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	fp.settleRefundErr = errors.New("db gone")
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-settle", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-settle", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("settle failure err = %v, want ErrRefundNotSettled", err)
 	}
 }
@@ -321,10 +321,10 @@ func TestCreateRefund_ReleaseFailureIsSurfacedNotSwallowed(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-rel", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := svc.CreateRefund(context.Background(), "rk-rel", res.Payment.ID, 7, 500, "")
+	_, _, err := svc.CreateRefund(context.Background(), "rk-rel", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("err = %v, want the refund's own ErrRefundNotSettled", err)
 	}
@@ -344,11 +344,11 @@ func TestCreateRefund_DeclineRecordFailureReopensTheOutcome(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-drf", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	fp.settleRefundErr = errors.New("db gone")
-	_, _, err := svc.CreateRefund(context.Background(), "rk-drf", res.Payment.ID, 7, 500, "")
+	_, _, err := svc.CreateRefund(context.Background(), "rk-drf", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("err = %v, want ErrRefundNotSettled (the decline was not recorded)", err)
 	}
@@ -364,10 +364,10 @@ func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
 	svc := NewService(fp, fi, provider.NewStub(), 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-weird", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, 7, 500, ""); err != nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, "7", 500, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Force a state the FSM does not produce, then replay the key past its seal.
@@ -380,7 +380,7 @@ func TestCreateRefund_AdoptedRowInAnUnexpectedStateIsNotSealed(t *testing.T) {
 			k.LockedAt = time.Unix(0, 0)
 		}
 	}
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-weird", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("err = %v, want ErrRefundNotSettled for an unexpected status", err)
 	}
 }
@@ -394,7 +394,7 @@ func TestCaptureVoid_CarryADeterministicProviderKey(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-key", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	want := fmt.Sprintf("capture:payment:%d", res.Payment.ID)
@@ -403,7 +403,7 @@ func TestCaptureVoid_CarryADeterministicProviderKey(t *testing.T) {
 	}
 
 	res2, _ := svc.CreateIntent(context.Background(), "k-key2", intent(3000))
-	if _, err := svc.Void(context.Background(), res2.Payment.ID, 7); err != nil {
+	if _, err := svc.Void(context.Background(), res2.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	if want := fmt.Sprintf("void:payment:%d", res2.Payment.ID); prov.gotVoidKey != want {
@@ -423,7 +423,7 @@ func TestCreateRefund_RejectedByState(t *testing.T) {
 		},
 		"voided": func(t *testing.T, svc *Service) int64 {
 			res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
-			if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err != nil {
+			if _, err := svc.Void(context.Background(), res.Payment.ID, "7"); err != nil {
 				t.Fatal(err)
 			}
 			return res.Payment.ID
@@ -437,7 +437,7 @@ func TestCreateRefund_RejectedByState(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			svc, _, _, _ := newTestService()
 			id := setup(t, svc)
-			_, _, err := svc.CreateRefund(context.Background(), "rk-"+name, id, 7, 500, "")
+			_, _, err := svc.CreateRefund(context.Background(), "rk-"+name, id, "7", 500, "")
 			if !errors.Is(err, domain.ErrRefundRejected) {
 				t.Fatalf("refund on %s must be rejected, got %v", name, err)
 			}
@@ -458,10 +458,10 @@ func TestCapture_DecidedFailureRollsBackToAuthorized(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "capture down") {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err == nil || !strings.Contains(err.Error(), "capture down") {
 		t.Fatalf("capture provider error must propagate, got %v", err)
 	}
-	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	got, err := svc.Get(context.Background(), res.Payment.ID, "7")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,10 +478,10 @@ func TestVoid_DecidedFailureRollsBackToAuthorized(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-void", intent(2000))
-	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err == nil || !strings.Contains(err.Error(), "void down") {
+	if _, err := svc.Void(context.Background(), res.Payment.ID, "7"); err == nil || !strings.Contains(err.Error(), "void down") {
 		t.Fatalf("void provider error must propagate, got %v", err)
 	}
-	got, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	got, err := svc.Get(context.Background(), res.Payment.ID, "7")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,11 +501,11 @@ func TestCapture_UnknownOutcomeParksInsteadOfReversing(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cu", intent(2000))
-	_, err := svc.Capture(context.Background(), res.Payment.ID, 7)
+	_, err := svc.Capture(context.Background(), res.Payment.ID, "7")
 	if !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("capture err = %v, want ErrOutcomeUnknown", err)
 	}
-	got, gerr := svc.Get(context.Background(), res.Payment.ID, 7)
+	got, gerr := svc.Get(context.Background(), res.Payment.ID, "7")
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
@@ -527,10 +527,10 @@ func TestVoid_UnknownOutcomeParksInsteadOfRollingBack(t *testing.T) {
 	svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(&recordingAttempts{}))
 
 	res, _ := svc.CreateIntent(context.Background(), "k-vu", intent(2000))
-	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Void(context.Background(), res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("void err = %v, want ErrOutcomeUnknown", err)
 	}
-	got, _ := svc.Get(context.Background(), res.Payment.ID, 7)
+	got, _ := svc.Get(context.Background(), res.Payment.ID, "7")
 	if got.Status != domain.StatusProcessing {
 		t.Fatalf("status = %s, want processing", got.Status)
 	}
@@ -582,7 +582,7 @@ func TestAttemptLog_RecordsOneRowPerRoundTripWithItsClass(t *testing.T) {
 			svc := NewService(fp, fi, prov, 168*time.Hour, WithAttempts(rec))
 
 			res, _ := svc.CreateIntent(context.Background(), "k-att-"+tc.name, intent(2000))
-			_, _ = svc.Capture(context.Background(), res.Payment.ID, 7)
+			_, _ = svc.Capture(context.Background(), res.Payment.ID, "7")
 
 			var captures []domain.Attempt
 			for _, a := range rec.got {
@@ -633,7 +633,7 @@ func TestAttemptLog_WriteFailureRefusesToPark(t *testing.T) {
 	if !errors.Is(capErr, domain.ErrOutcomeUnknown) {
 		t.Fatalf("err = %v, want ErrOutcomeUnknown", capErr)
 	}
-	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	got, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if got.Status == domain.StatusProcessing {
 		t.Fatal("parked with no attempt row: nothing could ever resolve this payment")
 	}
@@ -646,7 +646,7 @@ func TestAttemptLog_WriteFailureRefusesToPark(t *testing.T) {
 // on WHICH error rather than on the ceremony of demanding one.
 func mustCaptureErr(t *testing.T, svc *Service, ctx context.Context, paymentID int64) error {
 	t.Helper()
-	_, err := svc.Capture(ctx, paymentID, 7)
+	_, err := svc.Capture(ctx, paymentID, "7")
 	if err == nil {
 		t.Fatal("capture succeeded, want the unknown outcome reported")
 	}
@@ -729,7 +729,7 @@ func (r *recordingAttempts) Resolve(_ context.Context, attemptID int64, at time.
 
 func TestVoid_NotFound(t *testing.T) {
 	svc, _, _, _ := newTestService()
-	if _, err := svc.Void(context.Background(), 999, 7); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := svc.Void(context.Background(), 999, "7"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("voiding a missing payment must return ErrNotFound, got %v", err)
 	}
 }
@@ -742,8 +742,8 @@ func TestConcurrentCaptureAndVoid_OnlyOneWins(t *testing.T) {
 	var wg sync.WaitGroup
 	var capErr, voidErr error
 	wg.Add(2)
-	go func() { defer wg.Done(); _, capErr = svc.Capture(context.Background(), id, 7) }()
-	go func() { defer wg.Done(); _, voidErr = svc.Void(context.Background(), id, 7) }()
+	go func() { defer wg.Done(); _, capErr = svc.Capture(context.Background(), id, "7") }()
+	go func() { defer wg.Done(); _, voidErr = svc.Void(context.Background(), id, "7") }()
 	wg.Wait()
 
 	// Exactly one side wins; the loser sees an invalid-transition conflict.
@@ -761,7 +761,7 @@ func TestConcurrentCaptureAndVoid_OnlyOneWins(t *testing.T) {
 
 func TestCapture_NotFound(t *testing.T) {
 	svc, _, _, _ := newTestService()
-	if _, err := svc.Capture(context.Background(), 999, 7); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := svc.Capture(context.Background(), 999, "7"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("capturing a missing payment must return ErrNotFound, got %v", err)
 	}
 }
@@ -769,7 +769,7 @@ func TestCapture_NotFound(t *testing.T) {
 func TestGet_ForeignUserScoped(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "k-owner", intent(2000))
-	if _, err := svc.Get(context.Background(), res.Payment.ID, 8); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := svc.Get(context.Background(), res.Payment.ID, "8"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("a foreign user must not see the payment, got %v", err)
 	}
 }
@@ -781,16 +781,16 @@ func TestList_Pagination(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	items, total, err := svc.List(context.Background(), 7, 1, 2)
+	items, total, err := svc.List(context.Background(), "7", 1, 2)
 	if err != nil || total != 3 || len(items) != 2 {
 		t.Fatalf("page1: err=%v total=%d len=%d", err, total, len(items))
 	}
-	items, _, _ = svc.List(context.Background(), 7, 2, 2)
+	items, _, _ = svc.List(context.Background(), "7", 2, 2)
 	if len(items) != 1 {
 		t.Fatalf("page2 len=%d, want 1", len(items))
 	}
 	// Page beyond the last still reports the true total with an empty page.
-	items, total, err = svc.List(context.Background(), 7, 99, 2)
+	items, total, err = svc.List(context.Background(), "7", 99, 2)
 	if err != nil || total != 3 || len(items) != 0 {
 		t.Fatalf("page-beyond: err=%v total=%d len=%d, want total=3 len=0", err, total, len(items))
 	}
@@ -822,10 +822,10 @@ func TestReplayResult_CorruptCache(t *testing.T) {
 func TestCreateRefund_CorruptCache(t *testing.T) {
 	svc, _, fi, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "k-cc", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-cc", res.Payment.ID, 7, 500, ""); err != nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-cc", res.Payment.ID, "7", 500, ""); err != nil {
 		t.Fatal(err)
 	}
 	fi.mu.Lock()
@@ -835,7 +835,7 @@ func TestCreateRefund_CorruptCache(t *testing.T) {
 		}
 	}
 	fi.mu.Unlock()
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-cc", res.Payment.ID, 7, 500, ""); err == nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-cc", res.Payment.ID, "7", 500, ""); err == nil {
 		t.Fatal("corrupt refund cache must error")
 	}
 }
@@ -850,12 +850,12 @@ func TestCreateRefund_TakeoverAdoptsSettledRefund(t *testing.T) {
 	svc := NewService(fp, ei, prov, 168*time.Hour)
 
 	res, _ := svc.CreateIntent(context.Background(), "k-cap", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	// First refund settles, but Finish fails → key left unfinished.
 	ei.finishErr = errBoom
-	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 500, "damaged"); !errors.Is(err, errBoom) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, "7", 500, "damaged"); !errors.Is(err, errBoom) {
 		t.Fatalf("setup: want finish error, got %v", err)
 	}
 	fp.mu.Lock()
@@ -872,7 +872,7 @@ func TestCreateRefund_TakeoverAdoptsSettledRefund(t *testing.T) {
 	}
 	ei.mu.Unlock()
 
-	ref, replayed, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, 7, 500, "damaged")
+	ref, replayed, err := svc.CreateRefund(context.Background(), "rk", res.Payment.ID, "7", 500, "damaged")
 	if err != nil {
 		t.Fatalf("takeover retry: %v", err)
 	}

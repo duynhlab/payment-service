@@ -92,7 +92,9 @@ migratex, obsx)
 | `PORT` | `8080` | HTTP listen port |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | — | Postgres (pooled) |
 | `DB_POOL_MAX_CONNECTIONS` | `30` | pgx pool cap |
-| `AUTH_JWKS_URL` / `JWT_ISSUER` / `JWT_AUDIENCE` | auth defaults | JWT verification (authmw) |
+| `OIDC_ISSUER` | `https://id.duynh.me/realms/duynhlab` | Expected OIDC issuer (`iss`, exact match) — Keycloak realm (authmw) |
+| `OIDC_AUDIENCE` | `duynhlab-platform` | Expected audience (`aud` containment) |
+| `OIDC_JWKS_URL` | `""` | Optional JWKS override (empty = `<issuer>/protocol/openid-connect/certs`) |
 | `AUTH_HOLD_TTL` | `168h` | Authorized-hold expiry |
 | `IDEMPOTENCY_KEY_TTL` | `24h` | Key retention before reaping |
 | `IDEMPOTENCY_LOCK_TAKEOVER` | `90s` | Stale in-flight lock takeover threshold |

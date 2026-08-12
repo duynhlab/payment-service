@@ -29,9 +29,9 @@ const errAuthRequired = "Authentication required"
 // *logicv1.Service satisfies it; kept as an interface so handlers are testable.
 type paymentLogic interface {
 	CreateIntent(ctx context.Context, idemKey string, in logicv1.CreateIntentInput) (*logicv1.IntentResult, error)
-	Get(ctx context.Context, id, userID int64) (*domain.Payment, error)
-	List(ctx context.Context, userID int64, page, pageSize int) ([]domain.Payment, int, error)
-	CreateRefund(ctx context.Context, idemKey string, paymentID, userID, amountMinor int64, reason string) (*domain.Refund, bool, error)
+	Get(ctx context.Context, id int64, userID string) (*domain.Payment, error)
+	List(ctx context.Context, userID string, page, pageSize int) ([]domain.Payment, int, error)
+	CreateRefund(ctx context.Context, idemKey string, paymentID int64, userID string, amountMinor int64, reason string) (*domain.Refund, bool, error)
 }
 
 // Handler is the payment web-layer handler.
@@ -46,7 +46,7 @@ func NewHandler(logic paymentLogic) *Handler {
 
 // RegisterRoutes mounts the payment v1 routes on the engine. Private routes
 // carry the edge JWT gate; internal routes are cluster-only (NetworkPolicy is
-// the fence) and run with user scope 0.
+// the fence) and run unscoped (empty user).
 func RegisterRoutes(r *gin.Engine, h *Handler, verifier *authmw.Verifier) {
 	h.mount(r, authmw.MiddlewareJWT(verifier))
 }
@@ -77,18 +77,19 @@ func beginRequest(c *gin.Context) (context.Context, trace.Span, *zap.Logger) {
 	return ctx, trace.SpanFromContext(ctx), middleware.GetLoggerFromGinContext(c)
 }
 
-// beginAuthed resolves the otelgin server span and the authenticated user id
-// from the JWT claims set by authmw — never from the request body. On missing
-// or non-numeric claims it writes 401 and returns ok=false (the caller must
-// return immediately). The returned span is the server span — annotate it, but
-// do not end it (otelgin owns its lifecycle).
-func beginAuthed(c *gin.Context, op string) (context.Context, trace.Span, *zap.Logger, int64, bool) {
+// beginAuthed resolves the otelgin server span and the authenticated user id —
+// the OIDC token subject, an opaque string (ADR-042) — from the JWT claims set
+// by authmw, never from the request body. On a missing or empty subject it
+// writes 401 and returns ok=false (the caller must return immediately). The
+// returned span is the server span — annotate it, but do not end it (otelgin
+// owns its lifecycle).
+func beginAuthed(c *gin.Context, op string) (context.Context, trace.Span, *zap.Logger, string, bool) {
 	ctx, span, zapLogger := beginRequest(c)
-	userID, err := strconv.ParseInt(c.GetString(authmw.CtxUserID), 10, 64)
-	if err != nil || userID <= 0 {
+	userID := c.GetString(authmw.CtxUserID)
+	if userID == "" {
 		zapLogger.Warn(op + ": no valid user_id in context")
 		httpx.RespondError(c, http.StatusUnauthorized, httpx.CodeUnauthorized, errAuthRequired)
-		return ctx, span, zapLogger, 0, false
+		return ctx, span, zapLogger, "", false
 	}
 	return ctx, span, zapLogger, userID, true
 }
@@ -177,7 +178,7 @@ type createPaymentRequest struct {
 
 // toInput validates the request, applies defaults (USD, manual capture), and
 // builds the logic-layer input. A non-empty message means 400 VALIDATION_ERROR.
-func (r *createPaymentRequest) toInput(userID int64) (logicv1.CreateIntentInput, string) {
+func (r *createPaymentRequest) toInput(userID string) (logicv1.CreateIntentInput, string) {
 	var in logicv1.CreateIntentInput
 	if r.AmountMinor <= 0 {
 		return in, "amount_minor must be a positive integer (minor units)"
@@ -316,7 +317,7 @@ type createRefundRequest struct {
 
 // CreateRefund handles POST /payment/v1/internal/payments/:id/refunds — the
 // idempotent (partial) refund flow. Internal audience: no JWT (the route is
-// cluster-only behind NetworkPolicy), so lookups run unscoped (user 0).
+// cluster-only behind NetworkPolicy), so lookups run unscoped (empty user).
 func (h *Handler) CreateRefund(c *gin.Context) {
 	ctx, span, zapLogger := beginRequest(c)
 
@@ -343,7 +344,7 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 		return
 	}
 
-	ref, replayed, err := h.logic.CreateRefund(ctx, idemKey, paymentID, 0, req.AmountMinor, req.Reason)
+	ref, replayed, err := h.logic.CreateRefund(ctx, idemKey, paymentID, "", req.AmountMinor, req.Reason)
 	if err != nil {
 		span.RecordError(err)
 		zapLogger.Error("CreateRefund: refund failed", zap.Int64(logFieldPaymentID, paymentID), zap.Error(err))

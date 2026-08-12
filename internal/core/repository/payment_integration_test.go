@@ -111,7 +111,7 @@ func applyMigrations(t *testing.T, ctx context.Context, dsn string) {
 	}
 }
 
-func createPending(t *testing.T, repo *PaymentRepository, userID int64, orderID *int64, amount int64) *domain.Payment {
+func createPending(t *testing.T, repo *PaymentRepository, userID string, orderID *int64, amount int64) *domain.Payment {
 	t.Helper()
 	p, err := repo.Create(context.Background(), &domain.Payment{
 		UserID: userID, OrderID: orderID, AmountMinor: amount, Currency: "USD",
@@ -129,14 +129,14 @@ func TestPaymentRepository_Integration(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("create and owner-scoped find", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 2000)
+		p := createPending(t, repo, "7", nil, 2000)
 		if p.Status != domain.StatusPending || p.Currency != "USD" {
 			t.Fatalf("unexpected payment %+v", p)
 		}
-		if _, err := repo.FindByID(ctx, p.ID, 8); !errors.Is(err, domain.ErrNotFound) {
+		if _, err := repo.FindByID(ctx, p.ID, "8"); !errors.Is(err, domain.ErrNotFound) {
 			t.Fatalf("foreign user must not see it: %v", err)
 		}
-		got, err := repo.FindByID(ctx, p.ID, 7)
+		got, err := repo.FindByID(ctx, p.ID, "7")
 		if err != nil || got.ID != p.ID {
 			t.Fatalf("owner find: %v", err)
 		}
@@ -144,8 +144,8 @@ func TestPaymentRepository_Integration(t *testing.T) {
 
 	t.Run("unique order_id maps to ErrPaymentExists", func(t *testing.T) {
 		order := int64(101)
-		createPending(t, repo, 7, &order, 2000)
-		if _, err := repo.Create(ctx, &domain.Payment{UserID: 7, OrderID: &order, AmountMinor: 900,
+		createPending(t, repo, "7", &order, 2000)
+		if _, err := repo.Create(ctx, &domain.Payment{UserID: "7", OrderID: &order, AmountMinor: 900,
 			Currency: "USD", CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa"}); !errors.Is(err, domain.ErrPaymentExists) {
 			t.Fatalf("duplicate order payment: %v", err)
 		}
@@ -156,7 +156,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("CAS transition: concurrent capture vs void, one winner", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 2000)
+		p := createPending(t, repo, "7", nil, 2000)
 		if err := repo.TransitionStatus(ctx, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_1", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)}); err != nil {
 			t.Fatalf("authorize: %v", err)
@@ -193,7 +193,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("expiry job flips stale authorized holds", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 2000)
+		p := createPending(t, repo, "7", nil, 2000)
 		past := time.Now().Add(-time.Minute)
 		if err := repo.TransitionStatus(ctx, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_2", "authorized_at": past, "expires_at": past}); err != nil {
@@ -203,14 +203,14 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if err != nil || n < 1 {
 			t.Fatalf("expire: n=%d err=%v", n, err)
 		}
-		got, _ := repo.FindByID(ctx, p.ID, 0)
+		got, _ := repo.FindByID(ctx, p.ID, "")
 		if got.Status != domain.StatusExpired {
 			t.Fatalf("status=%s, want expired", got.Status)
 		}
 	})
 
 	t.Run("guarded refunds: partial accumulate, oversubscribe rejected, full flips status", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 2000)
+		p := createPending(t, repo, "7", nil, 2000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_3", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
@@ -227,7 +227,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if err := repo.SettleRefund(ctx, r1.ID, domain.RefundSucceeded, "re_1"); err != nil {
 			t.Fatalf("settle: %v", err)
 		}
-		got, _ := repo.FindByID(ctx, p.ID, 0)
+		got, _ := repo.FindByID(ctx, p.ID, "")
 		if got.RefundedMinor != 500 || !got.PartiallyRefunded() {
 			t.Fatalf("after partial: refunded=%d partially=%v", got.RefundedMinor, got.PartiallyRefunded())
 		}
@@ -239,7 +239,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if err := repo.SettleRefund(ctx, r2.ID, domain.RefundSucceeded, "re_2"); err != nil {
 			t.Fatal(err)
 		}
-		got, _ = repo.FindByID(ctx, p.ID, 0)
+		got, _ = repo.FindByID(ctx, p.ID, "")
 		if got.Status != domain.StatusRefunded {
 			t.Fatalf("after full refund status=%s, want refunded", got.Status)
 		}
@@ -250,7 +250,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("concurrent refunds cannot oversubscribe (FOR UPDATE guard)", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 1000)
+		p := createPending(t, repo, "7", nil, 1000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_c", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
@@ -283,14 +283,14 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if ok != 1 || rejected != 1 {
 			t.Fatalf("want exactly one refund admitted, got ok=%d rejected=%d", ok, rejected)
 		}
-		got, _ := repo.FindByID(ctx, p.ID, 0)
+		got, _ := repo.FindByID(ctx, p.ID, "")
 		if got.RefundedMinor > got.AmountMinor {
 			t.Fatalf("oversubscribed: refunded=%d > amount=%d", got.RefundedMinor, got.AmountMinor)
 		}
 	})
 
 	t.Run("failed refund releases its reserved amount", func(t *testing.T) {
-		p := createPending(t, repo, 7, nil, 1000)
+		p := createPending(t, repo, "7", nil, 1000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_4", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
@@ -303,7 +303,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		if err := repo.SettleRefund(ctx, r.ID, domain.RefundFailed, ""); err != nil {
 			t.Fatal(err)
 		}
-		got, _ := repo.FindByID(ctx, p.ID, 0)
+		got, _ := repo.FindByID(ctx, p.ID, "")
 		if got.Status != domain.StatusCaptured || got.RefundedMinor != 0 {
 			t.Fatalf("failed refund must release: status=%s refunded=%d", got.Status, got.RefundedMinor)
 		}
@@ -328,7 +328,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 		// Reproduces the H1 double-insert: a crash after the refund INSERT but
 		// before the key is finished lets a takeover retry re-enter CreateRefund
 		// with the same key. It must adopt the existing refund, not add a second.
-		p := createPending(t, repo, 7, nil, 2000)
+		p := createPending(t, repo, "7", nil, 2000)
 		mustTransition(t, repo, p.ID, domain.StatusPending, domain.StatusAuthorized,
 			map[string]any{"provider_payment_id": "mp_r", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)})
 		mustTransition(t, repo, p.ID, domain.StatusAuthorized, domain.StatusCaptured,
@@ -356,7 +356,7 @@ func TestPaymentRepository_Integration(t *testing.T) {
 	})
 
 	t.Run("list pagination", func(t *testing.T) {
-		userID := int64(55)
+		userID := "55"
 		for i := 0; i < 3; i++ {
 			createPending(t, repo, userID, nil, 1000+int64(i))
 		}
@@ -388,8 +388,8 @@ func TestPaymentIdempotencyAdoption_Integration(t *testing.T) {
 	idem := idempotency.New(pool, 90*time.Second)
 
 	t.Run("subject_id FK to payments is enforced", func(t *testing.T) {
-		pay := createPending(t, repo, 7, nil, 2000)
-		rec, _, err := idem.Claim(ctx, 7, "k-fk", "POST", "/pay", "h")
+		pay := createPending(t, repo, "7", nil, 2000)
+		rec, _, err := idem.Claim(ctx, "7", "k-fk", "POST", "/pay", "h")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -56,7 +56,7 @@ func (s *Service) resolveIntentDoubt(ctx context.Context, pay *domain.Payment) (
 		// Re-read per attempt. Each resolution can move the row, and handing the next
 		// one a snapshot from before that move would make it transition from a state
 		// the payment has already left.
-		fresh, err := s.payments.FindByID(ctx, pay.ID, 0)
+		fresh, err := s.payments.FindByID(ctx, pay.ID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -67,7 +67,7 @@ func (s *Service) resolveIntentDoubt(ctx context.Context, pay *domain.Payment) (
 			return nil, err
 		}
 	}
-	return s.payments.FindByID(ctx, pay.ID, 0)
+	return s.payments.FindByID(ctx, pay.ID, "")
 }
 
 // resolveAttempt re-drives one open attempt. A refund attempt is skipped here:
@@ -421,7 +421,7 @@ func (s *Service) ResolveOpenDoubt(ctx context.Context, limit int) (int64, error
 		}
 		swept[a.PaymentID] = true
 
-		pay, ferr := s.payments.FindByID(ctx, a.PaymentID, 0)
+		pay, ferr := s.payments.FindByID(ctx, a.PaymentID, "")
 		if ferr != nil {
 			recordSweepFailure(ctx, string(a.Operation))
 			continue
@@ -516,7 +516,7 @@ func (s *Service) sweepRefund(ctx context.Context, a domain.Attempt) bool {
 		recordSweepFailure(ctx, opRefund)
 		return false
 	}
-	pay, err := s.payments.FindByID(ctx, ref.PaymentID, 0)
+	pay, err := s.payments.FindByID(ctx, ref.PaymentID, "")
 	if err != nil {
 		recordSweepFailure(ctx, opRefund)
 		return false

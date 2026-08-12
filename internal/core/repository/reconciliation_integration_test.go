@@ -35,7 +35,7 @@ func TestReconciliation_Integration(t *testing.T) {
 		if _, err := pool.Exec(ctx,
 			`INSERT INTO payments (user_id, amount_minor, payment_method, status, provider_payment_id)
 			 VALUES ($1, $2, $3, $4, $5)`,
-			1, amount, "tok_visa", status, pid); err != nil {
+			"1", amount, "tok_visa", status, pid); err != nil {
 			t.Fatalf("insert payment %s: %v", pid, err)
 		}
 	}
@@ -189,12 +189,12 @@ func TestReconciliationHeal_Integration(t *testing.T) {
 	var healID int64
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO payments (user_id, amount_minor, payment_method, status, provider_payment_id)
-		 VALUES (1, 1000, 'tok_visa', 'authorized', 'mp_heal') RETURNING id`).Scan(&healID); err != nil {
+		 VALUES ('1', 1000, 'tok_visa', 'authorized', 'mp_heal') RETURNING id`).Scan(&healID); err != nil {
 		t.Fatalf("seed authorized payment: %v", err)
 	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO payments (user_id, amount_minor, payment_method, status, provider_payment_id)
-		 VALUES (1, 2000, 'tok_visa', 'captured', 'mp_amt')`); err != nil {
+		 VALUES ('1', 2000, 'tok_visa', 'captured', 'mp_amt')`); err != nil {
 		t.Fatalf("seed captured payment: %v", err)
 	}
 
@@ -245,7 +245,7 @@ func TestReconciliationHeal_Integration(t *testing.T) {
 	}
 
 	// The payment row converged to captured and the ledger is balanced.
-	got, err := payRepo.FindByID(ctx, healID, 0)
+	got, err := payRepo.FindByID(ctx, healID, "")
 	if err != nil {
 		t.Fatalf("find healed payment: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestWatermark_MonotonicAndWindowed(t *testing.T) {
 	// A payment created now sits inside a window that ends in the future and
 	// outside one that ended before it existed.
 	pay, err := payments.Create(ctx, &domain.Payment{
-		UserID: 31, AmountMinor: 1000, Currency: "USD",
+		UserID: "31", AmountMinor: 1000, Currency: "USD",
 		Status: domain.StatusPending, CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_test",
 	})
 	if err != nil {

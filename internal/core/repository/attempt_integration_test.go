@@ -21,7 +21,7 @@ func TestAttemptRepository_Integration(t *testing.T) {
 	attempts := NewAttemptRepository(pool)
 
 	pay, err := payments.Create(ctx, &domain.Payment{
-		UserID: 1, AmountMinor: 5000, Currency: "USD",
+		UserID: "1", AmountMinor: 5000, Currency: "USD",
 		Status: domain.StatusPending, CaptureMethod: domain.CaptureManual,
 		PaymentMethod: "tok_test",
 	})
@@ -101,7 +101,7 @@ func TestAttemptRepository_Integration(t *testing.T) {
 
 	t.Run("the database refuses a second SUCCESS capture, and says so by type", func(t *testing.T) {
 		p2, err := payments.Create(ctx, &domain.Payment{
-			UserID: 2, AmountMinor: 7000, Currency: "USD",
+			UserID: "2", AmountMinor: 7000, Currency: "USD",
 			Status: domain.StatusPending, CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_test",
 		})
 		if err != nil {
@@ -145,7 +145,7 @@ func TestProcessingRefund_KeepsItsReserveAndCanStillSettle(t *testing.T) {
 	ctx := context.Background()
 	repo := NewPaymentRepository(pool)
 
-	pay := capturedPayment(t, repo, 9, 5000, "ch_res")
+	pay := capturedPayment(t, repo, "9", 5000, "ch_res")
 
 	ref, err := repo.CreateRefund(ctx, pay.ID, 5000, "customer cancelled", "9:rk-1")
 	if err != nil {
@@ -155,7 +155,7 @@ func TestProcessingRefund_KeepsItsReserveAndCanStillSettle(t *testing.T) {
 		t.Fatalf("park refund: %v", err)
 	}
 
-	got, err := repo.FindByID(ctx, pay.ID, 0)
+	got, err := repo.FindByID(ctx, pay.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestProcessingRefund_KeepsItsReserveAndCanStillSettle(t *testing.T) {
 	if err := repo.SettleRefund(ctx, ref.ID, domain.RefundSucceeded, "rf_1"); err != nil {
 		t.Fatalf("settling a parked refund = %v, want it to land: the provider already paid", err)
 	}
-	settled, err := repo.FindByID(ctx, pay.ID, 0)
+	settled, err := repo.FindByID(ctx, pay.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestFindRefundByID_CarriesTheAmountAndTheOriginalKey(t *testing.T) {
 	ctx := context.Background()
 	repo := NewPaymentRepository(pool)
 
-	pay := capturedPayment(t, repo, 21, 4000, "ch_find")
+	pay := capturedPayment(t, repo, "21", 4000, "ch_find")
 	created, err := repo.CreateRefund(ctx, pay.ID, 1500, "partial", "21:rk-find")
 	if err != nil {
 		t.Fatalf("create refund: %v", err)
@@ -222,7 +222,7 @@ func TestReverseCapture_UndoesAParkedCapture(t *testing.T) {
 	ctx := context.Background()
 	repo := NewPaymentRepository(pool)
 
-	pay := capturedPayment(t, repo, 11, 2500, "ch_park")
+	pay := capturedPayment(t, repo, "11", 2500, "ch_park")
 	if err := repo.TransitionStatus(ctx, pay.ID, domain.StatusCaptured, domain.StatusProcessing, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestReverseCapture_UndoesAParkedCapture(t *testing.T) {
 	if err := repo.ReverseCapture(ctx, pay.ID); err != nil {
 		t.Fatalf("reversing a parked capture = %v, want it to land", err)
 	}
-	got, err := repo.FindByID(ctx, pay.ID, 0)
+	got, err := repo.FindByID(ctx, pay.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestReverseCapture_UndoesAParkedCapture(t *testing.T) {
 
 // capturedPayment builds a payment that has reached `captured` through the real
 // transitions, so the ledger and the row agree before a test starts bending them.
-func capturedPayment(t *testing.T, repo *PaymentRepository, userID, amount int64, providerRef string) *domain.Payment {
+func capturedPayment(t *testing.T, repo *PaymentRepository, userID string, amount int64, providerRef string) *domain.Payment {
 	t.Helper()
 	ctx := context.Background()
 	pay, err := repo.Create(ctx, &domain.Payment{

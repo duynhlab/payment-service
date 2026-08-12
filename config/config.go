@@ -48,9 +48,9 @@ type Config struct {
 	// This gives Kubernetes/Service routing time to stop sending new traffic.
 	// From READINESS_DRAIN_DELAY env (default: 5s, max: 30s).
 	ReadinessDrainDelay int
-	JWKSURL             string // Auth JWKS endpoint for local JWT verification - from AUTH_JWKS_URL env
-	JWTIssuer           string // Expected JWT issuer (iss) - from JWT_ISSUER env
-	JWTAudience         string // Expected JWT audience (aud) - from JWT_AUDIENCE env
+	OIDCIssuer          string // Expected OIDC issuer (iss, exact match) - from OIDC_ISSUER env
+	OIDCAudience        string // Expected OIDC audience (aud containment) - from OIDC_AUDIENCE env
+	OIDCJWKSURL         string // Optional JWKS endpoint override - from OIDC_JWKS_URL env (empty = derived from issuer)
 }
 
 // PaymentConfig holds payment-domain settings: authorization-hold expiry,
@@ -178,9 +178,9 @@ func Load() *Config {
 		GRPC:                GRPCConfig{Port: getEnv("GRPC_PORT", "9090")},
 		ShutdownTimeout:     getEnvDurationSeconds("SHUTDOWN_TIMEOUT", 10),
 		ReadinessDrainDelay: getEnvDurationSecondsWithMax("READINESS_DRAIN_DELAY", 5, 30),
-		JWKSURL:             getEnv("AUTH_JWKS_URL", "http://auth.auth.svc.cluster.local:8080/auth/v1/public/auth/jwks"),
-		JWTIssuer:           getEnv("JWT_ISSUER", "https://gateway.duynh.me"),
-		JWTAudience:         getEnv("JWT_AUDIENCE", "duynhlab-platform"),
+		OIDCIssuer:          getEnv("OIDC_ISSUER", "https://id.duynh.me/realms/duynhlab"),
+		OIDCAudience:        getEnv("OIDC_AUDIENCE", "duynhlab-platform"),
+		OIDCJWKSURL:         getEnv("OIDC_JWKS_URL", ""),
 	}
 }
 

@@ -22,10 +22,10 @@ func TestCapture_PostsLedgerOnceThenIdempotent(t *testing.T) {
 		t.Fatalf("authorize must not post ledger, got %d", fp.ledgerPosts)
 	}
 
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatalf("capture: %v", err)
 	}
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatalf("re-capture: %v", err)
 	}
 	if fp.ledgerPosts != 1 {
@@ -67,13 +67,13 @@ func TestCapture_DecidedFailPostsReversal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateIntent: %v", err)
 	}
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err == nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err == nil {
 		t.Fatal("expected provider capture failure")
 	}
 	if fp.ledgerPosts != 1 || fp.reversals != 1 {
 		t.Fatalf("want 1 post + 1 reversal, got posts=%d reversals=%d", fp.ledgerPosts, fp.reversals)
 	}
-	pay, err := svc.Get(context.Background(), res.Payment.ID, 7)
+	pay, err := svc.Get(context.Background(), res.Payment.ID, "7")
 	if err != nil {
 		t.Fatal(err)
 	}
