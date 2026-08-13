@@ -86,7 +86,7 @@ func Transition(from, to Status) error {
 // stored, or logged (PCI discipline, even for a mock).
 type Payment struct {
 	ID                int64         `json:"id"`
-	UserID            int64         `json:"user_id"`
+	UserID            string        `json:"user_id"` // OIDC token subject — opaque string (ADR-042)
 	OrderID           *int64        `json:"order_id,omitempty"`
 	AmountMinor       int64         `json:"amount_minor"`
 	Currency          string        `json:"currency"`

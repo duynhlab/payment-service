@@ -23,7 +23,13 @@ import (
 
 // sagaUserID is the unscoped owner used for internal saga calls (the gRPC
 // surface is cluster-only, NetworkPolicy-fenced; there is no end-user JWT).
-const sagaUserID = 0
+// Empty = unscoped, mirroring the repository's owner-scoping contract.
+const sagaUserID = ""
+
+// maxUserIDLen bounds the caller-supplied OIDC subject. It is persisted into
+// payments.user_id / idempotency_keys.user_id (VARCHAR(255)), so it is
+// validated at the boundary like any other external input.
+const maxUserIDLen = 255
 
 // errMsgAmountRange is the InvalidArgument message shared by the amount checks
 // on Authorize and Refund.
@@ -34,9 +40,9 @@ const errMsgAmountRange = "amount_minor must be positive and within the accepted
 type paymentLogic interface {
 	CreateIntent(ctx context.Context, idemKey string, in logicv1.CreateIntentInput) (*logicv1.IntentResult, error)
 	GetByOrderID(ctx context.Context, orderID int64) (*domain.Payment, error)
-	Capture(ctx context.Context, paymentID, userID int64) (*domain.Payment, error)
-	Void(ctx context.Context, paymentID, userID int64) (*domain.Payment, error)
-	CreateRefund(ctx context.Context, idemKey string, paymentID, userID, amountMinor int64, reason string) (*domain.Refund, bool, error)
+	Capture(ctx context.Context, paymentID int64, userID string) (*domain.Payment, error)
+	Void(ctx context.Context, paymentID int64, userID string) (*domain.Payment, error)
+	CreateRefund(ctx context.Context, idemKey string, paymentID int64, userID string, amountMinor int64, reason string) (*domain.Refund, bool, error)
 }
 
 // Server implements paymentv1.PaymentServiceServer.
@@ -55,8 +61,14 @@ func NewServer(svc paymentLogic) *Server {
 // (key order:<id>). A provider decline is a normal response with status="failed"
 // and a decline_code — not a gRPC error.
 func (s *Server) Authorize(ctx context.Context, req *paymentv1.AuthorizeRequest) (*paymentv1.AuthorizeResponse, error) {
-	if req.GetOrderId() <= 0 || req.GetUserId() <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "order_id and user_id must be positive")
+	if req.GetOrderId() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "order_id must be positive")
+	}
+	// user_id is the OIDC token subject — an opaque string (ADR-042). Non-empty
+	// and bounded, because it lands in a VARCHAR(255) owner column.
+	if req.GetUserId() == "" || len(req.GetUserId()) > maxUserIDLen {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"user_id must be a non-empty string of at most %d characters", maxUserIDLen)
 	}
 	// Enforce the same money invariants as the HTTP path (shared validators in
 	// the logic layer, so they can never drift between transports): positive

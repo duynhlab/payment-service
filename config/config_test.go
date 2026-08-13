@@ -41,13 +41,22 @@ func TestValidatePayment(t *testing.T) {
 	})
 }
 
-// TestLoadJWKSDefault pins the v3 collection-noun JWKS path (homelab ADR-017)
-// so a regression back to the pre-v3 default fails fast.
-func TestLoadJWKSDefault(t *testing.T) {
-	t.Setenv("AUTH_JWKS_URL", "")
+// TestLoadOIDCDefaults pins the Keycloak OIDC defaults (ADR-041) so a
+// regression back to the legacy auth-service JWT config fails fast. The JWKS
+// override defaults to empty — authmw derives the Keycloak realm certs URL
+// from the issuer.
+func TestLoadOIDCDefaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "")
+	t.Setenv("OIDC_AUDIENCE", "")
+	t.Setenv("OIDC_JWKS_URL", "")
 	cfg := Load()
-	want := "http://auth.auth.svc.cluster.local:8080/auth/v1/public/auth/jwks"
-	if cfg.JWKSURL != want {
-		t.Errorf("default JWKSURL = %q, want %q", cfg.JWKSURL, want)
+	if want := "https://id.duynh.me/realms/duynhlab"; cfg.OIDCIssuer != want {
+		t.Errorf("default OIDCIssuer = %q, want %q", cfg.OIDCIssuer, want)
+	}
+	if want := "duynhlab-platform"; cfg.OIDCAudience != want {
+		t.Errorf("default OIDCAudience = %q, want %q", cfg.OIDCAudience, want)
+	}
+	if cfg.OIDCJWKSURL != "" {
+		t.Errorf("default OIDCJWKSURL = %q, want empty (derived from issuer)", cfg.OIDCJWKSURL)
 	}
 }

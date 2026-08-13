@@ -68,14 +68,14 @@ func (f *fakePayments) Create(_ context.Context, p *domain.Payment) (*domain.Pay
 	return &out, nil
 }
 
-func (f *fakePayments) FindByID(_ context.Context, id, userID int64) (*domain.Payment, error) {
+func (f *fakePayments) FindByID(_ context.Context, id int64, userID string) (*domain.Payment, error) {
 	if f.findErr != nil {
 		return nil, f.findErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := f.items[id]
-	if !ok || (userID != 0 && p.UserID != userID) {
+	if !ok || (userID != "" && p.UserID != userID) {
 		return nil, domain.ErrNotFound
 	}
 	p.RefundedMinor = f.refundedLocked(id)
@@ -90,10 +90,10 @@ func (f *fakePayments) FindByOrderID(_ context.Context, orderID int64) (*domain.
 	if !ok {
 		return nil, domain.ErrNotFound
 	}
-	return f.FindByID(context.Background(), id, 0)
+	return f.FindByID(context.Background(), id, "")
 }
 
-func (f *fakePayments) ListByUser(_ context.Context, userID int64, limit, offset int) ([]domain.Payment, int, error) {
+func (f *fakePayments) ListByUser(_ context.Context, userID string, limit, offset int) ([]domain.Payment, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var all []domain.Payment
@@ -287,7 +287,7 @@ func newFakeIdem() *fakeIdem {
 	return &fakeIdem{keys: map[string]*idempotency.Record{}, take: 90 * time.Second}
 }
 
-func (f *fakeIdem) Claim(_ context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error) {
+func (f *fakeIdem) Claim(_ context.Context, userID, key, method, path, hash string) (*idempotency.Record, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := key
@@ -381,7 +381,7 @@ func newTestService() (*Service, *fakePayments, *fakeIdem, *provider.Stub) {
 }
 
 func intent(amount int64) CreateIntentInput {
-	return CreateIntentInput{UserID: 7, AmountMinor: amount, Currency: "USD",
+	return CreateIntentInput{UserID: "7", AmountMinor: amount, Currency: "USD",
 		CaptureMethod: domain.CaptureManual, PaymentMethod: "tok_visa"}
 }
 
@@ -432,6 +432,31 @@ func TestCreateIntent_ReplaysFirstResponse(t *testing.T) {
 	fp.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("exactly one payment must exist, got %d", n)
+	}
+}
+
+// TestCreateIntent_ReplayWithOpaqueStringSubject pins ADR-042: the idempotency
+// claim and the cached replay are keyed by the OIDC token subject — an opaque
+// string, not a numeric id — and the subject round-trips the JSON response
+// cache verbatim.
+func TestCreateIntent_ReplayWithOpaqueStringSubject(t *testing.T) {
+	svc, _, _, _ := newTestService()
+	in := intent(2000)
+	in.UserID = "a11ce000-0000-4000-8000-000000000001"
+	first, err := svc.CreateIntent(context.Background(), "key-sub", in)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if first.Payment.UserID != in.UserID {
+		t.Fatalf("payment owner = %q, want the opaque subject %q", first.Payment.UserID, in.UserID)
+	}
+	second, err := svc.CreateIntent(context.Background(), "key-sub", in)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if !second.Replayed || second.Payment.UserID != in.UserID {
+		t.Fatalf("replay must carry the string subject verbatim (replayed=%v user=%q)",
+			second.Replayed, second.Payment.UserID)
 	}
 }
 
@@ -499,7 +524,7 @@ func TestCreateIntent_TransientReleasesLockForImmediateRetry(t *testing.T) {
 func TestCreateIntent_InFlightLocked(t *testing.T) {
 	svc, _, fi, _ := newTestService()
 	// Seed an unfinished, fresh-locked key manually.
-	_, _, err := fi.Claim(context.Background(), 7, "key-6", "POST", "/payment/v1/private/payments", hashJSON(intent(2000)))
+	_, _, err := fi.Claim(context.Background(), "7", "key-6", "POST", "/payment/v1/private/payments", hashJSON(intent(2000)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +580,7 @@ func TestCreateIntent_OrderIdempotencyAndSquatProtection(t *testing.T) {
 	// A DIFFERENT user squatting the same order is rejected (no cross-user adopt).
 	foreign := intent(2000)
 	foreign.OrderID = &order
-	foreign.UserID = 99
+	foreign.UserID = "99"
 	if _, err := svc.CreateIntent(context.Background(), "key-10", foreign); !errors.Is(err, domain.ErrPaymentExists) {
 		t.Fatalf("foreign user on existing order must reject, got %v", err)
 	}
@@ -566,16 +591,16 @@ func TestCaptureAndVoid_Lifecycle(t *testing.T) {
 	res, _ := svc.CreateIntent(context.Background(), "key-9", intent(2000))
 	id := res.Payment.ID
 
-	got, err := svc.Capture(context.Background(), id, 7)
+	got, err := svc.Capture(context.Background(), id, "7")
 	if err != nil || got.Status != domain.StatusCaptured {
 		t.Fatalf("capture: %v status=%v", err, got)
 	}
 	// Idempotent re-capture.
-	if _, err := svc.Capture(context.Background(), id, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), id, "7"); err != nil {
 		t.Fatalf("re-capture must be a no-op: %v", err)
 	}
 	// Void after capture is forbidden by the whitelist.
-	if _, err := svc.Void(context.Background(), id, 7); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := svc.Void(context.Background(), id, "7"); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("void after capture must be invalid, got %v", err)
 	}
 }
@@ -583,11 +608,11 @@ func TestCaptureAndVoid_Lifecycle(t *testing.T) {
 func TestVoid_ReleasesHold(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "key-10", intent(2000))
-	got, err := svc.Void(context.Background(), res.Payment.ID, 7)
+	got, err := svc.Void(context.Background(), res.Payment.ID, "7")
 	if err != nil || got.Status != domain.StatusVoided {
 		t.Fatalf("void: %v %v", err, got)
 	}
-	if _, err := svc.Void(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Void(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatalf("re-void must be a no-op: %v", err)
 	}
 }
@@ -595,35 +620,35 @@ func TestVoid_ReleasesHold(t *testing.T) {
 func TestRefund_PartialThenFullFlipsStatus(t *testing.T) {
 	svc, _, _, _ := newTestService()
 	res, _ := svc.CreateIntent(context.Background(), "key-11", intent(2000))
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 
-	ref1, replayed, err := svc.CreateRefund(context.Background(), "rk-1", res.Payment.ID, 7, 500, "damaged")
+	ref1, replayed, err := svc.CreateRefund(context.Background(), "rk-1", res.Payment.ID, "7", 500, "damaged")
 	if err != nil || replayed || ref1.Status != domain.RefundSucceeded {
 		t.Fatalf("partial refund: %v replayed=%v ref=%v", err, replayed, ref1)
 	}
-	pay, _ := svc.Get(context.Background(), res.Payment.ID, 7)
+	pay, _ := svc.Get(context.Background(), res.Payment.ID, "7")
 	if !pay.PartiallyRefunded() || pay.Status != domain.StatusCaptured {
 		t.Fatalf("after partial: partially=%v status=%s", pay.PartiallyRefunded(), pay.Status)
 	}
 
 	// Refund idempotency: same key replays, no double refund.
-	refAgain, replayed, err := svc.CreateRefund(context.Background(), "rk-1", res.Payment.ID, 7, 500, "damaged")
+	refAgain, replayed, err := svc.CreateRefund(context.Background(), "rk-1", res.Payment.ID, "7", 500, "damaged")
 	if err != nil || !replayed || refAgain.ID != ref1.ID {
 		t.Fatalf("refund replay: %v replayed=%v", err, replayed)
 	}
 
 	// Over-refund must be rejected: 500 refunded, 2000 total, 1600 > remaining.
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-2", res.Payment.ID, 7, 1600, ""); !errors.Is(err, domain.ErrRefundRejected) {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-2", res.Payment.ID, "7", 1600, ""); !errors.Is(err, domain.ErrRefundRejected) {
 		t.Fatalf("over-refund must reject, got %v", err)
 	}
 
 	// Refund the remainder — payment flips to refunded.
-	if _, _, err := svc.CreateRefund(context.Background(), "rk-3", res.Payment.ID, 7, 1500, ""); err != nil {
+	if _, _, err := svc.CreateRefund(context.Background(), "rk-3", res.Payment.ID, "7", 1500, ""); err != nil {
 		t.Fatal(err)
 	}
-	pay, _ = svc.Get(context.Background(), res.Payment.ID, 7)
+	pay, _ = svc.Get(context.Background(), res.Payment.ID, "7")
 	if pay.Status != domain.StatusRefunded || pay.PartiallyRefunded() {
 		t.Fatalf("after full refund: status=%s partially=%v", pay.Status, pay.PartiallyRefunded())
 	}
@@ -641,7 +666,7 @@ func TestExpireHolds(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("expire: %v n=%d", err, n)
 	}
-	if _, err := svc.Capture(context.Background(), res.Payment.ID, 7); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := svc.Capture(context.Background(), res.Payment.ID, "7"); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("capturing an expired hold must be invalid, got %v", err)
 	}
 }

@@ -25,9 +25,9 @@ import (
 // repository.PaymentRepository).
 type PaymentRepo interface {
 	Create(ctx context.Context, p *domain.Payment) (*domain.Payment, error)
-	FindByID(ctx context.Context, id, userID int64) (*domain.Payment, error)
+	FindByID(ctx context.Context, id int64, userID string) (*domain.Payment, error)
 	FindByOrderID(ctx context.Context, orderID int64) (*domain.Payment, error)
-	ListByUser(ctx context.Context, userID int64, limit, offset int) ([]domain.Payment, int, error)
+	ListByUser(ctx context.Context, userID string, limit, offset int) ([]domain.Payment, int, error)
 	TransitionStatus(ctx context.Context, id int64, from, to domain.Status, set map[string]any) error
 	CaptureWithLedger(ctx context.Context, id int64, capturedAt time.Time) error
 	ReverseCapture(ctx context.Context, id int64) error
@@ -42,7 +42,7 @@ type PaymentRepo interface {
 // IdemRepo is the idempotency-key port (implemented by *idempotency.Repository
 // from the shared pkg). The claimed subject is the payment id.
 type IdemRepo interface {
-	Claim(ctx context.Context, userID int64, key, method, path, hash string) (*idempotency.Record, bool, error)
+	Claim(ctx context.Context, userID, key, method, path, hash string) (*idempotency.Record, bool, error)
 	Checkpoint(ctx context.Context, id int64, subjectID *int64) error
 	Release(ctx context.Context, id int64) error
 	Finish(ctx context.Context, id int64, code int, body []byte) error
@@ -207,7 +207,7 @@ func providerStatusOf(err error) string {
 // CreateIntentInput is the validated request to create a PaymentIntent. The
 // json tags define the canonical shape hashed for idempotency comparison.
 type CreateIntentInput struct {
-	UserID        int64                `json:"user_id"`
+	UserID        string               `json:"user_id"` // OIDC token subject (ADR-042)
 	OrderID       *int64               `json:"order_id,omitempty"`
 	AmountMinor   int64                `json:"amount_minor"`
 	Currency      string               `json:"currency"`
@@ -265,7 +265,7 @@ func (s *Service) CreateIntent(ctx context.Context, idemKey string, in CreateInt
 
 	// Checkpoint 1: ensure the payment row exists (re-entry reuses it).
 	if key.SubjectID != nil {
-		pay, err := s.payments.FindByID(ctx, *key.SubjectID, 0)
+		pay, err := s.payments.FindByID(ctx, *key.SubjectID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -328,7 +328,7 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 		return s.finishParkedIntent(ctx, key, pay)
 	}
 
-	chargeKey := fmt.Sprintf("%d:%s", in.UserID, key.Key)
+	chargeKey := fmt.Sprintf("%s:%s", in.UserID, key.Key)
 	// Provider call — outside any transaction; the shared idempotency key
 	// makes a re-driven call replay instead of double-charging.
 	charge, chErr := s.prov.Charge(ctx, provider.ChargeRequest{
@@ -453,7 +453,7 @@ func (s *Service) applyAuthorized(ctx context.Context, key *idempotency.Record, 
 			return nil, err
 		}
 	}
-	final, err := s.payments.FindByID(ctx, pay.ID, 0)
+	final, err := s.payments.FindByID(ctx, pay.ID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +468,7 @@ func (s *Service) applyAuthorized(ctx context.Context, key *idempotency.Record, 
 
 // finishIntent snapshots the payment, caches it on the key, and returns it.
 func (s *Service) finishIntent(ctx context.Context, keyID int64, code int, paymentID int64) (*IntentResult, error) {
-	pay, err := s.payments.FindByID(ctx, paymentID, 0)
+	pay, err := s.payments.FindByID(ctx, paymentID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +489,7 @@ func replayResult(key *idempotency.Record) (*IntentResult, error) {
 
 // Capture moves an authorized hold to captured. Idempotent: capturing an
 // already-captured payment returns it unchanged.
-func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain.Payment, error) {
+func (s *Service) Capture(ctx context.Context, paymentID int64, userID string) (*domain.Payment, error) {
 	pay, err := s.payments.FindByID(ctx, paymentID, userID)
 	if err != nil {
 		return nil, err
@@ -534,7 +534,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 	switch class {
 	case domain.OutcomeSuccess:
 		recordOperation(ctx, opCapture, resultOK)
-		return s.payments.FindByID(ctx, pay.ID, 0)
+		return s.payments.FindByID(ctx, pay.ID, "")
 
 	case domain.OutcomeUnknown:
 		// The heart of phase 6. Reversing here is the SEMANTIC OPPOSITE of the
@@ -579,7 +579,7 @@ func (s *Service) Capture(ctx context.Context, paymentID, userID int64) (*domain
 }
 
 // Void releases an authorized hold. Idempotent on already-voided payments.
-func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Payment, error) {
+func (s *Service) Void(ctx context.Context, paymentID int64, userID string) (*domain.Payment, error) {
 	pay, err := s.payments.FindByID(ctx, paymentID, userID)
 	if err != nil {
 		return nil, err
@@ -615,7 +615,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 	switch class {
 	case domain.OutcomeSuccess:
 		recordOperation(ctx, opVoid, resultOK)
-		return s.payments.FindByID(ctx, pay.ID, 0)
+		return s.payments.FindByID(ctx, pay.ID, "")
 
 	case domain.OutcomeUnknown:
 		// Rolling back to `authorized` would assert the hold is still live. If the
@@ -647,7 +647,7 @@ func (s *Service) Void(ctx context.Context, paymentID, userID int64) (*domain.Pa
 // metric — the CAS winner already counted this transition, so counting here
 // too would double-count one operation.
 func (s *Service) reloadAfterRace(ctx context.Context, id int64, want domain.Status) (*domain.Payment, error) {
-	pay, err := s.payments.FindByID(ctx, id, 0)
+	pay, err := s.payments.FindByID(ctx, id, "")
 	if err != nil {
 		return nil, err
 	}
@@ -731,10 +731,10 @@ func (s *Service) withKeyReleased(ctx context.Context, keyID int64, outcome erro
 
 // CreateRefund runs the idempotent (partial) refund flow. P1 settles
 // synchronously against the provider stub; async webhook settlement is P2.
-func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, userID, amountMinor int64, reason string) (*domain.Refund, bool, error) {
+func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID int64, userID string, amountMinor int64, reason string) (*domain.Refund, bool, error) {
 	in := struct {
 		PaymentID int64  `json:"payment_id"`
-		UserID    int64  `json:"user_id"`
+		UserID    string `json:"user_id"`
 		Amount    int64  `json:"amount"`
 		Reason    string `json:"reason"`
 	}{paymentID, userID, amountMinor, reason}
@@ -752,13 +752,13 @@ func (s *Service) CreateRefund(ctx context.Context, idemKey string, paymentID, u
 		return &ref, true, nil
 	}
 
-	pay, err := s.payments.FindByID(ctx, paymentID, 0)
+	pay, err := s.payments.FindByID(ctx, paymentID, "")
 	if err != nil {
 		return nil, false, s.withKeyReleased(ctx, key.ID, err)
 	}
 	// The refund insert is idempotent by this scoped key: a crash-recovery
 	// retry adopts the existing refund rather than creating a second one.
-	scopedKey := fmt.Sprintf("%d:%s", userID, idemKey)
+	scopedKey := fmt.Sprintf("%s:%s", userID, idemKey)
 	ref, err := s.payments.CreateRefund(ctx, pay.ID, amountMinor, reason, scopedKey)
 	if err != nil {
 		if errors.Is(err, domain.ErrRefundRejected) {
@@ -911,7 +911,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 }
 
 // Get returns one payment scoped to its owner.
-func (s *Service) Get(ctx context.Context, id, userID int64) (*domain.Payment, error) {
+func (s *Service) Get(ctx context.Context, id int64, userID string) (*domain.Payment, error) {
 	return s.payments.FindByID(ctx, id, userID)
 }
 
@@ -922,7 +922,7 @@ func (s *Service) GetByOrderID(ctx context.Context, orderID int64) (*domain.Paym
 }
 
 // List returns a page of the user's payments and the total count.
-func (s *Service) List(ctx context.Context, userID int64, page, pageSize int) ([]domain.Payment, int, error) {
+func (s *Service) List(ctx context.Context, userID string, page, pageSize int) ([]domain.Payment, int, error) {
 	return s.payments.ListByUser(ctx, userID, pageSize, (page-1)*pageSize)
 }
 

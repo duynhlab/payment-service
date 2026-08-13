@@ -156,7 +156,7 @@ func (f *fakeCapturer) CaptureWithLedger(_ context.Context, id int64, capturedAt
 	return f.err
 }
 
-func (f *fakeCapturer) FindByID(_ context.Context, id, _ int64) (*domain.Payment, error) {
+func (f *fakeCapturer) FindByID(_ context.Context, id int64, _ string) (*domain.Payment, error) {
 	if f.findErr != nil {
 		return nil, f.findErr
 	}

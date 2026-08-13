@@ -105,10 +105,10 @@ func TestParkedCapture_RetryConfirmsWithoutReversing(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("capture err = %v, want ErrOutcomeUnknown", err)
 	}
-	parked, _ := svc.Get(ctx, res.Payment.ID, 7)
+	parked, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if parked.Status != domain.StatusProcessing {
 		t.Fatalf("status = %s, want processing", parked.Status)
 	}
@@ -117,7 +117,7 @@ func TestParkedCapture_RetryConfirmsWithoutReversing(t *testing.T) {
 	}
 
 	prov.captureThenErr = nil
-	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	got, err := svc.Capture(ctx, res.Payment.ID, "7")
 	if err != nil {
 		t.Fatalf("retry err = %v, want the capture confirmed", err)
 	}
@@ -148,11 +148,11 @@ func TestParkedCapture_DefiniteRefusalReversesDeliberately(t *testing.T) {
 		context.DeadlineExceeded,
 		fmt.Errorf("%w: no such charge", provider.ErrDefinite),
 	}
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("capture err = %v, want ErrOutcomeUnknown", err)
 	}
 
-	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	got, err := svc.Capture(ctx, res.Payment.ID, "7")
 	if err != nil {
 		t.Fatalf("retry err = %v, want the doubt resolved and the capture completed", err)
 	}
@@ -175,16 +175,16 @@ func TestParkedVoid_RetryConfirmsTheRelease(t *testing.T) {
 
 	res, _ := svc.CreateIntent(ctx, "k-void-park", intent(2000))
 	prov.voidThenErr = context.DeadlineExceeded
-	if _, err := svc.Void(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Void(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("void err = %v, want ErrOutcomeUnknown", err)
 	}
-	parked, _ := svc.Get(ctx, res.Payment.ID, 7)
+	parked, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if parked.Status != domain.StatusProcessing {
 		t.Fatalf("status = %s, want processing (never authorized — the hold may be gone)", parked.Status)
 	}
 
 	prov.voidThenErr = nil
-	got, err := svc.Void(ctx, res.Payment.ID, 7)
+	got, err := svc.Void(ctx, res.Payment.ID, "7")
 	if err != nil {
 		t.Fatalf("retry err = %v, want the release confirmed", err)
 	}
@@ -203,17 +203,17 @@ func TestParkedRefund_RetrySettlesTheProviderAnswer(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-park", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-park", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-park", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("first refund err = %v, want ErrRefundNotSettled", err)
 	}
 
 	prov.refundThenErr = nil
-	ref, _, err := svc.CreateRefund(ctx, "rk-park", res.Payment.ID, 7, 500, "")
+	ref, _, err := svc.CreateRefund(ctx, "rk-park", res.Payment.ID, "7", 500, "")
 	if err != nil {
 		t.Fatalf("retry err = %v, want the refund settled", err)
 	}
@@ -231,11 +231,11 @@ func TestRefund_RecordsAttemptsAndClosesItsDoubt(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-att", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	_, _, _ = svc.CreateRefund(ctx, "rk-att", res.Payment.ID, 7, 500, "")
+	_, _, _ = svc.CreateRefund(ctx, "rk-att", res.Payment.ID, "7", 500, "")
 
 	open, _ := rec.ListOpenForPayment(ctx, res.Payment.ID)
 	if len(open) != 1 || open[0].Operation != domain.AttemptRefund {
@@ -249,7 +249,7 @@ func TestRefund_RecordsAttemptsAndClosesItsDoubt(t *testing.T) {
 	}
 
 	prov.refundThenErr = nil
-	if _, _, err := svc.CreateRefund(ctx, "rk-att", res.Payment.ID, 7, 500, ""); err != nil {
+	if _, _, err := svc.CreateRefund(ctx, "rk-att", res.Payment.ID, "7", 500, ""); err != nil {
 		t.Fatalf("retry err = %v", err)
 	}
 	if still, _ := rec.ListOpenForPayment(ctx, res.Payment.ID); len(still) != 0 {
@@ -268,10 +268,10 @@ func TestCapture_RateLimitReversesAndIsNotParked(t *testing.T) {
 
 	res, _ := svc.CreateIntent(ctx, "k-429", intent(2000))
 	prov.captureErr = provider.ErrTransient
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, provider.ErrTransient) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, provider.ErrTransient) {
 		t.Fatalf("err = %v, want the provider's transient error", err)
 	}
-	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	got, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if got.Status != domain.StatusAuthorized {
 		t.Fatalf("status = %s, want authorized — a refused request leaves the hold intact", got.Status)
 	}
@@ -318,10 +318,10 @@ func TestResolve_UnwiredLogCannotPark(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("err = %v, want the unknown outcome still reported", err)
 	}
-	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	got, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if got.Status == domain.StatusProcessing {
 		t.Fatal("parked without a log: the doubt could never be resolved")
 	}
@@ -373,7 +373,7 @@ func TestResolve_LostRaceIsNotReportedAsARejection(t *testing.T) {
 
 	res, _ := svc.CreateIntent(ctx, "k-race", intent(2000))
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("park err = %v", err)
 	}
 	prov.captureThenErr = nil
@@ -384,7 +384,7 @@ func TestResolve_LostRaceIsNotReportedAsARejection(t *testing.T) {
 		_ = fp.TransitionStatus(ctx, res.Payment.ID, domain.StatusProcessing, domain.StatusCaptured, nil)
 	}
 
-	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	got, err := svc.Capture(ctx, res.Payment.ID, "7")
 	if err != nil {
 		t.Fatalf("err = %v, want the lost race treated as a no-op", err)
 	}
@@ -413,14 +413,14 @@ func TestResolve_VerdictNotWrittenKeepsTheQuestionOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("park err = %v", err)
 	}
 
 	// The provider now answers, but the answer cannot be persisted.
 	prov.captureThenErr = nil
 	fp.transitionErr = errors.New("database went away")
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err == nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err == nil {
 		t.Fatal("resolution reported success while its verdict was not written")
 	}
 
@@ -431,7 +431,7 @@ func TestResolve_VerdictNotWrittenKeepsTheQuestionOpen(t *testing.T) {
 
 	// And once the write works, the redo settles it.
 	fp.transitionErr = nil
-	got, err := svc.Capture(ctx, res.Payment.ID, 7)
+	got, err := svc.Capture(ctx, res.Payment.ID, "7")
 	if err != nil {
 		t.Fatalf("redo err = %v", err)
 	}
@@ -452,12 +452,12 @@ func TestRefund_UnknownOutcomeIsRecognisableAsDoubt(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-ref-doubt", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
 
-	_, _, err := svc.CreateRefund(ctx, "rk-doubt", res.Payment.ID, 7, 500, "")
+	_, _, err := svc.CreateRefund(ctx, "rk-doubt", res.Payment.ID, "7", 500, "")
 	if !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("err = %v, want it to satisfy errors.Is(ErrOutcomeUnknown)", err)
 	}
@@ -478,7 +478,7 @@ func TestSweep_SettlesDoubtNobodyIsRetrying(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("park err = %v", err)
 	}
 	prov.captureThenErr = nil
@@ -490,7 +490,7 @@ func TestSweep_SettlesDoubtNobodyIsRetrying(t *testing.T) {
 	if closed != 1 {
 		t.Fatalf("closed = %d, want 1", closed)
 	}
-	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	got, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if got.Status != domain.StatusCaptured {
 		t.Fatalf("status = %s, want captured", got.Status)
 	}
@@ -507,11 +507,11 @@ func TestSweep_ReplaysAParkedRefundUnderItsOriginalKey(t *testing.T) {
 	ctx := context.Background()
 
 	res, _ := svc.CreateIntent(ctx, "k-sweep-ref", intent(2000))
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); err != nil {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); err != nil {
 		t.Fatal(err)
 	}
 	prov.refundThenErr = context.DeadlineExceeded
-	if _, _, err := svc.CreateRefund(ctx, "rk-sweep", res.Payment.ID, 7, 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
+	if _, _, err := svc.CreateRefund(ctx, "rk-sweep", res.Payment.ID, "7", 500, ""); !errors.Is(err, domain.ErrRefundNotSettled) {
 		t.Fatalf("park err = %v", err)
 	}
 	prov.refundThenErr = nil
@@ -539,7 +539,7 @@ func TestSweep_VerifiesAStrayAttemptInsteadOfDiscardingIt(t *testing.T) {
 	prov.captureThenErr = context.DeadlineExceeded
 	// The park CAS loses, so the row stays `captured` while the question stays open.
 	fp.transitionErr = domain.ErrStaleTransition
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
 	}
 	fp.transitionErr = nil
@@ -569,7 +569,7 @@ func TestSweep_LeavesUnresolvedDoubtOnTheWorklist(t *testing.T) {
 
 	res, _ := svc.CreateIntent(ctx, "k-sweep-silent", intent(2000))
 	prov.captureThenErr = context.DeadlineExceeded
-	if _, err := svc.Capture(ctx, res.Payment.ID, 7); !errors.Is(err, domain.ErrOutcomeUnknown) {
+	if _, err := svc.Capture(ctx, res.Payment.ID, "7"); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("park err = %v", err)
 	}
 	// The provider stays silent through the sweep as well.
@@ -580,7 +580,7 @@ func TestSweep_LeavesUnresolvedDoubtOnTheWorklist(t *testing.T) {
 	if closed != 0 {
 		t.Fatalf("closed = %d, want 0 — nothing was learned", closed)
 	}
-	got, _ := svc.Get(ctx, res.Payment.ID, 7)
+	got, _ := svc.Get(ctx, res.Payment.ID, "7")
 	if got.Status != domain.StatusProcessing {
 		t.Fatalf("status = %s, want processing", got.Status)
 	}

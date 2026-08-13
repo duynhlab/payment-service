@@ -21,7 +21,7 @@ import (
 func authorizeCaptured(t *testing.T, repo *PaymentRepository, amount int64) *domain.Payment {
 	t.Helper()
 	ctx := context.Background()
-	p := createPending(t, repo, 7, nil, amount)
+	p := createPending(t, repo, "7", nil, amount)
 	if err := repo.TransitionStatus(ctx, p.ID, domain.StatusPending, domain.StatusAuthorized,
 		map[string]any{"provider_payment_id": "mp_cap", "authorized_at": time.Now(), "expires_at": time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("authorize: %v", err)
@@ -86,7 +86,7 @@ func TestLedger_Integration(t *testing.T) {
 		if after-before != 1500 { // credit -1500 undone by debit +1500
 			t.Fatalf("reversal did not net capture: before=%d after=%d", before, after)
 		}
-		got, err := repo.FindByID(ctx, p.ID, 0)
+		got, err := repo.FindByID(ctx, p.ID, "")
 		if err != nil || got.Status != domain.StatusAuthorized {
 			t.Fatalf("reversed payment must be authorized, got %+v err=%v", got, err)
 		}

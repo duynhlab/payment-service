@@ -43,7 +43,7 @@ type fakeLogic struct {
 	refundErr      error
 	gotRefundKey   string
 	gotPaymentID   int64
-	gotUserID      int64
+	gotUserID      string
 	gotAmount      int64
 	gotReason      string
 }
@@ -53,16 +53,16 @@ func (f *fakeLogic) CreateIntent(_ context.Context, idemKey string, in logicv1.C
 	return f.createResult, f.createErr
 }
 
-func (f *fakeLogic) Get(_ context.Context, _, _ int64) (*domain.Payment, error) {
+func (f *fakeLogic) Get(_ context.Context, _ int64, _ string) (*domain.Payment, error) {
 	return f.payment, f.getErr
 }
 
-func (f *fakeLogic) List(_ context.Context, _ int64, page, pageSize int) ([]domain.Payment, int, error) {
+func (f *fakeLogic) List(_ context.Context, _ string, page, pageSize int) ([]domain.Payment, int, error) {
 	f.gotPage, f.gotPageSize = page, pageSize
 	return f.list, f.total, f.listErr
 }
 
-func (f *fakeLogic) CreateRefund(_ context.Context, idemKey string, paymentID, userID, amountMinor int64, reason string) (*domain.Refund, bool, error) {
+func (f *fakeLogic) CreateRefund(_ context.Context, idemKey string, paymentID int64, userID string, amountMinor int64, reason string) (*domain.Refund, bool, error) {
 	f.gotRefundKey, f.gotPaymentID, f.gotUserID = idemKey, paymentID, userID
 	f.gotAmount, f.gotReason = amountMinor, reason
 	return f.refund, f.refundReplayed, f.refundErr
@@ -107,8 +107,8 @@ func idemHeader() map[string]string {
 }
 
 func TestCreatePayment(t *testing.T) {
-	created := &domain.Payment{ID: 7, UserID: 42, AmountMinor: 2000, Currency: "USD", Status: domain.StatusAuthorized}
-	declined := &domain.Payment{ID: 8, UserID: 42, AmountMinor: 2002, Currency: "USD", Status: domain.StatusFailed, DeclineCode: provider.DeclineGeneric}
+	created := &domain.Payment{ID: 7, UserID: "42", AmountMinor: 2000, Currency: "USD", Status: domain.StatusAuthorized}
+	declined := &domain.Payment{ID: 8, UserID: "42", AmountMinor: 2002, Currency: "USD", Status: domain.StatusFailed, DeclineCode: provider.DeclineGeneric}
 
 	tests := []struct {
 		name       string
@@ -270,13 +270,14 @@ func TestCreatePayment(t *testing.T) {
 			wantCode:   httpx.CodeUnauthorized,
 		},
 		{
-			name:       "non-numeric subject 401",
-			userID:     "alice",
+			// The subject is an opaque string (ADR-042): a non-numeric OIDC sub
+			// is a first-class owner, no longer a 401 (the ParseInt gate is gone).
+			name:       "opaque non-numeric subject accepted 201",
+			userID:     "a11ce000-0000-4000-8000-000000000001",
 			headers:    idemHeader(),
 			body:       `{"amount_minor":2000,"payment_method":"tok_visa"}`,
-			fake:       &fakeLogic{},
-			wantStatus: http.StatusUnauthorized,
-			wantCode:   httpx.CodeUnauthorized,
+			fake:       &fakeLogic{createResult: &logicv1.IntentResult{Code: 201, Payment: created}},
+			wantStatus: http.StatusCreated,
 		},
 		{
 			name:       "logic error translated 409",
@@ -311,11 +312,11 @@ func TestCreatePayment(t *testing.T) {
 func TestCreatePaymentDefaultsAndClaims(t *testing.T) {
 	fake := &fakeLogic{createResult: &logicv1.IntentResult{
 		Code:    201,
-		Payment: &domain.Payment{ID: 1, UserID: 42},
+		Payment: &domain.Payment{ID: 1, UserID: "42"},
 	}}
 	r := newTestRouter(fake, "42")
 
-	body := `{"amount_minor":1500,"payment_method":"tok_visa","user_id":999}`
+	body := `{"amount_minor":1500,"payment_method":"tok_visa","user_id":"999"}`
 	rec := do(r, http.MethodPost, "/payment/v1/private/payments", body, idemHeader())
 
 	if rec.Code != http.StatusCreated {
@@ -325,8 +326,8 @@ func TestCreatePaymentDefaultsAndClaims(t *testing.T) {
 		t.Errorf("idemKey = %q, want %q", fake.gotIdemKey, "key-1")
 	}
 	in := fake.gotInput
-	if in.UserID != 42 {
-		t.Errorf("UserID = %d, want 42 (must come from claims)", in.UserID)
+	if in.UserID != "42" {
+		t.Errorf("UserID = %q, want %q (must come from claims)", in.UserID, "42")
 	}
 	if in.Currency != "USD" {
 		t.Errorf("Currency = %q, want default USD", in.Currency)
@@ -345,7 +346,7 @@ func TestCreatePaymentDeclinedEnvelope(t *testing.T) {
 	fake := &fakeLogic{createResult: &logicv1.IntentResult{
 		Code: 422,
 		Payment: &domain.Payment{
-			ID: 8, UserID: 42, Status: domain.StatusFailed, DeclineCode: provider.DeclineInsufficient,
+			ID: 8, UserID: "42", Status: domain.StatusFailed, DeclineCode: provider.DeclineInsufficient,
 		},
 	}}
 	r := newTestRouter(fake, "42")
@@ -373,7 +374,7 @@ func TestCreatePaymentDeclinedEnvelope(t *testing.T) {
 }
 
 func TestGetPayment(t *testing.T) {
-	pay := &domain.Payment{ID: 7, UserID: 42, AmountMinor: 2000, Currency: "USD", Status: domain.StatusCaptured}
+	pay := &domain.Payment{ID: 7, UserID: "42", AmountMinor: 2000, Currency: "USD", Status: domain.StatusCaptured}
 
 	tests := []struct {
 		name       string
@@ -626,8 +627,8 @@ func TestCreateRefund(t *testing.T) {
 				}
 			}
 			if tt.wantStatus == http.StatusCreated {
-				if tt.fake.gotUserID != 0 {
-					t.Errorf("userID passed to logic = %d, want 0 (internal scope)", tt.fake.gotUserID)
+				if tt.fake.gotUserID != "" {
+					t.Errorf("userID passed to logic = %q, want empty (internal scope)", tt.fake.gotUserID)
 				}
 				if tt.fake.gotPaymentID != 7 {
 					t.Errorf("paymentID = %d, want 7", tt.fake.gotPaymentID)

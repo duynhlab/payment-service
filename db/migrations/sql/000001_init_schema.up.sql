@@ -5,7 +5,7 @@
 
 CREATE TABLE IF NOT EXISTS payments (
     id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    user_id             BIGINT      NOT NULL,
+    user_id             VARCHAR(255) NOT NULL,            -- OIDC token subject (opaque string, ADR-042)
     order_id            BIGINT,
     amount_minor        BIGINT      NOT NULL CHECK (amount_minor > 0),
     currency            CHAR(3)     NOT NULL DEFAULT 'USD',
@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_refunds_payment ON refunds (payment_id);
 -- rows-affected decides the winner.
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    user_id        BIGINT      NOT NULL,
+    user_id        VARCHAR(255) NOT NULL,                 -- OIDC token subject (opaque string, ADR-042)
     idem_key       TEXT        NOT NULL,
     request_method TEXT        NOT NULL,
     request_path   TEXT        NOT NULL,
