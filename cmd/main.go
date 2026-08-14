@@ -215,7 +215,7 @@ func run() error {
 // means money is sitting somewhere nobody has looked.
 func registerBacklogGauges(attempts *repository.AttemptRepository, recon *repository.ReconciliationRepository) error {
 	if err := logicv1.ObserveDoubtBacklog(attempts.CountOpen, func(ctx context.Context) (time.Duration, error) {
-		return attempts.OldestOpenAge(ctx, time.Now())
+		return attempts.OldestOpenAge(ctx)
 	}); err != nil {
 		return fmt.Errorf("register doubt-backlog gauges: %w", err)
 	}
