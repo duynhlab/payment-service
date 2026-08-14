@@ -156,15 +156,23 @@ func (r *AttemptRepository) CountOpen(ctx context.Context) (int64, error) {
 // OldestOpenAge returns how long the oldest unresolved doubt has been open, or
 // zero when there is none — the age is what makes it alertable, since a single
 // open attempt is normal and an old one is not.
-func (r *AttemptRepository) OldestOpenAge(ctx context.Context, now time.Time) (time.Duration, error) {
-	var oldest *time.Time
+//
+// The age is computed BY POSTGRES. created_at is written with the database's
+// now(), so subtracting a caller-supplied time.Now() mixes two clocks: with the
+// database even slightly ahead, a just-recorded attempt reports a NEGATIVE age
+// and the gauge this feeds reads as "no doubt older than zero" exactly when
+// doubt was just created. Measured against a container runtime running ~0.3s
+// ahead: -37ms for an attempt inserted moments earlier.
+func (r *AttemptRepository) OldestOpenAge(ctx context.Context) (time.Duration, error) {
+	var seconds *float64
 	if err := r.pool.QueryRow(ctx, `
-		SELECT min(created_at) FROM payment_attempts
-		 WHERE outcome_class = 'UNKNOWN' AND resolved_at IS NULL`).Scan(&oldest); err != nil {
+		SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))
+		  FROM payment_attempts
+		 WHERE outcome_class = 'UNKNOWN' AND resolved_at IS NULL`).Scan(&seconds); err != nil {
 		return 0, fmt.Errorf("oldest open attempt: %w", err)
 	}
-	if oldest == nil {
+	if seconds == nil {
 		return 0, nil
 	}
-	return now.Sub(*oldest), nil
+	return time.Duration(*seconds * float64(time.Second)), nil
 }

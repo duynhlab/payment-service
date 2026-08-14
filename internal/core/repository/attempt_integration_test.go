@@ -53,7 +53,7 @@ func TestAttemptRepository_Integration(t *testing.T) {
 		if n, _ := attempts.CountOpen(ctx); n != 1 {
 			t.Errorf("CountOpen = %d, want 1", n)
 		}
-		age, err := attempts.OldestOpenAge(ctx, time.Now())
+		age, err := attempts.OldestOpenAge(ctx)
 		if err != nil || age <= 0 {
 			t.Errorf("OldestOpenAge = %v err %v, want a positive age", age, err)
 		}
@@ -67,7 +67,7 @@ func TestAttemptRepository_Integration(t *testing.T) {
 		if n, _ := attempts.CountOpen(ctx); n != 0 {
 			t.Errorf("CountOpen after resolve = %d, want 0", n)
 		}
-		if age, _ := attempts.OldestOpenAge(ctx, time.Now()); age != 0 {
+		if age, _ := attempts.OldestOpenAge(ctx); age != 0 {
 			t.Errorf("OldestOpenAge with nothing open = %v, want 0", age)
 		}
 	})

@@ -170,9 +170,18 @@ func (r *ReconciliationRepository) ListDiscrepancies(ctx context.Context, runID 
 // finished runs are removed, so a run still in progress is never reaped. Returns
 // the number of runs removed. Mirrors the outbox reaper.
 func (r *ReconciliationRepository) ReapRuns(ctx context.Context, ttl time.Duration) (int64, error) {
+	// The cutoff is computed BY POSTGRES, not by this process. finished_at is
+	// written with the database's now(), so comparing it against a Go time.Now()
+	// mixes two clocks: if the database is even slightly ahead, a just-finished
+	// run looks like it finished in the future and no retention window can reach
+	// it. Measured on a laptop whose container runtime ran ~0.3s ahead: reaping
+	// with ttl=0 deleted nothing at all. Passing the interval and letting the
+	// server subtract keeps both sides on one clock.
 	tag, err := r.pool.Exec(ctx,
-		`DELETE FROM reconciliation_runs WHERE finished_at IS NOT NULL AND finished_at < $1`,
-		time.Now().Add(-ttl))
+		`DELETE FROM reconciliation_runs
+		  WHERE finished_at IS NOT NULL
+		    AND finished_at < now() - make_interval(secs => $1)`,
+		ttl.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("reap reconciliation runs: %w", err)
 	}
