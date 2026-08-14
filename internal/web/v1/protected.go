@@ -36,9 +36,11 @@ type paymentReader interface {
 	FindByID(ctx context.Context, id int64, userID string) (*domain.Payment, error)
 }
 
-// attemptReader lists a payment's full round-trip history.
+// attemptReader lists a payment's full round-trip history, and the
+// cross-customer worklist of round-trips whose fate is still unknown.
 type attemptReader interface {
 	ListForPayment(ctx context.Context, paymentID int64) ([]domain.Attempt, error)
+	ListOpenPaged(ctx context.Context, limit, offset int) ([]domain.Attempt, int, error)
 }
 
 // ledgerTxReader summarizes a payment's append-only ledger lineage.
@@ -80,6 +82,7 @@ func (h *ProtectedHandler) mountProtected(r *gin.Engine, authMW ...gin.HandlerFu
 	{
 		protected.GET("/payments", h.ListPayments)
 		protected.GET("/payments/:id", h.GetPayment)
+		protected.GET("/attempts/open", h.ListOpenAttempts)
 		protected.GET("/reconciliations/runs", h.ListReconRuns)
 		protected.GET("/reconciliations/runs/:id", h.GetReconRun)
 	}
@@ -141,6 +144,21 @@ func (h *ProtectedHandler) GetPayment(c *gin.Context) {
 		"attempts": attempts,
 		"ledger":   ledger,
 	})
+}
+
+// ListOpenAttempts serves GET /attempts/open?page=&page_size= — the operator's
+// doubt worklist across all customers. Every row is a provider round-trip whose
+// answer never arrived, so the money effect may or may not have landed; the
+// reconciler owns resolving them, and this read is how a human sees the backlog
+// it has not reached yet.
+func (h *ProtectedHandler) ListOpenAttempts(c *gin.Context) {
+	page, pageSize := httpx.ParsePage(c)
+	items, total, err := h.attempts.ListOpenPaged(c.Request.Context(), pageSize, httpx.Offset(page, pageSize))
+	if err != nil {
+		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
+		return
+	}
+	c.JSON(http.StatusOK, httpx.NewPaginated(items, page, pageSize, total))
 }
 
 // ListReconRuns serves GET /reconciliations/runs?page=&page_size=.

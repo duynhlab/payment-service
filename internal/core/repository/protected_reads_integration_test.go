@@ -99,6 +99,50 @@ func TestProtectedReaders_Integration(t *testing.T) {
 		}
 	})
 
+	t.Run("open worklist pages across payments and excludes resolved", func(t *testing.T) {
+		// b gets its own open attempt so the worklist spans two payments.
+		bOpen, err := attempts.Record(ctx, domain.Attempt{
+			PaymentID: b.ID, Operation: domain.AttemptAuthorize, Outcome: domain.OutcomeUnknown,
+		})
+		if err != nil {
+			t.Fatalf("record open attempt on b: %v", err)
+		}
+
+		items, total, err := attempts.ListOpenPaged(ctx, 50, 0)
+		if err != nil || total < 2 {
+			t.Fatalf("open worklist = (total %d, %v), want >= 2", total, err)
+		}
+		ids := map[int64]bool{}
+		for _, a := range items {
+			if !a.Open() {
+				t.Fatalf("resolved attempt leaked into the worklist: %+v", a)
+			}
+			ids[a.ID] = true
+		}
+		if !ids[openID] || !ids[bOpen] {
+			t.Fatalf("worklist missing an open attempt: %v", ids)
+		}
+		if ids[doneID] {
+			t.Fatalf("the resolved attempt %d must not appear", doneID)
+		}
+
+		// Paging walks the same ordering without repeating a row.
+		p1, _, _ := attempts.ListOpenPaged(ctx, 1, 0)
+		p2, _, err := attempts.ListOpenPaged(ctx, 1, 1)
+		if err != nil || len(p1) != 1 || len(p2) != 1 || p1[0].ID == p2[0].ID {
+			t.Fatalf("paging broken: %v vs %v (%v)", p1, p2, err)
+		}
+
+		// Resolving one shrinks the total — the count is live, not cached.
+		if err := attempts.Resolve(ctx, bOpen, time.Now()); err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		_, after, err := attempts.ListOpenPaged(ctx, 50, 0)
+		if err != nil || after != total-1 {
+			t.Fatalf("after resolve total = (%d, %v), want %d", after, err, total-1)
+		}
+	})
+
 	t.Run("ledger lineage summary", func(t *testing.T) {
 		txns, err := ledger.TransactionsForPayment(ctx, a.ID)
 		if err != nil || len(txns) != 1 {

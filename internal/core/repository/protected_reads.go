@@ -65,6 +65,34 @@ func (r *AttemptRepository) ListForPayment(ctx context.Context, paymentID int64)
 	return scanAttempts(rows)
 }
 
+// ListOpenPaged pages the cross-customer open worklist — every attempt still
+// UNKNOWN and unresolved, oldest first, plus the unpaged total. The resolver
+// sweep consumes ListOpen with a hard limit because it works a batch; the
+// operator needs the true size of the doubt, which is what the total is for.
+func (r *AttemptRepository) ListOpenPaged(ctx context.Context, limit, offset int) ([]domain.Attempt, int, error) {
+	var total int
+	if err := r.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM payment_attempts
+		 WHERE outcome_class = 'UNKNOWN' AND resolved_at IS NULL`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count open attempts: %w", err)
+	}
+
+	rows, err := r.pool.Query(ctx, `
+		SELECT `+attemptColumns+`
+		  FROM payment_attempts
+		 WHERE outcome_class = 'UNKNOWN' AND resolved_at IS NULL
+		 ORDER BY created_at, id
+		 LIMIT $1 OFFSET $2`, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list open attempts page: %w", err)
+	}
+	items, err := scanAttempts(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
 // LedgerTransactionView is one append-only ledger transaction with its
 // balanced entry legs summarized for the operator.
 type LedgerTransactionView struct {

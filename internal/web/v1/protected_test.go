@@ -25,8 +25,11 @@ type fakeReaders struct {
 	}
 	payment  *domain.Payment
 	payErr   error
-	attempts []domain.Attempt
-	attErr   error
+	attempts  []domain.Attempt
+	attErr    error
+	open      []domain.Attempt
+	openTotal int
+	openErr   error
 	ledger   []repository.LedgerTransactionView
 	ledErr   error
 	runs     []repository.ReconRunView
@@ -51,6 +54,10 @@ func (f *fakeReaders) FindByID(_ context.Context, _ int64, userID string) (*doma
 }
 func (f *fakeReaders) ListForPayment(_ context.Context, _ int64) ([]domain.Attempt, error) {
 	return f.attempts, f.attErr
+}
+func (f *fakeReaders) ListOpenPaged(_ context.Context, limit, offset int) ([]domain.Attempt, int, error) {
+	f.got.limit, f.got.offset = limit, offset
+	return f.open, f.openTotal, f.openErr
 }
 func (f *fakeReaders) TransactionsForPayment(_ context.Context, _ int64) ([]repository.LedgerTransactionView, error) {
 	return f.ledger, f.ledErr
@@ -92,6 +99,7 @@ func TestProtectedPaymentsRoleGate(t *testing.T) {
 	for _, path := range []string{
 		"/payment/v1/protected/payments",
 		"/payment/v1/protected/payments/1",
+		"/payment/v1/protected/attempts/open",
 		"/payment/v1/protected/reconciliations/runs",
 		"/payment/v1/protected/reconciliations/runs/1",
 	} {
@@ -175,6 +183,37 @@ func TestProtectedGetPaymentErrorBranches(t *testing.T) {
 	r2 := protectedEngine(t, f2, backofficeRole)
 	if w := get(r2, "/payment/v1/protected/payments"); w.Code != http.StatusInternalServerError {
 		t.Fatalf("list err: want 500, got %d", w.Code)
+	}
+}
+
+func TestProtectedOpenAttempts(t *testing.T) {
+	f := &fakeReaders{
+		open:      []domain.Attempt{{ID: 4, PaymentID: 9, Outcome: domain.OutcomeUnknown}},
+		openTotal: 12,
+	}
+	r := protectedEngine(t, f, backofficeRole)
+
+	w := get(r, "/payment/v1/protected/attempts/open?page=3&page_size=5")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if f.got.limit != 5 || f.got.offset != 10 {
+		t.Fatalf("paging not forwarded: %+v", f.got)
+	}
+	var resp struct {
+		TotalItems int              `json:"total_items"`
+		Items      []domain.Attempt `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.TotalItems != 12 || len(resp.Items) != 1 || resp.Items[0].ID != 4 {
+		t.Fatalf("worklist body wrong: %s", w.Body.String())
+	}
+
+	f.openErr = context.DeadlineExceeded
+	if w := get(r, "/payment/v1/protected/attempts/open"); w.Code != http.StatusInternalServerError {
+		t.Fatalf("reader error: want 500, got %d", w.Code)
 	}
 }
 
