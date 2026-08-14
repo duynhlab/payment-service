@@ -197,9 +197,10 @@ func run() error {
 	}
 
 	var isShuttingDown atomic.Bool
-	protectedHandler := v1.NewProtectedHandler(paymentRepo, attemptRepo,
-		repository.NewLedgerRepository(pool), repository.NewReconReadRepository(pool))
-	srv := setupServer(cfg, logger, verifier, staffVerifier, paymentHandler, protectedHandler, webhookHandler, reconHandler, &isShuttingDown)
+	srv := setupServer(cfg, logger, verifier, staffVerifier, paymentHandler,
+		v1.NewProtectedHandler(paymentRepo, attemptRepo,
+			repository.NewLedgerRepository(pool), repository.NewReconReadRepository(pool)),
+		webhookHandler, reconHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
 	return nil
 }
