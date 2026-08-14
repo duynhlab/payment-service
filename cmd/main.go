@@ -138,13 +138,9 @@ func run() error {
 	// no gRPC fallback. The JWKS URL is derived from the Keycloak issuer unless
 	// OIDC_JWKS_URL overrides it. NewVerifier does not block on an unreachable
 	// JWKS — it refreshes in the background, so it is safe to build at startup.
-	verifier, err := authmw.NewVerifier(authmw.Config{
-		Issuer:   cfg.OIDCIssuer,
-		Audience: cfg.OIDCAudience,
-		JWKSURL:  cfg.OIDCJWKSURL,
-	})
+	verifier, staffVerifier, err := buildVerifiers(cfg)
 	if err != nil {
-		return fmt.Errorf("JWKS verifier init: %w", err)
+		return err
 	}
 
 	// Repositories + provider + logic. P1 runs the in-memory provider stub;
@@ -158,7 +154,6 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL,
 		logicv1.WithAttempts(attemptRepo))
 	paymentHandler := v1.NewHandler(paymentService)
-
 
 	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)
 
@@ -202,7 +197,10 @@ func run() error {
 	}
 
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, logger, verifier, paymentHandler, webhookHandler, reconHandler, &isShuttingDown)
+	srv := setupServer(cfg, logger, verifier, staffVerifier, paymentHandler,
+		v1.NewProtectedHandler(paymentRepo, attemptRepo,
+			repository.NewLedgerRepository(pool), repository.NewReconReadRepository(pool)),
+		webhookHandler, reconHandler, &isShuttingDown)
 	runGracefulShutdown(cfg, srv, tp, pool, logger, &isShuttingDown, stopJobsAndWait)
 	return nil
 }
@@ -531,7 +529,7 @@ func initProfiling(cfg *config.Config, logger *zap.Logger) func() {
 	}
 }
 
-func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, paymentHandler *v1.Handler, webhookHandler *v1.WebhookHandler, reconHandler *v1.ReconciliationHandler, isShuttingDown *atomic.Bool) *http.Server {
+func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, staffVerifier *authmw.Verifier, paymentHandler *v1.Handler, protectedHandler *v1.ProtectedHandler, webhookHandler *v1.WebhookHandler, reconHandler *v1.ReconciliationHandler, isShuttingDown *atomic.Bool) *http.Server {
 	r := gin.Default()
 
 	r.Use(middleware.TracingMiddleware())
@@ -551,6 +549,9 @@ func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifi
 	// Payment v1 routes — private (JWT required) + internal (cluster-only,
 	// NetworkPolicy is the fence). Variant A edge naming.
 	v1.RegisterRoutes(r, paymentHandler, verifier)
+	// Protected: the Backoffice's cross-customer reads (RFC-0023),
+	// staff-realm verified + role-gated (ADR-050).
+	v1.RegisterProtectedRoutes(r, protectedHandler, staffVerifier)
 	// Public webhook route — no JWT; the HMAC signature is the credential.
 	v1.RegisterWebhookRoutes(r, webhookHandler)
 	// Internal reconciliation API — cluster-only (NetworkPolicy is the fence),
@@ -624,4 +625,28 @@ func runGracefulShutdown(
 	}
 
 	logger.Info("Graceful shutdown complete")
+}
+
+// buildVerifiers constructs the customer-realm verifier (private routes) and
+// the staff-realm verifier (protected Backoffice group, ADR-050). Split from
+// run() to keep it within the lint budget; NewVerifier does not block on an
+// unreachable JWKS.
+func buildVerifiers(cfg *config.Config) (*authmw.Verifier, *authmw.Verifier, error) {
+	verifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCJWKSURL,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("JWKS verifier init: %w", err)
+	}
+	staffVerifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCStaffIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCStaffJWKSURL,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("staff JWKS verifier init: %w", err)
+	}
+	return verifier, staffVerifier, nil
 }
