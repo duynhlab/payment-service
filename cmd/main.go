@@ -138,24 +138,9 @@ func run() error {
 	// no gRPC fallback. The JWKS URL is derived from the Keycloak issuer unless
 	// OIDC_JWKS_URL overrides it. NewVerifier does not block on an unreachable
 	// JWKS — it refreshes in the background, so it is safe to build at startup.
-	verifier, err := authmw.NewVerifier(authmw.Config{
-		Issuer:   cfg.OIDCIssuer,
-		Audience: cfg.OIDCAudience,
-		JWKSURL:  cfg.OIDCJWKSURL,
-	})
+	verifier, staffVerifier, err := buildVerifiers(cfg)
 	if err != nil {
-		return fmt.Errorf("JWKS verifier init: %w", err)
-	}
-
-	// Second verifier for the protected Backoffice group (ADR-050): the
-	// workforce realm — customer tokens never pass it and vice versa.
-	staffVerifier, err := authmw.NewVerifier(authmw.Config{
-		Issuer:   cfg.OIDCStaffIssuer,
-		Audience: cfg.OIDCAudience,
-		JWKSURL:  cfg.OIDCStaffJWKSURL,
-	})
-	if err != nil {
-		return fmt.Errorf("staff JWKS verifier init: %w", err)
+		return err
 	}
 
 	// Repositories + provider + logic. P1 runs the in-memory provider stub;
@@ -169,7 +154,6 @@ func run() error {
 	paymentService := logicv1.NewService(paymentRepo, idemRepo, prov, cfg.Payment.AuthHoldTTL,
 		logicv1.WithAttempts(attemptRepo))
 	paymentHandler := v1.NewHandler(paymentService)
-
 
 	reconciler, reconHandler, reconRepo := buildReconciliation(cfg, prov, pool, paymentRepo, logger)
 
@@ -640,4 +624,28 @@ func runGracefulShutdown(
 	}
 
 	logger.Info("Graceful shutdown complete")
+}
+
+// buildVerifiers constructs the customer-realm verifier (private routes) and
+// the staff-realm verifier (protected Backoffice group, ADR-050). Split from
+// run() to keep it within the lint budget; NewVerifier does not block on an
+// unreachable JWKS.
+func buildVerifiers(cfg *config.Config) (*authmw.Verifier, *authmw.Verifier, error) {
+	verifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCJWKSURL,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("JWKS verifier init: %w", err)
+	}
+	staffVerifier, err := authmw.NewVerifier(authmw.Config{
+		Issuer:   cfg.OIDCStaffIssuer,
+		Audience: cfg.OIDCAudience,
+		JWKSURL:  cfg.OIDCStaffJWKSURL,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("staff JWKS verifier init: %w", err)
+	}
+	return verifier, staffVerifier, nil
 }
