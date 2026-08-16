@@ -30,11 +30,11 @@ import (
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/payment-service/internal/mockpay"
 	v1 "github.com/duynhlab/payment-service/internal/web/v1"
-	"github.com/duynhlab/payment-service/middleware"
 	paymentv1 "github.com/duynhlab/pkg/proto/payment/v1"
 
 	"github.com/duynhlab/pkg/authmw"
 	"github.com/duynhlab/pkg/grpcx"
+	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/idempotency"
 	"github.com/duynhlab/pkg/logger/zapx"
 	"github.com/duynhlab/pkg/migratex"
@@ -197,7 +197,7 @@ func run() error {
 	}
 
 	var isShuttingDown atomic.Bool
-	srv := setupServer(cfg, logger, verifier, staffVerifier, paymentHandler,
+	srv := setupServer(cfg, obsx.ConfigFromEnv().ServiceName, logger, verifier, staffVerifier, paymentHandler,
 		v1.NewProtectedHandler(paymentRepo, attemptRepo,
 			repository.NewLedgerRepository(pool), repository.NewReconReadRepository(pool)),
 		webhookHandler, reconHandler, &isShuttingDown)
@@ -482,7 +482,6 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 // original otherwise.
 func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
 	otelCfg := obsx.ConfigFromEnv()
-	middleware.SetServiceName(otelCfg.ServiceName)
 	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
 	if err != nil {
 		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
@@ -529,11 +528,11 @@ func initProfiling(cfg *config.Config, logger *zap.Logger) func() {
 	}
 }
 
-func setupServer(cfg *config.Config, logger *zap.Logger, verifier *authmw.Verifier, staffVerifier *authmw.Verifier, paymentHandler *v1.Handler, protectedHandler *v1.ProtectedHandler, webhookHandler *v1.WebhookHandler, reconHandler *v1.ReconciliationHandler, isShuttingDown *atomic.Bool) *http.Server {
+func setupServer(cfg *config.Config, otelServiceName string, logger *zap.Logger, verifier *authmw.Verifier, staffVerifier *authmw.Verifier, paymentHandler *v1.Handler, protectedHandler *v1.ProtectedHandler, webhookHandler *v1.WebhookHandler, reconHandler *v1.ReconciliationHandler, isShuttingDown *atomic.Bool) *http.Server {
 	r := gin.Default()
 
-	r.Use(middleware.TracingMiddleware())
-	r.Use(middleware.LoggingMiddleware(logger))
+	r.Use(httpmw.Tracing(otelServiceName))
+	r.Use(httpmw.Logging(logger))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{fieldStatus: "ok"})

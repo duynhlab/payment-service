@@ -56,6 +56,8 @@ github.com/duynhlab/pkg/dbx v0.36.1 h1:S5CjSTPlPlqsi4AK9aM/q90GUubGKwR+FXVbnHs7v
 github.com/duynhlab/pkg/dbx v0.36.1/go.mod h1:YnVOlvg23XpF6Acej/93539Zuwprp+kPug/joM49Cas=
 github.com/duynhlab/pkg/grpcx v0.36.1 h1:903Ebfd8kh3lMWf0X/PCXfnQ3J1UQPRc+3nax7e6WUA=
 github.com/duynhlab/pkg/grpcx v0.36.1/go.mod h1:Ck4uez5IUMlwkFFRxDskKATZADRquF7L1zIICtbM4nM=
+github.com/duynhlab/pkg/httpmw v0.1.0 h1:YLN9CFIHgK3tQTWx1WKIXCSkPJ6slDB/tLZ7Beub/Bs=
+github.com/duynhlab/pkg/httpmw v0.1.0/go.mod h1:E5Bz4CXQJZnxvPMZR0gUC1U5jCMMt7fAGwRZ7E1Tck4=
 github.com/duynhlab/pkg/httpx v0.36.1 h1:U/Bia3HwruSzNjnYVUgDC4R23gR5s02sAeCEQyrExjw=
 github.com/duynhlab/pkg/httpx v0.36.1/go.mod h1:9JIPpqTo1HGpyZP5chvW1l7+6h0WiL6VNdng1N4TpIM=
 github.com/duynhlab/pkg/idempotency v0.37.0 h1:0/SA6lTMNmpoQ6jBdczojeqZEsh84NDGdTkE2N2jOkk=
@@ -64,8 +66,8 @@ github.com/duynhlab/pkg/logger/zapx v0.36.0 h1:KYDOlgodIuNelGHjUCTKICDTMPaSrhbnq
 github.com/duynhlab/pkg/logger/zapx v0.36.0/go.mod h1:ZeoZcXSolDxJ4Tb3KbvvPy94hd6GJ0WfF/wBDmEvIWI=
 github.com/duynhlab/pkg/migratex v0.36.1 h1:N/Ro1jEIe4Hlf1hHLkc8mepuvqX4mk6qt8pp3YPUTOI=
 github.com/duynhlab/pkg/migratex v0.36.1/go.mod h1:16pUewDHZ+CSu9dkqFQ9gc0PoreUHpR5jNPMSHVcc9Y=
-github.com/duynhlab/pkg/obsx v0.36.1 h1:gS/ECndibxvUD4wDT5I2DTxsY7b/EhZDzl8PRaIiKJ8=
-github.com/duynhlab/pkg/obsx v0.36.1/go.mod h1:h5ZN+J4kMOcUuBEgFA8leFx2eR49yxClOB6Pds4pPKk=
+github.com/duynhlab/pkg/obsx v0.37.0 h1:a+ePdjvuSciRaMvokKm9DMyeQmh5tyT0zdQKl0pTS6U=
+github.com/duynhlab/pkg/obsx v0.37.0/go.mod h1:h5ZN+J4kMOcUuBEgFA8leFx2eR49yxClOB6Pds4pPKk=
 github.com/duynhlab/pkg/proto v0.37.0 h1:jDIIg1Db+InWKGkixsNWk6NyXbHAKqjA6nGwViBVqaY=
 github.com/duynhlab/pkg/proto v0.37.0/go.mod h1:3zQqA/7CB53Zeu3vVoKQc36eb8y1QwAd/ixX2hPYhms=
 github.com/ebitengine/purego v0.10.0 h1:QIw4xfpWT6GWTzaW5XEKy3HXoqrJGx1ijYHzTF0/ISU=
