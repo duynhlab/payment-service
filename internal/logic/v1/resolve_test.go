@@ -48,7 +48,7 @@ func TestParkedIntent_FreshKeyResolvesAndNeverChargesTwice(t *testing.T) {
 	if _, err := svc.CreateIntent(ctx, "key-1", intentFor(order, 2000)); !errors.Is(err, domain.ErrOutcomeUnknown) {
 		t.Fatalf("first attempt err = %v, want ErrOutcomeUnknown", err)
 	}
-	if got := prov.Stub.Charges(); got != 1 {
+	if got := prov.Charges(); got != 1 {
 		t.Fatalf("charges after the lost answer = %d, want 1", got)
 	}
 
@@ -61,7 +61,7 @@ func TestParkedIntent_FreshKeyResolvesAndNeverChargesTwice(t *testing.T) {
 	if res.Code != 201 || res.Payment.Status != domain.StatusAuthorized {
 		t.Fatalf("code=%d status=%s, want 201/authorized", res.Code, res.Payment.Status)
 	}
-	if got := prov.Stub.Charges(); got != 1 {
+	if got := prov.Charges(); got != 1 {
 		t.Fatalf("charges after resolution = %d, want 1 — the card must not be charged twice", got)
 	}
 }

@@ -127,15 +127,14 @@ func (f *fakePayments) TransitionStatus(_ context.Context, id int64, from, to do
 		return domain.ErrStaleTransition
 	}
 	p.Status = to
-	if v, ok := set["provider_payment_id"]; ok {
-		p.ProviderPaymentID = v.(string)
+	if v, ok := set["provider_payment_id"].(string); ok {
+		p.ProviderPaymentID = v
 	}
-	if v, ok := set["decline_code"]; ok {
-		p.DeclineCode = v.(string)
+	if v, ok := set["decline_code"].(string); ok {
+		p.DeclineCode = v
 	}
-	if v, ok := set["expires_at"]; ok {
-		t := v.(time.Time)
-		p.ExpiresAt = &t
+	if v, ok := set["expires_at"].(time.Time); ok {
+		p.ExpiresAt = &v
 	}
 	return nil
 }

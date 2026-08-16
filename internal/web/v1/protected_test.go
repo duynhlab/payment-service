@@ -23,20 +23,20 @@ type fakeReaders struct {
 		status        string
 		limit, offset int
 	}
-	payment  *domain.Payment
-	payErr   error
+	payment   *domain.Payment
+	payErr    error
 	attempts  []domain.Attempt
 	attErr    error
 	open      []domain.Attempt
 	openTotal int
 	openErr   error
-	ledger   []repository.LedgerTransactionView
-	ledErr   error
-	runs     []repository.ReconRunView
-	runTotal int
-	run      *repository.ReconRunView
-	discs    []repository.ReconDiscrepancyView
-	runErr   error
+	ledger    []repository.LedgerTransactionView
+	ledErr    error
+	runs      []repository.ReconRunView
+	runTotal  int
+	run       *repository.ReconRunView
+	discs     []repository.ReconDiscrepancyView
+	runErr    error
 }
 
 func (f *fakeReaders) ListAll(_ context.Context, status string, limit, offset int) ([]domain.Payment, int, error) {
