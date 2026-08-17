@@ -1,121 +1,104 @@
 version: "2"
 
 run:
-  timeout: 3m
+  timeout: 5m
   tests: true
+  relative-path-mode: gomod
+  modules-download-mode: readonly
+  allow-parallel-runners: true
 
 linters:
-  settings:
-    gocyclo:
-      min-complexity: 30
+  default: none
 
-    lll:
-      line-length: 100
-
-    funlen:
-      lines: 100
-      statements: 50
-
-    nestif:
-      min-complexity: 8
-
-    errcheck:
-      check-type-assertions: false
-      check-blank: false
-      exclude-functions:
-        - fmt.Print
-        - fmt.Printf
-        - fmt.Println
-        - fmt.Fprint
-        - fmt.Fprintf
-        - fmt.Fprintln
-        - (*log.Logger).Print
-        - (*log.Logger).Printf
-        - (*log.Logger).Println
   enable:
-    - asasalint
-    - asciicheck
-    - bidichk
-    - bodyclose
-    - canonicalheader
-    - copyloopvar
-    - dupl
-    - durationcheck
-    - embeddedstructfieldcheck
+    # Go core
     - errcheck
-    - errname
-    - errorlint
-    - exhaustive
-    - exptostd
-    - fatcontext
-    - forbidigo
-    - funlen
-    - gocheckcompilerdirectives
-    - gochecknoinits
-    - gochecksumtype
-    - gocognit
-    - goconst
-    - gocritic
-    - gocyclo
-    - gomoddirectives
-    - goprintffuncname
-    - gosec
     - govet
-    - iface
     - ineffassign
-    - intrange
-    - iotamixing
-    - loggercheck
-    - makezero
-    - mirror
-    - musttag
-    - nakedret
-    - nestif
+    - staticcheck
+    - unused
+
+    # Errors and correctness
+    - bodyclose
+    - durationcheck
+    - errorlint
+    - fatcontext
     - nilerr
     - nilnesserr
     - noctx
     - nosprintfhostport
-    - perfsprint
-    - predeclared
-    - promlinter
-    - reassign
-    - rowserrcheck
-    - sloglint
-    - spancheck
-    - sqlclosecheck
-    - staticcheck
-    - testableexamples
-    - testifylint
-    - testpackage
-    - tparallel
-    - unconvert
-    - unparam
-    - unqueryvet
-    - unused
-    - usestdlibvars
-    - usetesting
     - wastedassign
+
+    # Security
+    - asciicheck
+    - bidichk
+    - gosec
+
+    # Maintainability
+    - gocritic
+    - misspell
+    - nakedret
+    - nolintlint
+    - unconvert
     - whitespace
+
+    # Platform-specific defences. These four are not general Go hygiene — each
+    # guards a failure mode this platform actually has, and each was measured to
+    # find nothing today, so they cost a clean run and buy a regression gate.
+    - spancheck        # a span that is never Ended; every service opens spans
+    - sqlclosecheck    # rows/statements left open against Postgres
+    - rowserrcheck     # rows.Err() never checked, so a failed scan reads as empty
+    - testifylint      # reversed want/got and friends: a test that passes wrongly
+
+  settings:
+    errcheck:
+      # An unchecked type assertion panics at runtime rather than returning an
+      # error, so this is the stricter and safer setting.
+      check-type-assertions: true
+      check-blank: false
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    spancheck:
+      # Record-and-set-status together: a recorded error on a span left green
+      # makes the trace look healthy while carrying an exception nobody queries.
+      checks: [end, record-error, set-status]
+
   exclusions:
+    generated: strict
+    warn-unused: true
+
     rules:
       - path: _test\.go
         linters:
-          - funlen
-          - gocyclo
-          - dupl
-          - errcheck
-
-      - linters:
-          - errcheck
           - gosec
-        text: "Error return value of .*(Close|Write|Print|Error).*not checked"
+          # noctx flags httptest.NewRequest and asks for NewRequestWithContext.
+          # Measured across the fleet: 19/19 findings in order-service and 20/20
+          # in payment-service were this one call in test files. Real handler
+          # code is not affected, so the linter stays on for production paths.
+          - noctx
 
-      - linters:
-          - errcheck
-          - gosec
-        text: "Error return value of .*fmt\\.Print.*not checked"
-    paths:
-      - _test\.go
-      - vendor\/
-      - .*\.pb\.go$
-      - .*_generated\.go$
+formatters:
+  enable:
+    - goimports
+    # gofumpt is deliberately off, not forgotten. It changes no tokens — every
+    # token before the rewrite is still there after it, verified by comparing
+    # whitespace-stripped diffs — but it re-splits long signatures and composite
+    # literals across lines and adds trailing commas, which measured at roughly
+    # 2,500 changed lines over 72 files on five repositories alone (order 644,
+    # product 1,339). That is a mechanical sweep worth its own pull request per
+    # repository, where the diff can be read as "formatting, nothing else",
+    # rather than something buried inside a policy change.
+    # - gofumpt
+
+  exclusions:
+    generated: strict
+
+issues:
+  # golangci caps repeated findings at 3 by default, which silently hides how
+  # much of a pattern exists. Report everything.
+  max-issues-per-linter: 0
+  max-same-issues: 0

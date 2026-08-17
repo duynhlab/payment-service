@@ -54,22 +54,22 @@ type Server struct {
 	logger  *zap.Logger
 	emitter Emitter // webhook emitter; nil disables emission
 
-	mu            sync.Mutex
-	seq           int64                      // provider_payment_id sequence
-	refundSeq     int64                      // provider_refund_id sequence
-	eventSeq      int64                      // webhook event_id sequence
-	byKey         map[string]provider.Charge // charge idempotency replay
-	captured      map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
-	voided        map[string]bool            // voided ids — makes void idempotent under retry
-	refunded      map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
-	amounts       map[string]int64           // provider_payment_id -> amount (for GET /transactions)
+	mu        sync.Mutex
+	seq       int64                      // provider_payment_id sequence
+	refundSeq int64                      // provider_refund_id sequence
+	eventSeq  int64                      // webhook event_id sequence
+	byKey     map[string]provider.Charge // charge idempotency replay
+	captured  map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
+	voided    map[string]bool            // voided ids — makes void idempotent under retry
+	refunded  map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
+	amounts   map[string]int64           // provider_payment_id -> amount (for GET /transactions)
 	// createdAt is when the provider first saw each charge. Reconciliation reads
 	// it to bound a pass to a time window: without it a caller can only ask for
 	// EVERY transaction the provider has ever recorded, which is the scan that
 	// grows forever.
-	createdAt map[string]time.Time
-	refundsByKey  map[string]string          // refund idempotency key -> provider_refund_id
-	transientSeen map[string]bool            // charge keys that already hit the transient trigger once
+	createdAt     map[string]time.Time
+	refundsByKey  map[string]string // refund idempotency key -> provider_refund_id
+	transientSeen map[string]bool   // charge keys that already hit the transient trigger once
 	// mutationKeys binds an idempotency key to the (operation, charge) it was
 	// first used for, so reuse elsewhere is a detectable caller bug. It does NOT
 	// remember the answer: replaying a remembered success could contradict the

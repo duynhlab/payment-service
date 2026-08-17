@@ -56,7 +56,7 @@ func NewWebhookEmitter(url, secret string, logger *zap.Logger) *WebhookEmitter {
 		sem:       make(chan struct{}, maxInFlightWebhooks),
 		baseDelay: 200 * time.Millisecond,
 		now:       time.Now,
-		rnd:       rand.Float64, //nolint:gosec // non-crypto: only picks which events to duplicate
+		rnd:       rand.Float64, // non-crypto: only picks which events to duplicate
 	}
 }
 

@@ -206,8 +206,9 @@ func TestServer_NoAnswerCreatesTheChargeThenGoesSilent(t *testing.T) {
 	hc := &http.Client{Timeout: 900 * time.Millisecond}
 	body, _ := json.Marshal(provider.ChargeRequest{IdempotencyKey: "na", AmountMinor: 5013, Currency: "USD", AutoCapture: true})
 
-	_, err := hc.Post(base+"/charges", "application/json", bytes.NewReader(body))
+	silent, err := hc.Post(base+"/charges", "application/json", bytes.NewReader(body))
 	if err == nil {
+		_ = silent.Body.Close()
 		t.Fatal("the …13 trigger must not answer within the client timeout")
 	}
 

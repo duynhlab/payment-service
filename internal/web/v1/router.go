@@ -17,8 +17,8 @@ import (
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
-	"github.com/duynhlab/payment-service/middleware"
 	"github.com/duynhlab/pkg/authmw"
+	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/httpx"
 )
 
@@ -74,7 +74,7 @@ func (h *Handler) mount(r *gin.Engine, jwtMW gin.HandlerFunc) {
 // returned handle. The caller must NOT end it; otelgin owns its lifecycle.
 func beginRequest(c *gin.Context) (context.Context, trace.Span, *zap.Logger) {
 	ctx := c.Request.Context()
-	return ctx, trace.SpanFromContext(ctx), middleware.GetLoggerFromGinContext(c)
+	return ctx, trace.SpanFromContext(ctx), httpmw.LoggerFrom(c)
 }
 
 // beginAuthed resolves the otelgin server span and the authenticated user id —

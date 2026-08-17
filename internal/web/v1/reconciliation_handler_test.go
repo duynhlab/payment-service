@@ -3,8 +3,8 @@ package v1
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"

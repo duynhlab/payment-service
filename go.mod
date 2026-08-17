@@ -6,18 +6,18 @@ require (
 	github.com/duynhlab/pkg/authmw v0.37.1
 	github.com/duynhlab/pkg/dbx v0.36.1
 	github.com/duynhlab/pkg/grpcx v0.36.1
+	github.com/duynhlab/pkg/httpmw v0.1.0
 	github.com/duynhlab/pkg/httpx v0.36.1
 	github.com/duynhlab/pkg/idempotency v0.37.0
 	github.com/duynhlab/pkg/logger/zapx v0.36.0
 	github.com/duynhlab/pkg/migratex v0.36.1
-	github.com/duynhlab/pkg/obsx v0.36.1
+	github.com/duynhlab/pkg/obsx v0.37.1
 	github.com/duynhlab/pkg/proto v0.37.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/joho/godotenv v1.5.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
-	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.69.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
@@ -110,6 +110,7 @@ require (
 	go.mongodb.org/mongo-driver/v2 v2.6.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/bridges/otelzap v0.19.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.69.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.69.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.69.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.20.0 // indirect

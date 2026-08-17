@@ -109,7 +109,7 @@ func TestAuthorize_Validation(t *testing.T) {
 	// currency, PCI-safe token.
 	for _, r := range []*paymentv1.AuthorizeRequest{
 		{OrderId: 0, UserId: "7", AmountMinor: 1, PaymentMethod: "tok_visa"},
-		{OrderId: 1, UserId: "", AmountMinor: 1, PaymentMethod: "tok_visa"},                              // empty subject
+		{OrderId: 1, UserId: "", AmountMinor: 1, PaymentMethod: "tok_visa"},                                  // empty subject
 		{OrderId: 1, UserId: strings.Repeat("x", maxUserIDLen+1), AmountMinor: 1, PaymentMethod: "tok_visa"}, // over the VARCHAR(255) bound
 		{OrderId: 1, UserId: "7", AmountMinor: 0, PaymentMethod: "tok_visa"},
 		{OrderId: 1, UserId: "7", AmountMinor: logicv1.MaxAmountMinor + 1, PaymentMethod: "tok_visa"}, // over ceiling
