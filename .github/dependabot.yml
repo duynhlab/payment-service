@@ -11,6 +11,13 @@ updates:
       duynhlab-pkg:
         patterns:
           - "github.com/duynhlab/pkg/*"
+    ignore:
+      # RFC-0031 / ADR-072: the OpenTelemetry version is owned by duynhlab/pkg.
+      # obsx pins the SDK, exporters, contrib and semconv together and the
+      # services import only the API, so bumping go.opentelemetry.io/* here
+      # would skew the API against the SDK the shared package links. It moves
+      # with the pkg release train instead.
+      - dependency-name: "go.opentelemetry.io/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
