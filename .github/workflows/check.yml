@@ -18,10 +18,14 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@e321897e5c28e7c861b9d8beb37614e1c5823f42 # main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@5179402dc1ae410e8964c85926b830481df87360 # main
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
+      # RFC-0031 / ADR-072 fleet lint policy — second, additive pass from
+      # gha-workflows/.github/lint/golangci-policy.yml. Non-blocking for this
+      # release train; policy-lint-blocking: true follows.
+      policy-lint: true
       integration: true
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
 
