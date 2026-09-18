@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   pr-checks:
-    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@e321897e5c28e7c861b9d8beb37614e1c5823f42 # main
+    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@76ba76a2ad8bb8fe9217b2c3cf4f56c55642a92a # main
     with:
       slack_channel_id: "C0AD82A9A74"
     secrets:
