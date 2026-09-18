@@ -66,8 +66,8 @@ github.com/duynhlab/pkg/logger/zapx v0.36.1 h1:H70ugkEHXqeQq6Qtn/bw5KIrSAIa/zbQP
 github.com/duynhlab/pkg/logger/zapx v0.36.1/go.mod h1:a81EFKY45L5Mevu1227UtVCM+AIiDtMYgHHI0br80EM=
 github.com/duynhlab/pkg/migratex v0.36.2 h1:Sab/5qFhXU7awrqXvwKCioXs4myOz2nAE8Wbc5x7bQ0=
 github.com/duynhlab/pkg/migratex v0.36.2/go.mod h1:rF/I+XnjX0k2BoTtfAkiuDe1U/2ztifUb+jHLzPP0Ro=
-github.com/duynhlab/pkg/obsx v0.38.0 h1:RMpi33vzoHDkvESIY0tgP915vf4SS0p5IliGgRwgxbs=
-github.com/duynhlab/pkg/obsx v0.38.0/go.mod h1:6jmCsHYmURKV/Py2fnVyttB6PHpV3loBip6x70XuWmM=
+github.com/duynhlab/pkg/obsx v0.39.2 h1:UgxWHrZK2f2mPr8t7+6ciZwo0tNlhQR0hr0cUiLdRWU=
+github.com/duynhlab/pkg/obsx v0.39.2/go.mod h1:6jmCsHYmURKV/Py2fnVyttB6PHpV3loBip6x70XuWmM=
 github.com/duynhlab/pkg/proto v0.37.1 h1:ZjzXp0rLb6JTQq4t+41HFKVJDIZXaIzcSdx/OD0087o=
 github.com/duynhlab/pkg/proto v0.37.1/go.mod h1:reihbeWynb+5FLWjvw7Azgr2YG8cFFyxPVXCpUreVAY=
 github.com/ebitengine/purego v0.10.0 h1:QIw4xfpWT6GWTzaW5XEKy3HXoqrJGx1ijYHzTF0/ISU=
