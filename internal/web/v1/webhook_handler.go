@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/payment-service/internal/webhooksig"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 const (
@@ -75,7 +76,7 @@ func (h *WebhookHandler) HandleMockpay(c *gin.Context) {
 
 	// Verify over the RAW bytes — re-marshaling would change them and break HMAC.
 	if err := webhooksig.Verify(h.secret, c.GetHeader("Mockpay-Signature"), raw, time.Now(), webhookTolerance); err != nil {
-		log.Warn("webhook signature rejected", zap.Error(err))
+		log.Warn(ctx, "webhook signature rejected", slogx.Err(err))
 		c.JSON(http.StatusUnauthorized, gin.H{keyError: "invalid signature"})
 		return
 	}
@@ -84,7 +85,7 @@ func (h *WebhookHandler) HandleMockpay(c *gin.Context) {
 	if err := json.Unmarshal(raw, &ev); err != nil || ev.EventID == "" {
 		// Validly signed but unparseable / no event_id: a sender bug. Ack so it
 		// is not retried forever; nothing to dedup on.
-		log.Warn("webhook malformed after valid signature", zap.Error(err))
+		log.Warn(ctx, "webhook malformed after valid signature", slogx.Err(err))
 		c.JSON(http.StatusOK, gin.H{keyStatus: "ignored"})
 		return
 	}
@@ -92,16 +93,16 @@ func (h *WebhookHandler) HandleMockpay(c *gin.Context) {
 	result, err := h.processor.Process(ctx, ev.EventID, ev.Type, ev.ProviderPaymentID)
 	if err != nil {
 		// Infra failure — return non-2xx so the sender retries.
-		log.Error("webhook processing failed", zap.String("event_id", ev.EventID), zap.Error(err))
+		log.Error(ctx, "webhook processing failed", slog.String("webhook.event_id", ev.EventID), slogx.Err(err))
 		c.JSON(http.StatusInternalServerError, gin.H{keyError: "processing failed"})
 		return
 	}
 
-	log.Info("webhook received",
-		zap.String("event_id", ev.EventID),
-		zap.String("event_type", ev.Type),
-		zap.String(keyStatus, result.Status),
-		zap.Bool("duplicate", result.Duplicate),
+	log.Info(ctx, "webhook received",
+		slog.String("webhook.event_id", ev.EventID),
+		slog.String("event_type", ev.Type),
+		slog.String(keyStatus, result.Status),
+		slog.Bool("duplicate", result.Duplicate),
 	)
 	c.JSON(http.StatusOK, gin.H{keyStatus: result.Status, "duplicate": result.Duplicate})
 }

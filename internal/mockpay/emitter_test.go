@@ -8,10 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/webhooksig"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 const emitterSecret = "whsec_emit"
@@ -19,7 +18,7 @@ const emitterSecret = "whsec_emit"
 // fastEmitter builds an emitter with a tiny backoff and no random duplication,
 // pointed at url.
 func fastEmitter(url string) *WebhookEmitter {
-	e := NewWebhookEmitter(url, emitterSecret, zap.NewNop())
+	e := NewWebhookEmitter(url, emitterSecret, slogx.New(slogx.Config{Stdout: io.Discard}))
 	e.baseDelay = time.Millisecond
 	e.rnd = func() float64 { return 1.0 } // never duplicate
 	return e
@@ -95,7 +94,7 @@ func TestEmitter_EmitDuplicatesWhenRandBelowProb(t *testing.T) {
 	}))
 	t.Cleanup(ts.Close)
 
-	e := NewWebhookEmitter(ts.URL, emitterSecret, zap.NewNop())
+	e := NewWebhookEmitter(ts.URL, emitterSecret, slogx.New(slogx.Config{Stdout: io.Discard}))
 	e.baseDelay = time.Millisecond
 	e.rnd = func() float64 { return 0.0 } // always duplicate
 	e.Emit(provider.WebhookEvent{EventID: "evt_dup", Type: "charge.captured"})

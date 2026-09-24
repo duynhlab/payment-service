@@ -123,6 +123,7 @@ func (s *Service) resolveAuthorize(ctx context.Context, pay *domain.Payment, a d
 		}
 		if err == nil {
 			recordAuthorization(ctx, authAuthorized, currencyLabel(pay.Currency))
+			emitAuthorization(ctx, pay, outcomeAuthorized)
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -131,6 +132,7 @@ func (s *Service) resolveAuthorize(ctx context.Context, pay *domain.Payment, a d
 			map[string]any{colDeclineCode: declineCode(chErr)})
 		if err == nil {
 			recordAuthorization(ctx, authDeclined, currencyLabel(pay.Currency))
+			emitAuthorization(ctx, pay, outcomeDeclined)
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -156,6 +158,7 @@ func (s *Service) resolveCapture(ctx context.Context, pay *domain.Payment, a dom
 		err := s.transitionParked(ctx, pay.ID, domain.StatusCaptured, nil)
 		if err == nil {
 			recordOperation(ctx, opCapture, resultOK)
+			emitCapture(ctx, pay.ID, outcomeSucceeded)
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -169,6 +172,7 @@ func (s *Service) resolveCapture(ctx context.Context, pay *domain.Payment, a dom
 		}
 		if err == nil {
 			recordOperation(ctx, opCapture, resultDeclined)
+			emitCapture(ctx, pay.ID, outcomeDeclined)
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 

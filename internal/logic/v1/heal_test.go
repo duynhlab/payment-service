@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 )
@@ -108,7 +106,7 @@ func TestReconciler_Heal_MarkResolvedFailureIsNonFatal(t *testing.T) {
 	repo, ledger := reconWithDrift()
 	repo.resolveErr = errBoom // the audit write fails; the heal + run must still complete
 
-	_, _, err := NewReconciler(repo, ledger, WithHealer(&fakeHealer{converged: true}), WithLogger(zap.NewNop())).
+	_, _, err := NewReconciler(repo, ledger, WithHealer(&fakeHealer{converged: true})).
 		Run(context.Background(), 100)
 	if err != nil {
 		t.Fatalf("a mark-resolved failure must not fail the run, got %v", err)
@@ -116,13 +114,6 @@ func TestReconciler_Heal_MarkResolvedFailureIsNonFatal(t *testing.T) {
 	if repo.finished != domain.ReconRunCompleted {
 		t.Fatalf("run status = %q, want completed", repo.finished)
 	}
-}
-
-func TestWithLogger(t *testing.T) {
-	repo, ledger := reconWithDrift()
-	// A nil logger is ignored (the Nop default stays); a real one is attached.
-	NewReconciler(repo, ledger, WithLogger(nil))
-	NewReconciler(repo, ledger, WithLogger(zap.NewNop()))
 }
 
 func TestReconciler_Heal_FailureIsRecordedNotFatal(t *testing.T) {

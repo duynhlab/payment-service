@@ -6,20 +6,20 @@ package v1
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	logicv1 "github.com/duynhlab/payment-service/internal/logic/v1"
 	"github.com/duynhlab/pkg/authmw"
-	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/httpx"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // errAuthRequired is the response message when a request lacks a valid user.
@@ -68,13 +68,13 @@ func (h *Handler) mount(r *gin.Engine, jwtMW gin.HandlerFunc) {
 	}
 }
 
-// beginRequest resolves the otelgin server span and the request logger. The web
+// beginRequest resolves the otelgin server span and the facade logger. The web
 // layer does not mint its own span — otelgin already opened the server span for
 // this request (method/route are on it), so handlers annotate that span via the
 // returned handle. The caller must NOT end it; otelgin owns its lifecycle.
-func beginRequest(c *gin.Context) (context.Context, trace.Span, *zap.Logger) {
+func beginRequest(c *gin.Context) (context.Context, trace.Span, *slogx.Logger) {
 	ctx := c.Request.Context()
-	return ctx, trace.SpanFromContext(ctx), httpmw.LoggerFrom(c)
+	return ctx, trace.SpanFromContext(ctx), slogx.FromContext(ctx)
 }
 
 // beginAuthed resolves the otelgin server span and the authenticated user id —
@@ -83,11 +83,11 @@ func beginRequest(c *gin.Context) (context.Context, trace.Span, *zap.Logger) {
 // writes 401 and returns ok=false (the caller must return immediately). The
 // returned span is the server span — annotate it, but do not end it (otelgin
 // owns its lifecycle).
-func beginAuthed(c *gin.Context, op string) (context.Context, trace.Span, *zap.Logger, string, bool) {
+func beginAuthed(c *gin.Context, op string) (context.Context, trace.Span, *slogx.Logger, string, bool) {
 	ctx, span, zapLogger := beginRequest(c)
 	userID := c.GetString(authmw.CtxUserID)
 	if userID == "" {
-		zapLogger.Warn(op + ": no valid user_id in context")
+		zapLogger.Warn(ctx, op+": no valid user_id in context")
 		httpx.RespondError(c, http.StatusUnauthorized, httpx.CodeUnauthorized, errAuthRequired)
 		return ctx, span, zapLogger, "", false
 	}
@@ -214,7 +214,7 @@ func (r *createPaymentRequest) toInput(userID string) (logicv1.CreateIntentInput
 }
 
 // logFieldPaymentID is the structured-log key for a payment id.
-const logFieldPaymentID = "payment_id"
+const logFieldPaymentID = "payment.id"
 
 // CreatePayment handles POST /payment/v1/private/payments — the idempotent
 // authorize (and optionally capture) flow. 201 on success, 422 with the
@@ -233,7 +233,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	var req createPaymentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		span.RecordError(err)
-		zapLogger.Warn("CreatePayment: invalid request body", zap.Error(err))
+		zapLogger.Warn(ctx, "CreatePayment: invalid request body", slogx.Err(err))
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Invalid request body")
 		return
 	}
@@ -246,15 +246,15 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	result, err := h.logic.CreateIntent(ctx, idemKey, in)
 	if err != nil {
 		span.RecordError(err)
-		zapLogger.Error("CreatePayment: create intent failed", zap.Error(err))
+		zapLogger.Error(ctx, "CreatePayment: create intent failed", slogx.Err(err))
 		translateError(c, err)
 		return
 	}
 
-	zapLogger.Info("Payment intent processed",
-		zap.Int64(logFieldPaymentID, result.Payment.ID),
-		zap.Int("code", result.Code),
-		zap.Bool("replayed", result.Replayed),
+	zapLogger.Info(ctx, "Payment intent processed",
+		slog.Int64(logFieldPaymentID, result.Payment.ID),
+		slog.Int("code", result.Code),
+		slog.Bool("replayed", result.Replayed),
 	)
 	if result.Code == http.StatusUnprocessableEntity {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{
@@ -283,7 +283,7 @@ func (h *Handler) GetPayment(c *gin.Context) {
 	pay, err := h.logic.Get(ctx, id, userID)
 	if err != nil {
 		span.RecordError(err)
-		zapLogger.Warn("GetPayment: lookup failed", zap.Int64(logFieldPaymentID, id), zap.Error(err))
+		zapLogger.Warn(ctx, "GetPayment: lookup failed", slog.Int64(logFieldPaymentID, id), slogx.Err(err))
 		translateError(c, err)
 		return
 	}
@@ -302,7 +302,7 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	items, total, err := h.logic.List(ctx, userID, page, pageSize)
 	if err != nil {
 		span.RecordError(err)
-		zapLogger.Error("ListPayments: list failed", zap.Error(err))
+		zapLogger.Error(ctx, "ListPayments: list failed", slogx.Err(err))
 		translateError(c, err)
 		return
 	}
@@ -334,7 +334,7 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 	var req createRefundRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		span.RecordError(err)
-		zapLogger.Warn("CreateRefund: invalid request body", zap.Error(err))
+		zapLogger.Warn(ctx, "CreateRefund: invalid request body", slogx.Err(err))
 		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "Invalid request body")
 		return
 	}
@@ -347,15 +347,15 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 	ref, replayed, err := h.logic.CreateRefund(ctx, idemKey, paymentID, "", req.AmountMinor, req.Reason)
 	if err != nil {
 		span.RecordError(err)
-		zapLogger.Error("CreateRefund: refund failed", zap.Int64(logFieldPaymentID, paymentID), zap.Error(err))
+		zapLogger.Error(ctx, "CreateRefund: refund failed", slog.Int64(logFieldPaymentID, paymentID), slogx.Err(err))
 		translateError(c, err)
 		return
 	}
 
-	zapLogger.Info("Refund created",
-		zap.Int64("refund_id", ref.ID),
-		zap.Int64(logFieldPaymentID, paymentID),
-		zap.Bool("replayed", replayed),
+	zapLogger.Info(ctx, "Refund created",
+		slog.Int64("refund.id", ref.ID),
+		slog.Int64(logFieldPaymentID, paymentID),
+		slog.Bool("replayed", replayed),
 	)
 	c.JSON(http.StatusCreated, ref)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,8 +17,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 
 	"github.com/duynhlab/payment-service/config"
@@ -36,7 +35,7 @@ import (
 	"github.com/duynhlab/pkg/grpcx"
 	"github.com/duynhlab/pkg/httpmw"
 	"github.com/duynhlab/pkg/idempotency"
-	"github.com/duynhlab/pkg/logger/zapx"
+	"github.com/duynhlab/pkg/logger/slogx"
 	"github.com/duynhlab/pkg/migratex"
 	"github.com/duynhlab/pkg/obsx"
 )
@@ -73,13 +72,13 @@ const (
 
 // outboxLogPublisher is the P2 delivery sink: it logs each event. A real broker
 // replaces it behind logicv1.Publisher with no relay change.
-type outboxLogPublisher struct{ logger *zap.Logger }
+type outboxLogPublisher struct{ logger *slogx.Logger }
 
-func (p outboxLogPublisher) Publish(_ context.Context, e domain.OutboxEvent) error {
-	p.logger.Info("Outbox event published",
-		zap.Int64("outbox_id", e.ID),
-		zap.String("event_type", e.EventType),
-		zap.ByteString("payload", e.Payload),
+func (p outboxLogPublisher) Publish(ctx context.Context, e domain.OutboxEvent) error {
+	// The payload is deny-class: the record names the event, never its body.
+	p.logger.Info(ctx, "Outbox event published",
+		slog.Int64("outbox_id", e.ID),
+		slog.String("event_type", e.EventType),
 	)
 	return nil
 }
@@ -97,13 +96,11 @@ func main() {
 // startup failure. It owns all the shutdown defers, so main can os.Exit(1)
 // without skipping cleanup (os.Exit in main would bypass defers).
 func run() error {
+	ctx := context.Background()
 	cfg := config.Load()
 
-	logger, err := zapx.New(os.Getenv("LOG_LEVEL"))
-	if err != nil {
-		return fmt.Errorf("initialize logger: %w", err)
-	}
-	defer func() { _ = logger.Sync() }()
+	logger := slogx.New(slogx.Config{Level: os.Getenv("LOG_LEVEL")})
+	slogx.SetDefault(logger)
 
 	// `<binary> migrate` runs embedded schema migrations (its SQL runs and the
 	// process exits). No args serves the app.
@@ -115,11 +112,10 @@ func run() error {
 		return fmt.Errorf("configuration validation: %w", err)
 	}
 
-	logger.Info("Service starting",
-		zap.String("service", cfg.Service.Name),
-		zap.String("version", cfg.Service.Version),
-		zap.String("env", cfg.Service.Env),
-		zap.String(fieldPort, cfg.Service.Port),
+	logger.Info(ctx, "Service starting",
+		slog.String("service.version", cfg.Service.Version),
+		slog.String("deployment.environment.name", cfg.Service.Env),
+		slog.String(fieldPort, cfg.Service.Port),
 	)
 
 	tp, logger := initObservability(logger)
@@ -132,7 +128,7 @@ func run() error {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 	defer pool.Close()
-	logger.Info("Database connection pool established")
+	logger.Info(ctx, "Database connection pool established")
 
 	// Local RS256 OIDC JWT verification (cached JWKS) is the only credential —
 	// no gRPC fallback. The JWKS URL is derived from the Keycloak issuer unless
@@ -251,7 +247,7 @@ func registerBacklogGauges(attempts *repository.AttemptRepository, recon *reposi
 // window (hourly; the window itself is 24h, so cadence is not critical), and
 // relaying the transactional outbox (every 10s — event latency). The first two
 // are single-statement queries; the relay delivers to its sink.
-func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, recon *logicv1.Reconciler, reconRepo *repository.ReconciliationRepository, cfg *config.Config, logger *zap.Logger) {
+func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1.OutboxRelay, recon *logicv1.Reconciler, reconRepo *repository.ReconciliationRepository, cfg *config.Config, logger *slogx.Logger) {
 	expiry := time.NewTicker(time.Minute)
 	reap := time.NewTicker(time.Hour)
 	outbox := time.NewTicker(outboxRelayInterval)
@@ -316,7 +312,7 @@ func runBackgroundJobs(ctx context.Context, svc *logicv1.Service, relay *logicv1
 
 // runJob executes one maintenance tick under a bounded timeout so a single
 // hung query cannot stall the loop, logging the affected-row count or error.
-func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(context.Context) (int64, error)) {
+func runJob(ctx context.Context, name string, logger *slogx.Logger, fn func(context.Context) (int64, error)) {
 	jctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	n, err := fn(jctx)
@@ -324,9 +320,9 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 	case err != nil:
 		// Include count: a job can partially succeed (e.g. the relay delivered
 		// some events before the sink failed) — hiding it loses that signal.
-		logger.Error(name+" failed", zap.Int64("count", n), zap.Error(err))
+		logger.Error(ctx, name+" failed", slog.Int64("count", n), slogx.Err(err))
 	case n > 0:
-		logger.Info(name+" completed", zap.Int64("count", n))
+		logger.Info(ctx, name+" completed", slog.Int64("count", n))
 	}
 }
 
@@ -348,7 +344,8 @@ func runJob(ctx context.Context, name string, logger *zap.Logger, fn func(contex
 // converges the lost-capture-response window through the payment repo's
 // idempotent CaptureWithLedger — the provider is never called. Default off keeps
 // the detect-only behaviour of ADR-011.
-func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpool.Pool, capturer logicv1.LedgerCapturer, logger *zap.Logger) (*logicv1.Reconciler, *v1.ReconciliationHandler, *repository.ReconciliationRepository) {
+func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpool.Pool, capturer logicv1.LedgerCapturer, logger *slogx.Logger) (*logicv1.Reconciler, *v1.ReconciliationHandler, *repository.ReconciliationRepository) {
+	ctx := context.Background()
 	reconRepo := repository.NewReconciliationRepository(pool)
 	ledger, ok := prov.(logicv1.ProviderLedger)
 	if !ok {
@@ -360,23 +357,23 @@ func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpo
 	// (idempotency_keys.payment_id → subject_id) is not rolling-safe, so
 	// replicaCount stays 1 regardless of this.
 	opts := []logicv1.ReconcilerOption{
-		logicv1.WithLogger(logger),
 		logicv1.WithLease(repository.NewLeaseRepository(pool)),
 	}
 	if cfg.Payment.ReconHealEnabled {
 		opts = append(opts, logicv1.WithHealer(logicv1.NewCaptureHealer(capturer, time.Now)))
-		logger.Info("Reconciliation auto-heal enabled (RECON_HEAL_ENABLED)")
+		logger.Info(ctx, "Reconciliation auto-heal enabled (RECON_HEAL_ENABLED)")
 	}
 	reconciler := logicv1.NewReconciler(reconRepo, ledger, opts...)
 	return reconciler, v1.NewReconciliationHandler(reconciler, reconRepo), reconRepo
 }
 
-func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
+func selectProvider(cfg *config.Config, logger *slogx.Logger) provider.Provider {
+	ctx := context.Background()
 	if cfg.Payment.ProviderURL != "" {
-		logger.Info("Using mockpay HTTP provider", zap.String("url", cfg.Payment.ProviderURL))
+		logger.Info(ctx, "Using mockpay HTTP provider", slog.String("url", cfg.Payment.ProviderURL))
 		return provider.NewHTTPClient(cfg.Payment.ProviderURL)
 	}
-	logger.Info("Using in-memory provider stub")
+	logger.Info(ctx, "Using in-memory provider stub")
 	return provider.NewStub()
 }
 
@@ -387,16 +384,17 @@ func selectProvider(cfg *config.Config, logger *zap.Logger) provider.Provider {
 // `migrate` applies the versioned schema migrations (one-shot). `mockpay` runs
 // the mock payment provider — a second deployment of this binary, mirroring the
 // order-worker pattern. Payment has no `seed` subcommand (no demo data).
-func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
+func maybeRunSubcommand(cfg *config.Config, logger *slogx.Logger) bool {
+	ctx := context.Background()
 	if len(os.Args) <= 1 {
 		return false
 	}
 	switch os.Args[1] {
 	case "migrate":
 		if err := migratex.Run(migrations.FS, "sql", cfg.Database.BuildDSN()); err != nil {
-			logger.Fatal("Schema migration failed", zap.Error(err))
+			logger.Fatal(ctx, "Schema migration failed", slogx.Err(err))
 		}
-		logger.Info("Schema migrations applied")
+		logger.Info(ctx, "Schema migrations applied")
 		return true
 	case "mockpay":
 		runMockpay(cfg, logger)
@@ -408,25 +406,27 @@ func maybeRunSubcommand(cfg *config.Config, logger *zap.Logger) bool {
 
 // startGRPC serves the internal PaymentService on :9090 (east-west, saga-only).
 // Returns the server so shutdown can GracefulStop it before the pool closes.
-func startGRPC(cfg *config.Config, logger *zap.Logger, svc *logicv1.Service) (*grpc.Server, error) {
+func startGRPC(cfg *config.Config, logger *slogx.Logger, svc *logicv1.Service) (*grpc.Server, error) {
+	ctx := context.Background()
 	lc := net.ListenConfig{}
 	lis, err := lc.Listen(context.Background(), "tcp", ":"+cfg.GRPC.Port)
 	if err != nil {
 		return nil, fmt.Errorf("listen gRPC :%s: %w", cfg.GRPC.Port, err)
 	}
-	grpcSrv, _ := grpcx.NewServer(logger)
+	grpcSrv, _ := grpcx.NewServer(logger.Slog())
 	paymentv1.RegisterPaymentServiceServer(grpcSrv, grpcv1.NewServer(svc))
 	go func() {
-		logger.Info("Starting gRPC server", zap.String(fieldPort, cfg.GRPC.Port))
+		logger.Info(ctx, "Starting gRPC server", slog.String(fieldPort, cfg.GRPC.Port))
 		if err := grpcSrv.Serve(lis); err != nil {
-			logger.Error("gRPC server error", zap.Error(err))
+			logger.Error(ctx, "gRPC server error", slogx.Err(err))
 		}
 	}()
 	return grpcSrv, nil
 }
 
 // runMockpay serves the mock provider until SIGTERM/SIGINT, then drains.
-func runMockpay(cfg *config.Config, logger *zap.Logger) {
+func runMockpay(cfg *config.Config, logger *slogx.Logger) {
+	ctx := context.Background()
 	// mockpay is a deployed service (a real network hop), so it gets the same
 	// OTel wiring as the main binary: this installs the TracerProvider + W3C
 	// propagator that let the otelhttp handler below open a server span joining
@@ -443,12 +443,12 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 	var emitter mockpay.Emitter
 	switch {
 	case cfg.Payment.WebhookURL == "":
-		logger.Info("mockpay webhook emission disabled (MOCKPAY_WEBHOOK_URL empty)")
+		logger.Info(ctx, "mockpay webhook emission disabled (MOCKPAY_WEBHOOK_URL empty)")
 	case cfg.Payment.WebhookSecret == "":
-		logger.Error("MOCKPAY_WEBHOOK_URL set but MOCKPAY_WEBHOOK_SECRET empty; emission disabled")
+		logger.Error(ctx, "MOCKPAY_WEBHOOK_URL set but MOCKPAY_WEBHOOK_SECRET empty; emission disabled")
 	default:
 		emitter = mockpay.NewWebhookEmitter(cfg.Payment.WebhookURL, cfg.Payment.WebhookSecret, logger)
-		logger.Info("mockpay webhook emission enabled", zap.String("url", cfg.Payment.WebhookURL))
+		logger.Info(ctx, "mockpay webhook emission enabled", slog.String("url", cfg.Payment.WebhookURL))
 	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Service.Port,
@@ -459,22 +459,28 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
-		logger.Info("mockpay listening", zap.String(fieldPort, cfg.Service.Port))
+		logger.Info(ctx, "mockpay listening", slog.String(fieldPort, cfg.Service.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("mockpay server error", zap.Error(err))
+			logger.Error(ctx, "mockpay server error", slogx.Err(err))
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	logger.ProcessStarted(ctx, slogx.ComponentMockpay)
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	<-ctx.Done()
+	<-sigCtx.Done()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	outcome := slogx.OutcomeGraceful
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("mockpay shutdown error", zap.Error(err))
+		outcome = slogx.OutcomeError
+		logger.Error(ctx, "mockpay shutdown error", slogx.Err(err))
 	}
-	logger.Info("mockpay shutdown complete")
+	logger.Info(ctx, "mockpay shutdown complete")
+	// Written before the deferred OTel shutdown runs, so it is exported.
+	logger.ProcessStopped(ctx, slogx.ComponentMockpay, outcome)
 }
 
 // initObservability is the single OTel wiring point (RFC-0014) — traces per
@@ -485,50 +491,46 @@ func runMockpay(cfg *config.Config, logger *zap.Logger) {
 // Returns the SDK shutdown handle (nil when setup failed) and the logger the
 // caller must continue with — rebuilt with the OTLP tee on success, the
 // original otherwise.
-func initObservability(logger *zap.Logger) (interface{ Shutdown(context.Context) error }, *zap.Logger) {
+func initObservability(logger *slogx.Logger) (interface{ Shutdown(context.Context) error }, *slogx.Logger) {
+	ctx := context.Background()
 	otelCfg := obsx.ConfigFromEnv()
 	obs, err := obsx.SetupObservability(context.Background(), otelCfg)
 	if err != nil {
-		logger.Warn("Failed to initialize OpenTelemetry", zap.Error(err))
+		logger.Warn(ctx, "Failed to initialize OpenTelemetry", slogx.Err(err))
 		return nil, logger
 	}
-	// RFC-0014 P4: tee application logs into the OTLP pipeline. ZapCore
-	// returns a NopCore when OTEL_LOGS_ENABLED is off, so the tee is
-	// unconditional; the min level mirrors the stdout core so debug
-	// lines never leave the pod on an info-level service.
-	minLevel, err := zapcore.ParseLevel(os.Getenv("LOG_LEVEL"))
-	if err != nil {
-		minLevel = zapcore.InfoLevel
-	}
-	logger = logger.WithOptions(zap.WrapCore(func(c zapcore.Core) zapcore.Core {
-		return zapcore.NewTee(c, obs.ZapCore(otelCfg.ServiceName, minLevel))
-	}))
-	logger.Info("OpenTelemetry initialized",
-		zap.Bool("traces", obs.Enabled().Traces),
-		zap.Bool("otlp_metrics", obs.Enabled().Metrics),
-		zap.Bool("otlp_logs", obs.Enabled().Logs),
-		zap.String("endpoint", otelCfg.Endpoint),
-		zap.Float64("sample_rate", otelCfg.SampleRate),
+	// The facade reaches OTLP through the global logger provider obsx
+	// installed; rebuilding it only wires Flush, so a Fatal record is
+	// exported before the process exits.
+	logger = slogx.New(slogx.Config{Level: os.Getenv("LOG_LEVEL"), Flush: obs.ForceFlush})
+	slogx.SetDefault(logger)
+	logger.Info(ctx, "OpenTelemetry initialized",
+		slog.Bool("traces", obs.Enabled().Traces),
+		slog.Bool("otlp_metrics", obs.Enabled().Metrics),
+		slog.Bool("otlp_logs", obs.Enabled().Logs),
+		slog.String("endpoint", otelCfg.Endpoint),
+		slog.Float64("sample_rate", otelCfg.SampleRate),
 	)
 	return obs, logger
 }
 
 // initProfiling starts Pyroscope continuous profiling via the shared obsx helper
 // and returns a cleanup func (a no-op when profiling is disabled or setup fails).
-func initProfiling(cfg *config.Config, logger *zap.Logger) func() {
+func initProfiling(cfg *config.Config, logger *slogx.Logger) func() {
+	ctx := context.Background()
 	if !cfg.Profiling.Enabled {
-		logger.Info("Profiling disabled (PROFILING_ENABLED=false)")
+		logger.Info(ctx, "Profiling disabled (PROFILING_ENABLED=false)")
 		return func() { /* profiling disabled: nothing to stop */ }
 	}
 	stopProfiling, err := obsx.SetupProfiling()
 	if err != nil {
-		logger.Warn("Failed to initialize profiling", zap.Error(err))
+		logger.Warn(ctx, "Failed to initialize profiling", slogx.Err(err))
 		return func() { /* setup failed: nothing to stop */ }
 	}
-	logger.Info("Profiling initialized", zap.String("endpoint", cfg.Profiling.Endpoint))
+	logger.Info(ctx, "Profiling initialized", slog.String("endpoint", cfg.Profiling.Endpoint))
 	return func() {
 		if err := stopProfiling(context.Background()); err != nil {
-			logger.Error("Profiling shutdown error", zap.Error(err))
+			logger.Error(ctx, "Profiling shutdown error", slogx.Err(err))
 		}
 	}
 }
@@ -547,16 +549,19 @@ type httpHandlers struct {
 func setupServer(
 	cfg *config.Config,
 	otelServiceName string,
-	logger *zap.Logger,
+	logger *slogx.Logger,
 	verifier *authmw.Verifier,
 	staffVerifier *authmw.Verifier,
 	h httpHandlers,
 	isShuttingDown *atomic.Bool,
 ) *http.Server {
-	r := gin.Default()
+	// gin.New, not gin.Default: Default installs gin's own logger and
+	// recovery, which print the raw path and client address past the facade.
+	r := gin.New()
 
 	r.Use(httpmw.Tracing(otelServiceName))
-	r.Use(httpmw.Logging(logger))
+	r.Use(httpmw.Logging(logger.Slog()))
+	r.Use(httpmw.Recovery(logger.Slog()))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{fieldStatus: "ok"})
@@ -593,27 +598,30 @@ func runGracefulShutdown(
 	srv *http.Server,
 	tp interface{ Shutdown(context.Context) error },
 	pool interface{ Close() },
-	logger *zap.Logger,
+	logger *slogx.Logger,
 	isShuttingDown *atomic.Bool,
 	beforePoolClose func(),
 ) {
+	ctx := context.Background()
 	go func() {
-		logger.Info("Starting payment service", zap.String(fieldPort, cfg.Service.Port))
+		logger.Info(ctx, "Starting payment service", slog.String(fieldPort, cfg.Service.Port))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("Failed to start server", zap.Error(err))
+			logger.Error(ctx, "Failed to start server", slogx.Err(err))
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	logger.ProcessStarted(ctx, slogx.ComponentAPI)
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	<-ctx.Done()
-	logger.Info("Shutdown signal received")
+	<-sigCtx.Done()
+	logger.Info(ctx, "Shutdown signal received")
 
 	isShuttingDown.Store(true)
 	drainDelay := cfg.GetReadinessDrainDelayDuration()
 	if drainDelay > 0 {
-		logger.Info("Readiness drain delay started", zap.Duration("delay", drainDelay))
+		logger.Info(ctx, "Readiness drain delay started", slog.Duration("delay", drainDelay))
 		time.Sleep(drainDelay)
 	}
 
@@ -621,33 +629,39 @@ func runGracefulShutdown(
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	logger.Info("Shutting down server...", zap.Duration("timeout", shutdownTimeout))
+	logger.Info(ctx, "Shutting down server...", slog.Duration("timeout", shutdownTimeout))
 
+	outcome := slogx.OutcomeGraceful
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("HTTP server shutdown error", zap.Error(err))
+		outcome = slogx.OutcomeError
+		logger.Error(ctx, "HTTP server shutdown error", slogx.Err(err))
 	} else {
-		logger.Info("HTTP server shutdown complete")
+		logger.Info(ctx, "HTTP server shutdown complete")
 	}
 
 	if beforePoolClose != nil {
 		beforePoolClose()
-		logger.Info("Background jobs stopped")
+		logger.Info(ctx, "Background jobs stopped")
 	}
 
 	pool.Close()
-	logger.Info("Database pool closed")
+	logger.Info(ctx, "Database pool closed")
+
+	// process.stopped goes out BEFORE the OTel SDK shuts down: a record
+	// emitted after it is dropped rather than exported.
+	logger.ProcessStopped(ctx, slogx.ComponentAPI, outcome)
 
 	// Shutdown the OTel SDK — flushes pending spans plus any OTLP
 	// metrics/logs providers built behind the RFC-0014 flags.
 	if tp != nil {
 		if err := tp.Shutdown(shutdownCtx); err != nil {
-			logger.Error("OpenTelemetry shutdown error", zap.Error(err))
+			logger.Error(ctx, "OpenTelemetry shutdown error", slogx.Err(err))
 		} else {
-			logger.Info("OpenTelemetry shutdown complete")
+			logger.Info(ctx, "OpenTelemetry shutdown complete")
 		}
 	}
 
-	logger.Info("Graceful shutdown complete")
+	logger.Info(ctx, "Graceful shutdown complete")
 }
 
 // buildVerifiers constructs the customer-realm verifier (private routes) and
