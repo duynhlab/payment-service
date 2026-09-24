@@ -25,7 +25,7 @@ const (
 	maxWebhookAttempts  = 4
 	webhookDupProb      = 0.10 // ~10% of events are deliberately delivered twice
 	maxInFlightWebhooks = 64   // cap concurrent deliveries so a down receiver can't fan out unbounded goroutines
-	fieldEventID        = "event_id"
+	fieldEventID        = "webhook.event_id"
 )
 
 // WebhookEmitter POSTs signed webhooks to a receiver. It deliberately models a
