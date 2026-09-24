@@ -136,11 +136,6 @@ func (s *Server) transactionStatus(id string) string {
 	}
 }
 
-// handleTransactions serves the paged provider ledger the reconciliation job
-// pages through. Transactions are ordered **lexically** by provider_payment_id —
-// a stable total order so a paged sweep sees every row exactly once (it is not
-// chronological: ids are random). Defaults: page 1, page_size 50
-// (capped at 200).
 // handleTransactions serves the reconciliation ledger, optionally bounded to a
 // half-open time window [from, to). A real provider offers the same thing for the
 // same reason: without it every reconciliation pass has to read the provider's
@@ -151,6 +146,10 @@ func (s *Server) transactionStatus(id string) string {
 // unparseable `from` would widen the window to everything and answer a question
 // nobody asked — and the caller would compare that against a narrow internal set
 // and report every older charge as missing on our side.
+//
+// Transactions are ordered lexically by provider_payment_id — a stable total
+// order, so a paged sweep sees every row once (not chronological: ids are
+// random). Defaults: page 1, page_size 50 (capped at 200).
 func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
 	const maxPage = 1_000_000 // a mock; this many pages is far beyond any test
 	page := atoiDefault(r.URL.Query().Get("page"), 1, 1, maxPage)
@@ -500,7 +499,8 @@ func inWindow(created, from, to time.Time) bool {
 // mp_1 again: payment then held two rows with one provider_payment_id, and a
 // reused evt_N webhook was dropped by payment's event_id dedup as a redelivery.
 // A real provider never reuses an id; 96 random bits make a collision
-// negligible for a mock. crypto/rand does not fail on supported platforms.
+// negligible for a mock. rand.Read never returns an error (Go ≥1.24), hence the
+// discarded result.
 func newID(prefix string) string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
