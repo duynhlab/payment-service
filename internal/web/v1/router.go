@@ -253,7 +253,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 	zapLogger.Info(ctx, "Payment intent processed",
 		slog.Int64(logFieldPaymentID, result.Payment.ID),
-		slog.Int("code", result.Code),
+		slog.Int("http.response.status_code", result.Code),
 		slog.Bool("replayed", result.Replayed),
 	)
 	if result.Code == http.StatusUnprocessableEntity {
