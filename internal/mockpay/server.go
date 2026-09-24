@@ -12,6 +12,8 @@ package mockpay
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,15 +56,12 @@ type Server struct {
 	logger  *slogx.Logger
 	emitter Emitter // webhook emitter; nil disables emission
 
-	mu        sync.Mutex
-	seq       int64                      // provider_payment_id sequence
-	refundSeq int64                      // provider_refund_id sequence
-	eventSeq  int64                      // webhook event_id sequence
-	byKey     map[string]provider.Charge // charge idempotency replay
-	captured  map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
-	voided    map[string]bool            // voided ids — makes void idempotent under retry
-	refunded  map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
-	amounts   map[string]int64           // provider_payment_id -> amount (for GET /transactions)
+	mu       sync.Mutex
+	byKey    map[string]provider.Charge // charge idempotency replay
+	captured map[string]bool            // provider_payment_id -> captured (absent = voided/unknown)
+	voided   map[string]bool            // voided ids — makes void idempotent under retry
+	refunded map[string]bool            // provider_payment_id -> refunded (for GET /transactions status)
+	amounts  map[string]int64           // provider_payment_id -> amount (for GET /transactions)
 	// createdAt is when the provider first saw each charge. Reconciliation reads
 	// it to bound a pass to a time window: without it a caller can only ask for
 	// EVERY transaction the provider has ever recorded, which is the scan that
@@ -95,15 +94,14 @@ func New(logger *slogx.Logger, emitter Emitter) *Server {
 	}
 }
 
-// emit assigns a fresh event_id and hands the event to the emitter. The caller
-// holds s.mu (for eventSeq); Emit itself is async and touches no server state.
+// emit assigns a fresh event_id and hands the event to the emitter. Emit itself
+// is async and touches no server state.
 func (s *Server) emit(eventType, providerPaymentID string, amount int64) {
 	if s.emitter == nil {
 		return
 	}
-	s.eventSeq++
 	s.emitter.Emit(provider.WebhookEvent{
-		EventID:           fmt.Sprintf("evt_%d", s.eventSeq),
+		EventID:           newID("evt_"),
 		Type:              eventType,
 		ProviderPaymentID: providerPaymentID,
 		AmountMinor:       amount,
@@ -138,11 +136,6 @@ func (s *Server) transactionStatus(id string) string {
 	}
 }
 
-// handleTransactions serves the paged provider ledger the reconciliation job
-// pages through. Transactions are ordered **lexically** by provider_payment_id —
-// a stable total order so a paged sweep sees every row exactly once (it is not
-// chronological: `mp_10` sorts before `mp_2`). Defaults: page 1, page_size 50
-// (capped at 200).
 // handleTransactions serves the reconciliation ledger, optionally bounded to a
 // half-open time window [from, to). A real provider offers the same thing for the
 // same reason: without it every reconciliation pass has to read the provider's
@@ -153,6 +146,10 @@ func (s *Server) transactionStatus(id string) string {
 // unparseable `from` would widen the window to everything and answer a question
 // nobody asked — and the caller would compare that against a narrow internal set
 // and report every older charge as missing on our side.
+//
+// Transactions are ordered lexically by provider_payment_id — a stable total
+// order, so a paged sweep sees every row once (not chronological: ids are
+// random). Defaults: page 1, page_size 50 (capped at 200).
 func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
 	const maxPage = 1_000_000 // a mock; this many pages is far beyond any test
 	page := atoiDefault(r.URL.Query().Get("page"), 1, 1, maxPage)
@@ -284,8 +281,7 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 // no-answer trigger can create a charge that really exists and then stay silent
 // about it — the lost-response window, reproduced faithfully. Caller holds s.mu.
 func (s *Server) mintCharge(ctx context.Context, req provider.ChargeRequest) provider.Charge {
-	s.seq++
-	c := provider.Charge{ProviderPaymentID: fmt.Sprintf("mp_%d", s.seq), Captured: req.AutoCapture}
+	c := provider.Charge{ProviderPaymentID: newID("mp_"), Captured: req.AutoCapture}
 	if req.IdempotencyKey != "" {
 		s.byKey[req.IdempotencyKey] = c
 	}
@@ -454,8 +450,7 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.refundSeq++
-	refundID := fmt.Sprintf("re_%d", s.refundSeq)
+	refundID := newID("re_")
 	if req.IdempotencyKey != "" {
 		s.refundsByKey[req.IdempotencyKey] = refundID
 	}
@@ -497,4 +492,17 @@ func inWindow(created, from, to time.Time) bool {
 		return false
 	}
 	return true
+}
+
+// newID mints a provider id that stays unique across mockpay restarts. The ids
+// used to be counters (mp_1, mp_2, …) held in memory, so a restart handed out
+// mp_1 again: payment then held two rows with one provider_payment_id, and a
+// reused evt_N webhook was dropped by payment's event_id dedup as a redelivery.
+// A real provider never reuses an id; 96 random bits make a collision
+// negligible for a mock. rand.Read never returns an error (Go ≥1.24), hence the
+// discarded result.
+func newID(prefix string) string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return prefix + hex.EncodeToString(b[:])
 }

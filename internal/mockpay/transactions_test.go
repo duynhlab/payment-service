@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,9 +89,8 @@ func TestServer_Transactions_Statuses(t *testing.T) {
 	}
 }
 
-// TestServer_Transactions_LexicalOrder locks the real ordering semantics: ids
-// are sorted lexically, not numerically, so mp_10 precedes mp_2. This crosses
-// the boundary a 5-item test can't see, and guards the "stable sweep" contract
+// TestServer_Transactions_LexicalOrder locks the ordering semantics: ids are
+// sorted lexically, a stable total order, which is the "stable sweep" contract
 // the recon job relies on.
 func TestServer_Transactions_LexicalOrder(t *testing.T) {
 	url := newServer(t)
@@ -107,10 +107,27 @@ func TestServer_Transactions_LexicalOrder(t *testing.T) {
 				page.Transactions[i-1].ProviderPaymentID, page.Transactions[i].ProviderPaymentID)
 		}
 	}
-	// The trap: mp_10 sorts right after mp_1, before mp_2.
-	if page.Transactions[0].ProviderPaymentID != "mp_1" || page.Transactions[1].ProviderPaymentID != "mp_10" {
-		t.Errorf("lexical head = %q,%q; want mp_1,mp_10",
-			page.Transactions[0].ProviderPaymentID, page.Transactions[1].ProviderPaymentID)
+}
+
+// TestServer_IDsSurviveRestart is the reason ids are random: a second server
+// (a restarted mockpay, empty memory) must not hand out an id the first one
+// already issued — payment would hold two rows with one provider_payment_id.
+func TestServer_IDsSurviveRestart(t *testing.T) {
+	seen := map[string]bool{}
+	for run := 0; run < 2; run++ {
+		url := newServer(t)
+		for i := 0; i < 5; i++ {
+			post(t, url+"/charges", provider.ChargeRequest{AmountMinor: 1000, Currency: "USD", PaymentMethod: "tok_visa"})
+		}
+		for _, txn := range getTransactions(t, url+"/transactions?page_size=50").Transactions {
+			if !strings.HasPrefix(txn.ProviderPaymentID, "mp_") {
+				t.Fatalf("id %q lost its mp_ prefix", txn.ProviderPaymentID)
+			}
+			if seen[txn.ProviderPaymentID] {
+				t.Fatalf("id %q issued again after a restart", txn.ProviderPaymentID)
+			}
+			seen[txn.ProviderPaymentID] = true
+		}
 	}
 }
 
