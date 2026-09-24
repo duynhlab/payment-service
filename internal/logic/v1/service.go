@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/duynhlab/pkg/idempotency"
@@ -143,7 +144,7 @@ func (s *Service) recordAttempt(ctx context.Context, a domain.Attempt) error {
 		recordAttemptWriteFailure(ctx, string(a.Operation))
 	}
 	trace.SpanFromContext(ctx).RecordError(err, trace.WithAttributes(
-		attribute.Int64("payment.id", a.PaymentID),
+		attribute.String("payment.id", strconv.FormatInt(a.PaymentID, 10)),
 		attribute.String("payment.operation", string(a.Operation)),
 		attribute.String("payment.outcome_class", string(a.Outcome)),
 	))
