@@ -219,7 +219,7 @@ func TestServer_NoAnswerCreatesTheChargeThenGoesSilent(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	tb, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(tb), "mp_1") {
+	if !strings.Contains(string(tb), `"provider_payment_id":"mp_`) {
 		t.Fatalf("the silent charge must still exist provider-side, got %s", tb)
 	}
 }
