@@ -3,15 +3,15 @@ package provider_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/mockpay"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // newClient spins the real mockpay handler behind httptest and points an
@@ -19,7 +19,7 @@ import (
 // server behaviour end to end (no Docker).
 func newClient(t *testing.T) *provider.HTTPClient {
 	t.Helper()
-	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
+	ts := httptest.NewServer(mockpay.New(slogx.New(slogx.Config{Stdout: io.Discard}), nil).Handler())
 	t.Cleanup(ts.Close)
 	return provider.NewHTTPClient(ts.URL)
 }
@@ -222,7 +222,7 @@ func TestHTTPClient_VoidIsIdempotent(t *testing.T) {
 // error so the caller treats it as transient and re-drives (safe via per-key
 // replay) rather than as a decline.
 func TestHTTPClient_TransportErrorIsRetryable(t *testing.T) {
-	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
+	ts := httptest.NewServer(mockpay.New(slogx.New(slogx.Config{Stdout: io.Discard}), nil).Handler())
 	ts.Close() // nothing is listening now
 	c := provider.NewHTTPClient(ts.URL)
 

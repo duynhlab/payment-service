@@ -5,14 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/webhooksig"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // Emitter delivers a webhook for a money movement. The server calls it after
@@ -25,7 +25,7 @@ const (
 	maxWebhookAttempts  = 4
 	webhookDupProb      = 0.10 // ~10% of events are deliberately delivered twice
 	maxInFlightWebhooks = 64   // cap concurrent deliveries so a down receiver can't fan out unbounded goroutines
-	fieldEventID        = "event_id"
+	fieldEventID        = "webhook.event_id"
 )
 
 // WebhookEmitter POSTs signed webhooks to a receiver. It deliberately models a
@@ -36,7 +36,7 @@ type WebhookEmitter struct {
 	url    string
 	secret string
 	client *http.Client
-	logger *zap.Logger
+	logger *slogx.Logger
 
 	sem chan struct{} // bounds concurrent deliveries
 
@@ -47,7 +47,7 @@ type WebhookEmitter struct {
 }
 
 // NewWebhookEmitter builds an emitter targeting url, signing with secret.
-func NewWebhookEmitter(url, secret string, logger *zap.Logger) *WebhookEmitter {
+func NewWebhookEmitter(url, secret string, logger *slogx.Logger) *WebhookEmitter {
 	return &WebhookEmitter{
 		url:       url,
 		secret:    secret,
@@ -66,7 +66,7 @@ func NewWebhookEmitter(url, secret string, logger *zap.Logger) *WebhookEmitter {
 func (e *WebhookEmitter) Emit(ev provider.WebhookEvent) {
 	e.dispatch(ev)
 	if e.rnd() < webhookDupProb {
-		e.logger.Info("mockpay duplicating webhook", zap.String(fieldEventID, ev.EventID))
+		e.logger.Info(context.Background(), "mockpay duplicating webhook", slog.String(fieldEventID, ev.EventID))
 		e.dispatch(ev)
 	}
 }
@@ -83,7 +83,7 @@ func (e *WebhookEmitter) dispatch(ev provider.WebhookEvent) {
 			e.deliver(ev)
 		}()
 	default:
-		e.logger.Warn("mockpay webhook dropped: delivery queue saturated", zap.String(fieldEventID, ev.EventID))
+		e.logger.Warn(context.Background(), "mockpay webhook dropped: delivery queue saturated", slog.String(fieldEventID, ev.EventID))
 	}
 }
 
@@ -92,20 +92,20 @@ func (e *WebhookEmitter) dispatch(ev provider.WebhookEvent) {
 func (e *WebhookEmitter) deliver(ev provider.WebhookEvent) {
 	body, err := json.Marshal(ev)
 	if err != nil {
-		e.logger.Error("mockpay marshal webhook", zap.Error(err))
+		e.logger.Error(context.Background(), "mockpay marshal webhook", slogx.Err(err))
 		return
 	}
 	for attempt := 1; attempt <= maxWebhookAttempts; attempt++ {
 		if e.postOnce(body) {
-			e.logger.Info("mockpay webhook delivered",
-				zap.String(fieldEventID, ev.EventID), zap.Int("attempt", attempt))
+			e.logger.Info(context.Background(), "mockpay webhook delivered",
+				slog.String(fieldEventID, ev.EventID), slog.Int("attempt", attempt))
 			return
 		}
 		if attempt < maxWebhookAttempts {
 			time.Sleep(time.Duration(attempt) * e.baseDelay)
 		}
 	}
-	e.logger.Warn("mockpay webhook gave up", zap.String(fieldEventID, ev.EventID))
+	e.logger.Warn(context.Background(), "mockpay webhook gave up", slog.String(fieldEventID, ev.EventID))
 }
 
 // postOnce signs and sends one delivery, returning true on a 2xx ack. The

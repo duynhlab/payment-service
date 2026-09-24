@@ -371,11 +371,15 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 		// retry under ANY key now resolves rather than charges.
 		recordAuthorization(ctx, authError, currencyLabel(in.Currency))
 		recordProviderUnknown(ctx, opAuthorize, unknownStagePark)
-		return nil, s.withKeyReleased(ctx, key.ID, s.park(ctx, domain.StatusPending, domain.Attempt{
+		parked, perr := s.parkReported(ctx, domain.StatusPending, domain.Attempt{
 			PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
 			ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
 			IdempotencyKey: chargeKey,
-		}, chErr))
+		}, chErr)
+		if parked {
+			emitAuthorization(ctx, pay, outcomeUnknown)
+		}
+		return nil, s.withKeyReleased(ctx, key.ID, perr)
 
 	case domain.OutcomeRetryableFailure:
 		// The provider refused this attempt outright and did nothing (429): the
@@ -426,6 +430,7 @@ func (s *Service) handleDeclined(ctx context.Context, key *idempotency.Record, i
 	}
 	if txErr == nil {
 		recordAuthorization(ctx, authDeclined, currencyLabel(in.Currency))
+		emitAuthorization(ctx, pay, outcomeDeclined)
 	}
 	return s.finishIntent(ctx, key.ID, 422, pay.ID)
 }
@@ -462,6 +467,7 @@ func (s *Service) applyAuthorized(ctx context.Context, key *idempotency.Record, 
 	}
 	if txErr == nil {
 		recordAuthorization(ctx, authAuthorized, currencyLabel(in.Currency))
+		emitAuthorization(ctx, pay, outcomeAuthorized)
 	}
 	return s.finishIntent(ctx, key.ID, 201, pay.ID)
 }
@@ -534,6 +540,7 @@ func (s *Service) Capture(ctx context.Context, paymentID int64, userID string) (
 	switch class {
 	case domain.OutcomeSuccess:
 		recordOperation(ctx, opCapture, resultOK)
+		emitCapture(ctx, pay.ID, outcomeSucceeded)
 		return s.payments.FindByID(ctx, pay.ID, "")
 
 	case domain.OutcomeUnknown:
@@ -552,7 +559,11 @@ func (s *Service) Capture(ctx context.Context, paymentID int64, userID string) (
 		// it lands, the escape is a retry, not a timer.
 		recordProviderUnknown(ctx, opCapture, unknownStagePark)
 		recordOperation(ctx, opCapture, resultUnknown)
-		return nil, s.park(ctx, domain.StatusCaptured, attempt, capErr)
+		parked, perr := s.parkReported(ctx, domain.StatusCaptured, attempt, capErr)
+		if parked {
+			emitCapture(ctx, pay.ID, outcomeUnknown)
+		}
+		return nil, perr
 
 	case domain.OutcomeBusinessDecline:
 		// Decided no: nothing was captured. Reverse the row and post the
@@ -561,6 +572,7 @@ func (s *Service) Capture(ctx context.Context, paymentID int64, userID string) (
 		if rbErr := s.payments.ReverseCapture(ctx, pay.ID); rbErr != nil {
 			return nil, fmt.Errorf("provider capture failed (%w) and rollback failed: %w", capErr, rbErr)
 		}
+		emitCapture(ctx, pay.ID, outcomeDeclined) // only once the reversal stored the decision
 		return nil, capErr
 
 	case domain.OutcomeRetryableFailure:
@@ -841,6 +853,7 @@ func (s *Service) settlePendingRefund(ctx context.Context, pay *domain.Payment, 
 	ref.Status = domain.RefundSucceeded
 	ref.ProviderRefundID = providerRefundID
 	recordOperation(ctx, opRefund, resultOK)
+	emitRefund(ctx, pay.ID, ref.ID, outcomeSucceeded)
 	return nil
 }
 
@@ -893,6 +906,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 			return fmt.Errorf("%w: parking the refund failed: %w", domain.ErrRefundNotSettled, err)
 		}
 		ref.Status = domain.RefundProcessing
+		emitRefund(ctx, ref.PaymentID, ref.ID, outcomeUnknown) // the doubt is stored
 		// Wraps BOTH sentinels. ErrRefundNotSettled says which operation is open;
 		// ErrOutcomeUnknown says what kind of open it is, and that is the one every
 		// caller tests to tell doubt from a decided no. A refund is not exempt from
@@ -907,6 +921,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 		return fmt.Errorf("%w: recording the decline failed: %w", domain.ErrRefundNotSettled, err)
 	}
 	ref.Status = domain.RefundFailed
+	emitRefund(ctx, ref.PaymentID, ref.ID, outcomeDeclined) // the decline is stored
 	return fmt.Errorf("%w: %w", domain.ErrRefundDeclined, provErr)
 }
 

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -23,9 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/provider"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // msgUnknownCharge is the error message for capture/void/refund against an id
@@ -51,7 +51,7 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 
 // Server is the in-memory mock provider. Safe for concurrent requests.
 type Server struct {
-	logger  *zap.Logger
+	logger  *slogx.Logger
 	emitter Emitter // webhook emitter; nil disables emission
 
 	mu        sync.Mutex
@@ -79,7 +79,7 @@ type Server struct {
 }
 
 // New builds an empty mock provider. emitter may be nil (emission disabled).
-func New(logger *zap.Logger, emitter Emitter) *Server {
+func New(logger *slogx.Logger, emitter Emitter) *Server {
 	return &Server{
 		logger:        logger,
 		emitter:       emitter,
@@ -270,20 +270,20 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 		// it could previously only be reproduced by killing a container — which
 		// also destroyed the charge, so the "provider did it, we do not know"
 		// case was untestable. Here the charge really survives.
-		s.mintCharge(req)
+		s.mintCharge(r.Context(), req)
 		s.noAnswer(r.Context())
 		return
 	case provider.OutcomeOK:
 	}
 
-	c := s.mintCharge(req)
+	c := s.mintCharge(r.Context(), req)
 	writeJSON(w, http.StatusOK, c)
 }
 
 // mintCharge creates the charge and emits its webhook. Split out so the
 // no-answer trigger can create a charge that really exists and then stay silent
 // about it — the lost-response window, reproduced faithfully. Caller holds s.mu.
-func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
+func (s *Server) mintCharge(ctx context.Context, req provider.ChargeRequest) provider.Charge {
 	s.seq++
 	c := provider.Charge{ProviderPaymentID: fmt.Sprintf("mp_%d", s.seq), Captured: req.AutoCapture}
 	if req.IdempotencyKey != "" {
@@ -292,8 +292,8 @@ func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
 	s.captured[c.ProviderPaymentID] = req.AutoCapture
 	s.amounts[c.ProviderPaymentID] = req.AmountMinor
 	s.createdAt[c.ProviderPaymentID] = time.Now().UTC()
-	s.logger.Info("charge", zap.String("id", c.ProviderPaymentID),
-		zap.Int64("amount_minor", req.AmountMinor), zap.Bool("captured", c.Captured))
+	s.logger.Info(ctx, "charge", slog.String("id", c.ProviderPaymentID),
+		slog.Bool("captured", c.Captured))
 	eventType := "charge.authorized"
 	if c.Captured {
 		eventType = "charge.captured"
@@ -320,7 +320,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.bindKey(w, key, opCapture, id) {
+	if !s.bindKey(r.Context(), w, key, opCapture, id) {
 		return
 	}
 	if _, ok := s.captured[id]; !ok {
@@ -328,7 +328,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.captured[id] = true
-	s.logger.Info("capture", zap.String("id", id))
+	s.logger.Info(r.Context(), "capture", slog.String("id", id))
 	s.emit("charge.captured", id, 0)
 	w.WriteHeader(http.StatusOK)
 }
@@ -341,7 +341,7 @@ func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.bindKey(w, key, opVoid, id) {
+	if !s.bindKey(r.Context(), w, key, opVoid, id) {
 		return
 	}
 	if s.voided[id] {
@@ -354,7 +354,7 @@ func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(s.captured, id)
 	s.voided[id] = true
-	s.logger.Info("void", zap.String("id", id))
+	s.logger.Info(r.Context(), "void", slog.String("id", id))
 	s.emit("charge.voided", id, 0)
 	w.WriteHeader(http.StatusOK)
 }
@@ -401,16 +401,16 @@ func mutationKey(w http.ResponseWriter, r *http.Request) (string, bool) {
 // was already used for a different one — borrowing another operation's verdict
 // would hide the caller's key-derivation bug behind a plausible success.
 // Returns false when the response is written. Caller holds s.mu.
-func (s *Server) bindKey(w http.ResponseWriter, key, op, chargeID string) bool {
+func (s *Server) bindKey(ctx context.Context, w http.ResponseWriter, key, op, chargeID string) bool {
 	if key == "" {
 		return true
 	}
 	want := mutationBinding{operation: op, chargeID: chargeID}
 	if prior, ok := s.mutationKeys[key]; ok && prior != want {
-		s.logger.Warn("idempotency key reused for a different operation or charge",
-			zap.String("key", key), zap.String("bound_operation", prior.operation),
-			zap.String("bound_charge", prior.chargeID),
-			zap.String("requested_operation", op), zap.String("requested_charge", chargeID))
+		s.logger.Warn(ctx, "idempotency key reused for a different operation or charge",
+			slog.String("bound_operation", prior.operation),
+			slog.String("bound_charge", prior.chargeID),
+			slog.String("requested_operation", op), slog.String("requested_charge", chargeID))
 		writeError(w, http.StatusConflict, provider.CodeIdempotencyConflict,
 			"idempotency key reused for a different operation or charge")
 		return false
@@ -449,8 +449,7 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 	// refund refused" unreachable through the real cancellation flow, which is
 	// exactly the case worth exercising.
 	if req.AmountMinor%100 == refundDeclineSuffix {
-		s.logger.Info("refund declined", zap.String("charge", req.ProviderPaymentID),
-			zap.Int64("amount_minor", req.AmountMinor))
+		s.logger.Info(r.Context(), "refund declined", slog.String("charge", req.ProviderPaymentID))
 		writeError(w, http.StatusPaymentRequired, codeRefundDeclined, "refund declined")
 		return
 	}
@@ -461,8 +460,8 @@ func (s *Server) handleRefund(w http.ResponseWriter, r *http.Request) {
 		s.refundsByKey[req.IdempotencyKey] = refundID
 	}
 	s.refunded[req.ProviderPaymentID] = true
-	s.logger.Info("refund", zap.String("id", refundID),
-		zap.String("charge", req.ProviderPaymentID), zap.Int64("amount_minor", req.AmountMinor))
+	s.logger.Info(r.Context(), "refund", slog.String("id", refundID),
+		slog.String("charge", req.ProviderPaymentID))
 	s.emit("refund.succeeded", req.ProviderPaymentID, req.AmountMinor)
 	writeJSON(w, http.StatusOK, provider.RefundResponse{ProviderRefundID: refundID})
 }

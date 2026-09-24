@@ -11,10 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/duynhlab/payment-service/internal/core/provider"
 	"github.com/duynhlab/payment-service/internal/mockpay"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // recordingEmitter captures the events the server emits (synchronously).
@@ -37,7 +36,7 @@ func (r *recordingEmitter) snapshot() []provider.WebhookEvent {
 
 func newServer(t *testing.T) string {
 	t.Helper()
-	ts := httptest.NewServer(mockpay.New(zap.NewNop(), nil).Handler())
+	ts := httptest.NewServer(mockpay.New(slogx.New(slogx.Config{Stdout: io.Discard}), nil).Handler())
 	t.Cleanup(ts.Close)
 	return ts.URL
 }
@@ -305,7 +304,7 @@ func TestServer_VoidIsIdempotent(t *testing.T) {
 
 func TestServer_EmitsWebhooks(t *testing.T) {
 	em := &recordingEmitter{}
-	ts := httptest.NewServer(mockpay.New(zap.NewNop(), em).Handler())
+	ts := httptest.NewServer(mockpay.New(slogx.New(slogx.Config{Stdout: io.Discard}), em).Handler())
 	t.Cleanup(ts.Close)
 
 	// auto-capture → charge.captured

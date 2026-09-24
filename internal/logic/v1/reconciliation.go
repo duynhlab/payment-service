@@ -3,12 +3,12 @@ package v1
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
-
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/payment-service/internal/core/provider"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 const (
@@ -75,8 +75,7 @@ type Healer interface {
 type Reconciler struct {
 	repo   ReconRepo
 	ledger ProviderLedger
-	healer Healer      // nil = detect-only (the default)
-	logger *zap.Logger // heal-path diagnostics; Nop unless WithLogger is set
+	healer Healer // nil = detect-only (the default)
 	now    func() time.Time
 	// lease makes the reconciler a single writer across PROCESSES. Nil keeps the
 	// pre-lease behaviour, which is safe only while exactly one process ever runs
@@ -114,20 +113,10 @@ func WithHealer(h Healer) ReconcilerOption {
 	return func(r *Reconciler) { r.healer = h }
 }
 
-// WithLogger attaches a logger for the heal path (failed convergences /
-// mark-resolved writes). Detection reports through Run's return value as before.
-func WithLogger(l *zap.Logger) ReconcilerOption {
-	return func(r *Reconciler) {
-		if l != nil {
-			r.logger = l
-		}
-	}
-}
-
 // NewReconciler wires the reconciler onto its persistence port and the provider
 // ledger it pages. Detect-only unless WithHealer is passed.
 func NewReconciler(repo ReconRepo, ledger ProviderLedger, opts ...ReconcilerOption) *Reconciler {
-	r := &Reconciler{repo: repo, ledger: ledger, logger: zap.NewNop(), now: time.Now}
+	r := &Reconciler{repo: repo, ledger: ledger, now: time.Now}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -172,7 +161,7 @@ func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.
 				// The connection closes and the server frees the lock at session end,
 				// so the lease is not stuck — but a broken acquire/release pairing is a
 				// bug, and silence here is how it would stay one.
-				r.logger.Error("reconciliation lease release failed", zap.Error(rerr))
+				slogx.FromContext(ctx).Error(ctx, "reconciliation lease release failed", slogx.Err(rerr))
 			}
 		}()
 	}
@@ -212,6 +201,7 @@ func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.
 	for class, n := range byClass {
 		recordReconDiscrepancies(ctx, string(class), n)
 	}
+	emitDiscrepancies(ctx, runID, byClass)
 
 	if len(discrepancies) > 0 {
 		if serr := r.repo.SaveDiscrepancies(ctx, runID, discrepancies); serr != nil {
@@ -230,13 +220,13 @@ func (r *Reconciler) RunWindow(ctx context.Context, pageSize int, window domain.
 	// but against an answer that cannot be trusted to be the window's — the
 	// next pass re-covers it, and the violation counter is the alert signal.
 	if violations > 0 {
-		r.logger.Error("reconciliation watermark held: the provider returned rows outside the requested window",
-			zap.Int64("run_id", runID), zap.Int("violations", violations))
+		slogx.FromContext(ctx).Error(ctx, "reconciliation watermark held: the provider returned rows outside the requested window",
+			idAttr("reconciliation.run_id", runID), slog.Int("violations", violations))
 	}
 	if violations == 0 && !window.Through.IsZero() {
 		if werr := r.repo.AdvanceWatermark(ctx, window.Through); werr != nil {
-			r.logger.Error("reconciliation watermark did not advance; the next pass will re-cover this window",
-				zap.Int64("run_id", runID), zap.Time("through", window.Through), zap.Error(werr))
+			slogx.FromContext(ctx).Error(ctx, "reconciliation watermark did not advance; the next pass will re-cover this window",
+				idAttr("reconciliation.run_id", runID), slog.Time("through", window.Through), slogx.Err(werr))
 		}
 	}
 
@@ -300,10 +290,10 @@ func (r *Reconciler) detect(ctx context.Context, pageSize int, window domain.Rec
 			if (!window.From.IsZero() && tx.CreatedAt.Before(window.From)) ||
 				(!window.Through.IsZero() && !tx.CreatedAt.Before(window.Through)) {
 				violations++
-				r.logger.Warn("provider transaction outside the requested window; excluded from classification",
-					zap.String("provider_payment_id", tx.ProviderPaymentID),
-					zap.Time("created_at", tx.CreatedAt),
-					zap.Time("from", window.From), zap.Time("through", window.Through))
+				slogx.FromContext(ctx).Warn(ctx, "provider transaction outside the requested window; excluded from classification",
+					slog.String("payment.provider_id", tx.ProviderPaymentID),
+					slog.Time("created_at", tx.CreatedAt),
+					slog.Time("from", window.From), slog.Time("through", window.Through))
 				continue
 			}
 			txns = append(txns, tx)
@@ -353,8 +343,8 @@ func (r *Reconciler) heal(ctx context.Context, runID int64, discrepancies []doma
 		case err != nil:
 			res = domain.ResolutionFailed
 			recordReconHealFailure(ctx, string(d.Class))
-			r.logger.Error("reconciliation heal failed",
-				zap.Int64("run_id", runID), zap.String("provider_payment_id", d.ProviderPaymentID), zap.Error(err))
+			slogx.FromContext(ctx).Error(ctx, "reconciliation heal failed",
+				idAttr("reconciliation.run_id", runID), slog.String("payment.provider_id", d.ProviderPaymentID), slogx.Err(err))
 		case converged:
 			res = domain.ResolutionHealed
 		default:
@@ -368,9 +358,9 @@ func (r *Reconciler) heal(ctx context.Context, runID int64, discrepancies []doma
 // audit annotation, never the (already-persisted) discrepancy or the heal.
 func (r *Reconciler) markResolved(ctx context.Context, runID int64, providerPaymentID string, res domain.Resolution) {
 	if err := r.repo.MarkResolved(ctx, runID, providerPaymentID, res); err != nil {
-		r.logger.Error("reconciliation mark-resolved failed",
-			zap.Int64("run_id", runID), zap.String("provider_payment_id", providerPaymentID),
-			zap.String("resolution", string(res)), zap.Error(err))
+		slogx.FromContext(ctx).Error(ctx, "reconciliation mark-resolved failed",
+			idAttr("reconciliation.run_id", runID), slog.String("payment.provider_id", providerPaymentID),
+			slog.String("resolution", string(res)), slogx.Err(err))
 	}
 }
 

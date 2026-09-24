@@ -4,15 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 
 	"github.com/duynhlab/payment-service/internal/core/domain"
 	"github.com/duynhlab/pkg/httpx"
+	"github.com/duynhlab/pkg/logger/slogx"
 )
 
 // reconRunTimeout bounds a synchronously-triggered run — parity with the
@@ -43,7 +44,7 @@ const reconRunsPathDeprecated = "/payment/v1/internal/reconciliation/runs"
 
 // Shared JSON/log field keys.
 const (
-	fieldRunID         = "run_id"
+	fieldRunID         = "reconciliation.run_id"
 	fieldDiscrepancies = "discrepancies"
 )
 
@@ -138,7 +139,7 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	}
 	if err != nil {
 		span.RecordError(err)
-		log.Error(msgRunFailed, zap.Int64(fieldRunID, runID), zap.Error(err))
+		log.Error(ctx, msgRunFailed, slog.Int64(fieldRunID, runID), slogx.Err(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgRunFailed)
 		return
 	}
@@ -146,11 +147,11 @@ func (h *ReconciliationHandler) TriggerRun(c *gin.Context) {
 	run, err := h.reader.GetRun(ctx, runID)
 	if err != nil {
 		span.RecordError(err)
-		log.Error("Reconciliation run lookup after trigger failed", zap.Int64(fieldRunID, runID), zap.Error(err))
+		log.Error(ctx, "Reconciliation run lookup after trigger failed", slog.Int64(fieldRunID, runID), slogx.Err(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
 		return
 	}
-	log.Info("Reconciliation run triggered", zap.Int64(fieldRunID, runID), zap.Int(fieldDiscrepancies, found))
+	log.Info(ctx, "Reconciliation run triggered", slog.Int64(fieldRunID, runID), slog.Int(fieldDiscrepancies, found))
 	c.Header("Location", reconRunsPath+"/"+strconv.FormatInt(runID, 10))
 	c.JSON(http.StatusCreated, gin.H{fieldRun: run})
 }
@@ -173,7 +174,7 @@ func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 	}
 	if err != nil {
 		span.RecordError(err)
-		log.Error("Reconciliation run lookup failed", zap.Int64(fieldRunID, id), zap.Error(err))
+		log.Error(ctx, "Reconciliation run lookup failed", slog.Int64(fieldRunID, id), slogx.Err(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
 		return
 	}
@@ -182,7 +183,7 @@ func (h *ReconciliationHandler) GetRun(c *gin.Context) {
 	discrepancies, err := h.reader.ListDiscrepancies(ctx, id, limit, offset)
 	if err != nil {
 		span.RecordError(err)
-		log.Error("Discrepancy list failed", zap.Int64(fieldRunID, id), zap.Error(err))
+		log.Error(ctx, "Discrepancy list failed", slog.Int64(fieldRunID, id), slogx.Err(err))
 		httpx.RespondError(c, http.StatusInternalServerError, httpx.CodeInternal, msgInternalError)
 		return
 	}
