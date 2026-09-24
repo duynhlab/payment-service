@@ -270,20 +270,20 @@ func (s *Server) handleCharge(w http.ResponseWriter, r *http.Request) {
 		// it could previously only be reproduced by killing a container — which
 		// also destroyed the charge, so the "provider did it, we do not know"
 		// case was untestable. Here the charge really survives.
-		s.mintCharge(req)
+		s.mintCharge(r.Context(), req)
 		s.noAnswer(r.Context())
 		return
 	case provider.OutcomeOK:
 	}
 
-	c := s.mintCharge(req)
+	c := s.mintCharge(r.Context(), req)
 	writeJSON(w, http.StatusOK, c)
 }
 
 // mintCharge creates the charge and emits its webhook. Split out so the
 // no-answer trigger can create a charge that really exists and then stay silent
 // about it — the lost-response window, reproduced faithfully. Caller holds s.mu.
-func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
+func (s *Server) mintCharge(ctx context.Context, req provider.ChargeRequest) provider.Charge {
 	s.seq++
 	c := provider.Charge{ProviderPaymentID: fmt.Sprintf("mp_%d", s.seq), Captured: req.AutoCapture}
 	if req.IdempotencyKey != "" {
@@ -292,7 +292,7 @@ func (s *Server) mintCharge(req provider.ChargeRequest) provider.Charge {
 	s.captured[c.ProviderPaymentID] = req.AutoCapture
 	s.amounts[c.ProviderPaymentID] = req.AmountMinor
 	s.createdAt[c.ProviderPaymentID] = time.Now().UTC()
-	s.logger.Info(context.Background(), "charge", slog.String("id", c.ProviderPaymentID),
+	s.logger.Info(ctx, "charge", slog.String("id", c.ProviderPaymentID),
 		slog.Bool("captured", c.Captured))
 	eventType := "charge.authorized"
 	if c.Captured {
@@ -320,7 +320,7 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.bindKey(w, key, opCapture, id) {
+	if !s.bindKey(r.Context(), w, key, opCapture, id) {
 		return
 	}
 	if _, ok := s.captured[id]; !ok {
@@ -341,7 +341,7 @@ func (s *Server) handleVoid(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.bindKey(w, key, opVoid, id) {
+	if !s.bindKey(r.Context(), w, key, opVoid, id) {
 		return
 	}
 	if s.voided[id] {
@@ -401,13 +401,13 @@ func mutationKey(w http.ResponseWriter, r *http.Request) (string, bool) {
 // was already used for a different one — borrowing another operation's verdict
 // would hide the caller's key-derivation bug behind a plausible success.
 // Returns false when the response is written. Caller holds s.mu.
-func (s *Server) bindKey(w http.ResponseWriter, key, op, chargeID string) bool {
+func (s *Server) bindKey(ctx context.Context, w http.ResponseWriter, key, op, chargeID string) bool {
 	if key == "" {
 		return true
 	}
 	want := mutationBinding{operation: op, chargeID: chargeID}
 	if prior, ok := s.mutationKeys[key]; ok && prior != want {
-		s.logger.Warn(context.Background(), "idempotency key reused for a different operation or charge",
+		s.logger.Warn(ctx, "idempotency key reused for a different operation or charge",
 			slog.String("bound_operation", prior.operation),
 			slog.String("bound_charge", prior.chargeID),
 			slog.String("requested_operation", op), slog.String("requested_charge", chargeID))

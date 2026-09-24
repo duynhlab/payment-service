@@ -370,13 +370,16 @@ func (s *Service) driveCharge(ctx context.Context, key *idempotency.Record, in C
 		// The lock is released either way, so a same-key retry can make progress; a
 		// retry under ANY key now resolves rather than charges.
 		recordAuthorization(ctx, authError, currencyLabel(in.Currency))
-		emitAuthorization(ctx, pay, outcomeUnknown)
 		recordProviderUnknown(ctx, opAuthorize, unknownStagePark)
-		return nil, s.withKeyReleased(ctx, key.ID, s.park(ctx, domain.StatusPending, domain.Attempt{
+		parked, perr := s.parkReported(ctx, domain.StatusPending, domain.Attempt{
 			PaymentID: pay.ID, Operation: domain.AttemptAuthorize, Outcome: class,
 			ProviderRef: chargeRef(charge), ProviderStatus: providerStatusOf(chErr),
 			IdempotencyKey: chargeKey,
-		}, chErr))
+		}, chErr)
+		if parked {
+			emitAuthorization(ctx, pay, outcomeUnknown)
+		}
+		return nil, s.withKeyReleased(ctx, key.ID, perr)
 
 	case domain.OutcomeRetryableFailure:
 		// The provider refused this attempt outright and did nothing (429): the
@@ -556,17 +559,20 @@ func (s *Service) Capture(ctx context.Context, paymentID int64, userID string) (
 		// it lands, the escape is a retry, not a timer.
 		recordProviderUnknown(ctx, opCapture, unknownStagePark)
 		recordOperation(ctx, opCapture, resultUnknown)
-		emitCapture(ctx, pay.ID, outcomeUnknown)
-		return nil, s.park(ctx, domain.StatusCaptured, attempt, capErr)
+		parked, perr := s.parkReported(ctx, domain.StatusCaptured, attempt, capErr)
+		if parked {
+			emitCapture(ctx, pay.ID, outcomeUnknown)
+		}
+		return nil, perr
 
 	case domain.OutcomeBusinessDecline:
 		// Decided no: nothing was captured. Reverse the row and post the
 		// compensating reversal (append-only — never edit the capture entry).
 		recordOperation(ctx, opCapture, resultDeclined)
-		emitCapture(ctx, pay.ID, outcomeDeclined)
 		if rbErr := s.payments.ReverseCapture(ctx, pay.ID); rbErr != nil {
 			return nil, fmt.Errorf("provider capture failed (%w) and rollback failed: %w", capErr, rbErr)
 		}
+		emitCapture(ctx, pay.ID, outcomeDeclined) // only once the reversal stored the decision
 		return nil, capErr
 
 	case domain.OutcomeRetryableFailure:
@@ -883,7 +889,6 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 	}
 	if class == domain.OutcomeUnknown {
 		recordOperation(ctx, opRefund, resultUnknown)
-		emitRefund(ctx, ref.PaymentID, ref.ID, outcomeUnknown)
 		recordProviderUnknown(ctx, opRefund, unknownStagePark)
 		if attemptErr != nil {
 			// Same rule as the intent-level parks: no evidence, no park. A refund
@@ -901,6 +906,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 			return fmt.Errorf("%w: parking the refund failed: %w", domain.ErrRefundNotSettled, err)
 		}
 		ref.Status = domain.RefundProcessing
+		emitRefund(ctx, ref.PaymentID, ref.ID, outcomeUnknown) // the doubt is stored
 		// Wraps BOTH sentinels. ErrRefundNotSettled says which operation is open;
 		// ErrOutcomeUnknown says what kind of open it is, and that is the one every
 		// caller tests to tell doubt from a decided no. A refund is not exempt from
@@ -908,7 +914,6 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 		return fmt.Errorf("%w: %w: %w", domain.ErrRefundNotSettled, domain.ErrOutcomeUnknown, provErr)
 	}
 	recordOperation(ctx, opRefund, resultDeclined)
-	emitRefund(ctx, ref.PaymentID, ref.ID, outcomeDeclined)
 	if err := s.payments.SettleRefund(ctx, ref.ID, domain.RefundFailed, ""); err != nil {
 		// The verdict itself is now unpersisted, so the outcome is open again:
 		// ask for a same-key retry rather than reporting a decline we did not
@@ -916,6 +921,7 @@ func (s *Service) refundNotSucceeded(ctx context.Context, ref *domain.Refund, cl
 		return fmt.Errorf("%w: recording the decline failed: %w", domain.ErrRefundNotSettled, err)
 	}
 	ref.Status = domain.RefundFailed
+	emitRefund(ctx, ref.PaymentID, ref.ID, outcomeDeclined) // the decline is stored
 	return fmt.Errorf("%w: %w", domain.ErrRefundDeclined, provErr)
 }
 

@@ -108,7 +108,7 @@ func (s *Service) resolveAuthorize(ctx context.Context, pay *domain.Payment, a d
 
 	switch class {
 	case domain.OutcomeSuccess:
-		err := s.transitionParked(ctx, pay.ID, domain.StatusAuthorized,
+		applied, err := s.transitionParkedApplied(ctx, pay.ID, domain.StatusAuthorized,
 			map[string]any{
 				colProviderPaymentID: charge.ProviderPaymentID,
 				colAuthorizedAt:      s.now(),
@@ -123,16 +123,20 @@ func (s *Service) resolveAuthorize(ctx context.Context, pay *domain.Payment, a d
 		}
 		if err == nil {
 			recordAuthorization(ctx, authAuthorized, currencyLabel(pay.Currency))
-			emitAuthorization(ctx, pay, outcomeAuthorized)
+			if applied {
+				emitAuthorization(ctx, pay, outcomeAuthorized)
+			}
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
 	case domain.OutcomeBusinessDecline:
-		err := s.transitionParked(ctx, pay.ID, domain.StatusFailed,
+		applied, err := s.transitionParkedApplied(ctx, pay.ID, domain.StatusFailed,
 			map[string]any{colDeclineCode: declineCode(chErr)})
 		if err == nil {
 			recordAuthorization(ctx, authDeclined, currencyLabel(pay.Currency))
-			emitAuthorization(ctx, pay, outcomeDeclined)
+			if applied {
+				emitAuthorization(ctx, pay, outcomeDeclined)
+			}
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -155,10 +159,12 @@ func (s *Service) resolveCapture(ctx context.Context, pay *domain.Payment, a dom
 
 	switch class {
 	case domain.OutcomeSuccess:
-		err := s.transitionParked(ctx, pay.ID, domain.StatusCaptured, nil)
+		applied, err := s.transitionParkedApplied(ctx, pay.ID, domain.StatusCaptured, nil)
 		if err == nil {
 			recordOperation(ctx, opCapture, resultOK)
-			emitCapture(ctx, pay.ID, outcomeSucceeded)
+			if applied {
+				emitCapture(ctx, pay.ID, outcomeSucceeded)
+			}
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -167,12 +173,15 @@ func (s *Service) resolveCapture(ctx context.Context, pay *domain.Payment, a dom
 		// moves processing→authorized and posts the compensating ledger legs, so the
 		// books stop asserting revenue nobody collected.
 		err := s.payments.ReverseCapture(ctx, pay.ID)
+		applied := err == nil
 		if errors.Is(err, domain.ErrStaleTransition) {
 			err = nil // another resolver reached the same conclusion first
 		}
 		if err == nil {
 			recordOperation(ctx, opCapture, resultDeclined)
-			emitCapture(ctx, pay.ID, outcomeDeclined)
+			if applied {
+				emitCapture(ctx, pay.ID, outcomeDeclined)
+			}
 		}
 		return s.closeAfterVerdict(ctx, a, err)
 
@@ -274,11 +283,20 @@ func (s *Service) closeAfterVerdict(ctx context.Context, a domain.Attempt, appli
 // FAILURE, which the saga reads as permanent — so a race between two resolvers
 // would make the caller compensate a payment that was just settled correctly.
 func (s *Service) transitionParked(ctx context.Context, paymentID int64, to domain.Status, set map[string]any) error {
+	_, err := s.transitionParkedApplied(ctx, paymentID, to, set)
+	return err
+}
+
+// transitionParkedApplied is transitionParked that also reports whether THIS
+// call moved the row. A resolver that lost the race returns (false, nil): the
+// doubt is closed either way, but only the winner stored the decision, so only
+// it writes the catalog event.
+func (s *Service) transitionParkedApplied(ctx context.Context, paymentID int64, to domain.Status, set map[string]any) (bool, error) {
 	err := s.payments.TransitionStatus(ctx, paymentID, domain.StatusProcessing, to, set)
 	if errors.Is(err, domain.ErrStaleTransition) {
-		return nil
+		return false, nil
 	}
-	return err
+	return err == nil, err
 }
 
 // closeAttempt stamps the original attempt resolved. A lost race (another
@@ -341,14 +359,22 @@ func declineCode(err error) string {
 // reporting a precondition failure there is what made callers compensate an
 // operation that may well have succeeded.
 func (s *Service) park(ctx context.Context, from domain.Status, a domain.Attempt, cause error) error {
+	_, err := s.parkReported(ctx, from, a, cause)
+	return err
+}
+
+// parkReported is park that also reports whether the doubt was stored — the
+// attempt row written and the payment moved to processing. Only a stored
+// doubt is a decision a catalog event may describe.
+func (s *Service) parkReported(ctx context.Context, from domain.Status, a domain.Attempt, cause error) (bool, error) {
 	unknown := fmt.Errorf("%w: %s: %w", domain.ErrOutcomeUnknown, a.Operation, cause)
 	if err := s.recordAttempt(ctx, a); err != nil {
-		return fmt.Errorf("%w (not parked: the attempt log refused the evidence: %w)", unknown, err)
+		return false, fmt.Errorf("%w (not parked: the attempt log refused the evidence: %w)", unknown, err)
 	}
 	if err := s.payments.TransitionStatus(ctx, a.PaymentID, from, domain.StatusProcessing, nil); err != nil {
-		return fmt.Errorf("%w (parking it failed: %w)", unknown, err)
+		return false, fmt.Errorf("%w (parking it failed: %w)", unknown, err)
 	}
-	return unknown
+	return true, unknown
 }
 
 // settleBeforeOperating gives a parked payment its answer before an operation

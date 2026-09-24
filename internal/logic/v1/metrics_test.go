@@ -66,6 +66,16 @@ var testReader = func() sdkmetric.Reader {
 // one service, with the cumulative counter asserted at each step.
 func TestAuthorizationMetric(t *testing.T) {
 	reader := testReader
+	// The reader is process-wide and other tests authorize payments too, so
+	// every assertion is a delta from this test's own starting point.
+	base := collectCounter(t, reader, "payment.authorization.total", "result")
+	authDelta := func() map[string]int64 {
+		got := collectCounter(t, reader, "payment.authorization.total", "result")
+		for k, v := range base {
+			got[k] -= v
+		}
+		return got
+	}
 
 	svc, _, fi, _ := newTestService()
 	ctx := context.Background()
@@ -80,7 +90,7 @@ func TestAuthorizationMetric(t *testing.T) {
 		t.Fatal("expected a transient error")
 	}
 
-	got := collectCounter(t, reader, "payment.authorization.total", "result")
+	got := authDelta()
 	for result, want := range map[string]int64{"authorized": 1, "declined": 1, "error": 1} {
 		if got[result] != want {
 			t.Errorf("authorization{result=%s} = %d, want %d", result, got[result], want)
@@ -92,7 +102,7 @@ func TestAuthorizationMetric(t *testing.T) {
 	if _, err := svc.CreateIntent(ctx, "auth", intent(2000)); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if got := collectCounter(t, reader, "payment.authorization.total", "result"); got["authorized"] != 1 {
+	if got := authDelta(); got["authorized"] != 1 {
 		t.Errorf("authorized after replay = %d, want 1 (idempotent replay must not re-count)", got["authorized"])
 	}
 
@@ -102,14 +112,14 @@ func TestAuthorizationMetric(t *testing.T) {
 	if _, err := svc.CreateIntent(ctx, "rdv", intent(2000)); err != nil {
 		t.Fatalf("second authorize: %v", err)
 	}
-	if got := collectCounter(t, reader, "payment.authorization.total", "result"); got["authorized"] != 2 {
+	if got := authDelta(); got["authorized"] != 2 {
 		t.Fatalf("authorized after second payment = %d, want 2", got["authorized"])
 	}
 	fi.forceReDrive("rdv")
 	if _, err := svc.CreateIntent(ctx, "rdv", intent(2000)); err != nil {
 		t.Fatalf("re-drive: %v", err)
 	}
-	if got := collectCounter(t, reader, "payment.authorization.total", "result"); got["authorized"] != 2 {
+	if got := authDelta(); got["authorized"] != 2 {
 		t.Errorf("authorized after re-drive = %d, want 2 (takeover must not double-count)", got["authorized"])
 	}
 }
