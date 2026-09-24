@@ -29,30 +29,41 @@ var (
 	meter = otel.Meter("payment-service")
 
 	authorizationCounter, _ = meter.Int64Counter("payment.authorization.total",
-		metric.WithDescription("Payment authorization attempts by outcome (decline-rate KPI)"))
+		metric.WithDescription("Payment authorization attempts by outcome (decline-rate KPI)"),
+		metric.WithUnit("{authorization}"))
 	operationCounter, _ = meter.Int64Counter("payment.operation.total",
-		metric.WithDescription("Money-lifecycle operations (capture/void/refund) by outcome"))
+		metric.WithDescription("Money-lifecycle operations (capture/void/refund) by outcome"),
+		metric.WithUnit("{operation}"))
 	reconDiscrepancyCounter, _ = meter.Int64Counter("payment.reconciliation.discrepancies.total",
-		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by class"))
+		metric.WithDescription("Ledger-vs-provider discrepancies found per reconciliation run, by class"),
+		metric.WithUnit("{discrepancy}"))
 	providerUnknownCounter, _ = meter.Int64Counter("payment.provider.unknown.total",
-		metric.WithDescription("Provider calls that returned no verdict, by operation and stage — stage=park is a NEW doubt (an intent enters processing), stage=resolve is a re-ask that ALSO answered nothing (existing doubt surviving). The first GameDay read 2 against one parked row because both round-trips counted indistinguishably"))
+		metric.WithDescription("Provider calls that returned no verdict, by operation and stage — stage=park is a NEW doubt (an intent enters processing), stage=resolve is a re-ask that ALSO answered nothing (existing doubt surviving). The first GameDay read 2 against one parked row because both round-trips counted indistinguishably"),
+		metric.WithUnit("{outcome}"))
 	attemptWriteFailureCounter, _ = meter.Int64Counter("payment.attempt.write_failures.total",
-		metric.WithDescription("Attempt rows that could not be written, by operation — the money state is still correct, but its evidence is missing"))
+		metric.WithDescription("Attempt rows that could not be written, by operation — the money state is still correct, but its evidence is missing"),
+		metric.WithUnit("{failure}"))
 	keyReleaseFailureCounter, _ = meter.Int64Counter("payment.idempotency.release_failures.total",
-		metric.WithDescription("Idempotency keys that could not be unlocked after a failed attempt; each one delays a caller's same-key retry until the takeover window"))
+		metric.WithDescription("Idempotency keys that could not be unlocked after a failed attempt; each one delays a caller's same-key retry until the takeover window"),
+		metric.WithUnit("{failure}"))
 	attemptResolutionCounter, _ = meter.Int64Counter("payment.attempt.resolution.total",
-		metric.WithDescription("Re-drives of an open UNKNOWN attempt, by operation and the class the provider answered with — `UNKNOWN` here means the doubt survived the round-trip"))
+		metric.WithDescription("Re-drives of an open UNKNOWN attempt, by operation and the class the provider answered with — `UNKNOWN` here means the doubt survived the round-trip"),
+		metric.WithUnit("{resolution}"))
 	sweepFailureCounter, _ = meter.Int64Counter("payment.doubt.sweep_failures.total",
-		metric.WithDescription("Worklist entries the background sweep could not even attempt, by operation — doubt that nothing is currently working on"))
+		metric.WithDescription("Worklist entries the background sweep could not even attempt, by operation — doubt that nothing is currently working on"),
+		metric.WithUnit("{failure}"))
 	reconRunCounter, _ = meter.Int64Counter("payment.reconciliation.runs.total",
-		metric.WithDescription("Reconciliation passes by outcome — the answer to 'is the reconciler running at all', which a discrepancy count alone cannot give"))
+		metric.WithDescription("Reconciliation passes by outcome — the answer to 'is the reconciler running at all', which a discrepancy count alone cannot give"),
+		metric.WithUnit("{run}"))
 	reconRunDuration, _ = meter.Float64Histogram("payment.reconciliation.run.duration",
 		metric.WithDescription("How long a reconciliation pass takes; a window that stops draining shows up here before it shows up in staleness"),
 		metric.WithUnit("s"))
 	reconWindowViolationCounter, _ = meter.Int64Counter("payment.reconciliation.window_violations.total",
-		metric.WithDescription("Provider transactions outside the window the pass asked for — a provider ignoring its bounds can manufacture phantom missing_internal discrepancies (first GameDay, F1), so violating rows are excluded and the watermark holds"))
+		metric.WithDescription("Provider transactions outside the window the pass asked for — a provider ignoring its bounds can manufacture phantom missing_internal discrepancies (first GameDay, F1), so violating rows are excluded and the watermark holds"),
+		metric.WithUnit("{row}"))
 	reconHealFailureCounter, _ = meter.Int64Counter("payment.reconciliation.heal_failures.total",
-		metric.WithDescription("Heal attempts that errored, by discrepancy class — previously only logged, so a heal that never worked was invisible"))
+		metric.WithDescription("Heal attempts that errored, by discrepancy class — previously only logged, so a heal that never worked was invisible"),
+		metric.WithUnit("{failure}"))
 )
 
 // Reconciliation run outcomes (bounded).
@@ -93,7 +104,8 @@ func recordReconHealFailure(ctx context.Context, class string) {
 // only something derived from stored state can tell "stopped" from "quiet".
 func ObserveReconciliationWatermark(age func(context.Context) (time.Duration, error)) error {
 	g, err := meter.Float64ObservableGauge("payment.reconciliation.watermark_age_seconds",
-		metric.WithDescription("How far behind now the reconciliation frontier is; grows without bound if the reconciler stops"))
+		metric.WithDescription("How far behind now the reconciliation frontier is; grows without bound if the reconciler stops"),
+		metric.WithUnit("s"))
 	if err != nil {
 		return err
 	}
@@ -129,12 +141,14 @@ func recordSweepFailure(ctx context.Context, op string) {
 // sitting somewhere nobody has looked. Count alone cannot tell those apart.
 func ObserveDoubtBacklog(count func(context.Context) (int64, error), oldest func(context.Context) (time.Duration, error)) error {
 	open, err := meter.Int64ObservableGauge("payment.doubt.open",
-		metric.WithDescription("Provider round-trips whose outcome is still unknown and unresolved"))
+		metric.WithDescription("Provider round-trips whose outcome is still unknown and unresolved"),
+		metric.WithUnit("{attempt}"))
 	if err != nil {
 		return err
 	}
 	age, err := meter.Float64ObservableGauge("payment.doubt.oldest_age_seconds",
-		metric.WithDescription("Age of the oldest unresolved provider outcome; the escalation signal, since one fresh unknown is routine and an old one is not"))
+		metric.WithDescription("Age of the oldest unresolved provider outcome; the escalation signal, since one fresh unknown is routine and an old one is not"),
+		metric.WithUnit("s"))
 	if err != nil {
 		return err
 	}
