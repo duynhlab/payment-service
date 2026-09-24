@@ -439,6 +439,9 @@ func runMockpay(cfg *config.Config, logger *slogx.Logger) {
 			_ = obsShutdown.Shutdown(sctx)
 		}()
 	}
+	// Profiled like every other deployment: without this, mockpay's
+	// PROFILING_ENABLED=true started nothing and Pyroscope never saw it.
+	defer initProfiling(cfg, logger)()
 
 	var emitter mockpay.Emitter
 	switch {
