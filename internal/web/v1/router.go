@@ -253,7 +253,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 	zapLogger.Info(ctx, "Payment intent processed",
 		slog.Int64(logFieldPaymentID, result.Payment.ID),
-		slog.Int("code", result.Code),
+		slog.Int("http.response.status_code", result.Code),
 		slog.Bool("replayed", result.Replayed),
 	)
 	if result.Code == http.StatusUnprocessableEntity {
@@ -278,7 +278,7 @@ func (h *Handler) GetPayment(c *gin.Context) {
 	if !ok {
 		return
 	}
-	span.SetAttributes(attribute.Int64("payment.id", id))
+	span.SetAttributes(attribute.String("payment.id", strconv.FormatInt(id, 10)))
 
 	pay, err := h.logic.Get(ctx, id, userID)
 	if err != nil {
@@ -329,7 +329,7 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 	if !ok {
 		return
 	}
-	span.SetAttributes(attribute.Int64("payment.id", paymentID))
+	span.SetAttributes(attribute.String("payment.id", strconv.FormatInt(paymentID, 10)))
 
 	var req createRefundRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -353,7 +353,7 @@ func (h *Handler) CreateRefund(c *gin.Context) {
 	}
 
 	zapLogger.Info(ctx, "Refund created",
-		slog.Int64("refund.id", ref.ID),
+		slog.String("refund.id", strconv.FormatInt(ref.ID, 10)),
 		slog.Int64(logFieldPaymentID, paymentID),
 		slog.Bool("replayed", replayed),
 	)

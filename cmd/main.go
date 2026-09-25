@@ -370,7 +370,7 @@ func buildReconciliation(cfg *config.Config, prov provider.Provider, pool *pgxpo
 func selectProvider(cfg *config.Config, logger *slogx.Logger) provider.Provider {
 	ctx := context.Background()
 	if cfg.Payment.ProviderURL != "" {
-		logger.Info(ctx, "Using mockpay HTTP provider", slog.String("url", cfg.Payment.ProviderURL))
+		logger.Info(ctx, "Using mockpay HTTP provider", slog.String("url.full", cfg.Payment.ProviderURL))
 		return provider.NewHTTPClient(cfg.Payment.ProviderURL)
 	}
 	logger.Info(ctx, "Using in-memory provider stub")
@@ -451,7 +451,7 @@ func runMockpay(cfg *config.Config, logger *slogx.Logger) {
 		logger.Error(ctx, "MOCKPAY_WEBHOOK_URL set but MOCKPAY_WEBHOOK_SECRET empty; emission disabled")
 	default:
 		emitter = mockpay.NewWebhookEmitter(cfg.Payment.WebhookURL, cfg.Payment.WebhookSecret, logger)
-		logger.Info(ctx, "mockpay webhook emission enabled", slog.String("url", cfg.Payment.WebhookURL))
+		logger.Info(ctx, "mockpay webhook emission enabled", slog.String("url.full", cfg.Payment.WebhookURL))
 	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Service.Port,

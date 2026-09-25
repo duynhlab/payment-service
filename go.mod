@@ -9,9 +9,9 @@ require (
 	github.com/duynhlab/pkg/httpmw v0.2.0
 	github.com/duynhlab/pkg/httpx v0.37.1
 	github.com/duynhlab/pkg/idempotency v0.37.1
-	github.com/duynhlab/pkg/logger/slogx v0.2.0
+	github.com/duynhlab/pkg/logger/slogx v0.3.0
 	github.com/duynhlab/pkg/migratex v0.36.2
-	github.com/duynhlab/pkg/obsx v0.46.0
+	github.com/duynhlab/pkg/obsx v0.47.0
 	github.com/duynhlab/pkg/proto v0.37.1
 	github.com/gin-gonic/gin v1.12.0
 	github.com/jackc/pgx/v5 v5.10.0
