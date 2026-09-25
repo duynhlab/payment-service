@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"github.com/duynhlab/pkg/httpmw"
 )
 
 // maxRespBytes caps how much of a provider response we read. Responses are tiny
@@ -36,16 +36,17 @@ type HTTPClient struct {
 }
 
 // NewHTTPClient wires a mockpay client at baseURL (e.g. http://mockpay:8080).
-// The transport is wrapped with otelhttp so each outbound call carries the W3C
-// traceparent (the money-hop joins the caller's trace) and emits a client span.
-// otelhttp injects only headers via the global propagator — it never touches
-// the request body, so any body-level signing stays intact.
+// The transport comes from the shared package (httpmw.Transport, the one
+// sanctioned otelhttp hop) so each outbound call carries the W3C traceparent
+// (the money-hop joins the caller's trace) and emits a client span. Only
+// headers are injected — the request body is untouched, so any body-level
+// signing stays intact.
 func NewHTTPClient(baseURL string) *HTTPClient {
 	return &HTTPClient{
 		baseURL: baseURL,
 		hc: &http.Client{
 			Timeout:   10 * time.Second,
-			Transport: otelhttp.NewTransport(http.DefaultTransport),
+			Transport: httpmw.Transport(http.DefaultTransport),
 		},
 	}
 }

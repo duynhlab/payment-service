@@ -18,10 +18,12 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@e321897e5c28e7c861b9d8beb37614e1c5823f42 # main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@54fd20d46fd99b5fb85e6029247fcaba865c1481 # main
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
+      policy-lint: true
+      policy-lint-blocking: true
       integration: true
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
 
