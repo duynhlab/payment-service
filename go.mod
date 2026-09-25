@@ -6,7 +6,7 @@ require (
 	github.com/duynhlab/pkg/authmw v0.37.2
 	github.com/duynhlab/pkg/dbx v0.36.3
 	github.com/duynhlab/pkg/grpcx v0.37.0
-	github.com/duynhlab/pkg/httpmw v0.2.0
+	github.com/duynhlab/pkg/httpmw v0.3.0
 	github.com/duynhlab/pkg/httpx v0.37.1
 	github.com/duynhlab/pkg/idempotency v0.37.1
 	github.com/duynhlab/pkg/logger/slogx v0.3.0
@@ -18,7 +18,6 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
@@ -109,6 +108,7 @@ require (
 	go.opentelemetry.io/contrib/bridges/otelslog v0.20.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin v0.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/runtime v0.71.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.22.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp v1.46.0 // indirect

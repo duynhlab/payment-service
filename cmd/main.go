@@ -16,7 +16,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc"
 
 	"github.com/duynhlab/payment-service/config"
@@ -429,7 +428,7 @@ func runMockpay(cfg *config.Config, logger *slogx.Logger) {
 	ctx := context.Background()
 	// mockpay is a deployed service (a real network hop), so it gets the same
 	// OTel wiring as the main binary: this installs the TracerProvider + W3C
-	// propagator that let the otelhttp handler below open a server span joining
+	// propagator that let the httpmw.Handler below open a server span joining
 	// the caller's trace (the money-hop's far end).
 	obsShutdown, logger := initObservability(logger)
 	if obsShutdown != nil {
@@ -455,7 +454,7 @@ func runMockpay(cfg *config.Config, logger *slogx.Logger) {
 	}
 	srv := &http.Server{
 		Addr:              ":" + cfg.Service.Port,
-		Handler:           otelhttp.NewHandler(mockpay.New(logger, emitter).Handler(), "mockpay"),
+		Handler:           httpmw.Handler(mockpay.New(logger, emitter).Handler(), "mockpay"),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
