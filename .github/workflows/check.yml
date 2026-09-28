@@ -28,7 +28,7 @@ jobs:
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
 
   gitleaks:
-    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@54fd20d46fd99b5fb85e6029247fcaba865c1481 # main
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@ad936a94f1f5660000098dcc3fe917e88d1e916d # main
     permissions:
       contents: read
       security-events: write
