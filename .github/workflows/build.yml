@@ -75,7 +75,7 @@ jobs:
 
   docker-sign:
     needs: [docker-build]
-    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@e321897e5c28e7c861b9d8beb37614e1c5823f42 # main
+    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@54fd20d46fd99b5fb85e6029247fcaba865c1481 # main
     with:
       tags: ${{ needs.docker-build.outputs.tags }}
       digest: ${{ needs.docker-build.outputs.digest }}
