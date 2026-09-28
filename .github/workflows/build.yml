@@ -58,7 +58,7 @@ jobs:
   trivy-report:
     needs: [docker-build]
     if: needs.docker-build.outputs.scan-status == 'pass'
-    uses: duynhlab/gha-workflows/.github/workflows/trivy-scan.yml@54fd20d46fd99b5fb85e6029247fcaba865c1481 # main
+    uses: duynhlab/gha-workflows/.github/workflows/trivy-scan.yml@ad936a94f1f5660000098dcc3fe917e88d1e916d # main
     with:
       image-ref: ghcr.io/${{ github.repository }}/${{ github.event.repository.name }}@${{ needs.docker-build.outputs.digest }}
       severity: 'CRITICAL,HIGH,MEDIUM'
