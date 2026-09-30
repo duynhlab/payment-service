@@ -4,7 +4,7 @@ go 1.26.7
 
 require (
 	github.com/duynhlab/pkg/authmw v0.37.2
-	github.com/duynhlab/pkg/dbx v0.36.3
+	github.com/duynhlab/pkg/dbx v0.37.0
 	github.com/duynhlab/pkg/grpcx v0.37.0
 	github.com/duynhlab/pkg/httpmw v0.3.0
 	github.com/duynhlab/pkg/httpx v0.37.1
