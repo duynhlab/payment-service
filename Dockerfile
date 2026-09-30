@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" go build -o /
 # Pinned base (not :latest) for reproducibility; busybox provides the wget the
 # compose healthcheck uses. Runs as a non-root user (least privilege; also
 # satisfies the cluster PSS-restricted runAsNonRoot policy).
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk --no-cache add ca-certificates \
     && adduser -D -u 10001 app
 WORKDIR /app
