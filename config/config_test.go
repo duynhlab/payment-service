@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -58,5 +59,36 @@ func TestLoadOIDCDefaults(t *testing.T) {
 	}
 	if cfg.OIDCJWKSURL != "" {
 		t.Errorf("default OIDCJWKSURL = %q, want empty (derived from issuer)", cfg.OIDCJWKSURL)
+	}
+}
+
+func TestBuildDSN(t *testing.T) {
+	db := &DatabaseConfig{Host: "localhost", Port: "5432", Name: "payment", User: "payment", Password: "secret", SSLMode: "disable"}
+	want := "postgresql://payment:secret@localhost:5432/payment?sslmode=disable"
+	if got := db.BuildDSN(); got != want {
+		t.Errorf("BuildDSN() = %q, want %q", got, want)
+	}
+}
+
+func TestBuildDSN_EscapesCredentials(t *testing.T) {
+	// Dynamic/rotated secrets can contain DSN-reserved characters; they must
+	// round-trip through the URL instead of corrupting it. '%' and ' ' matter
+	// most: pgx >= 5.11 rejects malformed percent-encoding outright.
+	db := &DatabaseConfig{
+		Host: "localhost", Port: "5432", Name: "app",
+		User: "app@user", Password: "p@ss:w/rd?& 100%", SSLMode: "require",
+	}
+	u, err := url.Parse(db.BuildDSN())
+	if err != nil {
+		t.Fatalf("BuildDSN() is not a parseable URL: %v", err)
+	}
+	if got := u.User.Username(); got != db.User {
+		t.Errorf("username round-trip = %q, want %q", got, db.User)
+	}
+	if got, _ := u.User.Password(); got != db.Password {
+		t.Errorf("password round-trip = %q, want %q", got, db.Password)
+	}
+	if got := u.Query().Get("sslmode"); got != "require" {
+		t.Errorf("sslmode = %q, want require", got)
 	}
 }

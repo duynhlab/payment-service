@@ -23,6 +23,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -122,9 +123,19 @@ type DatabaseConfig struct {
 // BuildDSN constructs PostgreSQL connection string from config
 func (c *DatabaseConfig) BuildDSN() string {
 	// Format: postgresql://user:password@host:port/dbname?sslmode=disable
-	hostPort := net.JoinHostPort(c.Host, c.Port)
-	return fmt.Sprintf("postgresql://%s:%s@%s/%s?sslmode=%s",
-		c.User, c.Password, hostPort, c.Name, c.SSLMode)
+	// Built via net/url so credentials with reserved characters (rotated or
+	// dynamic secrets) are percent-encoded instead of corrupting the DSN.
+	// Pool sizing is applied on the parsed pgxpool.Config in database.Connect (not
+	// the DSN) so the migrate subcommand can share this exact DSN (its pgx stdlib
+	// driver rejects pool_* params).
+	u := url.URL{
+		Scheme:   "postgresql",
+		User:     url.UserPassword(c.User, c.Password),
+		Host:     net.JoinHostPort(c.Host, c.Port),
+		Path:     "/" + c.Name,
+		RawQuery: url.Values{"sslmode": []string{c.SSLMode}}.Encode(),
+	}
+	return u.String()
 }
 
 // Load reads configuration from environment variables with defaults
