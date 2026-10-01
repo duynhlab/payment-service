@@ -16,7 +16,7 @@ ledger that explains every movement of money.
 
 | Area | Technology |
 |------|------------|
-| Runtime | Go 1.26 |
+| Runtime | Go 1.27 |
 | Transports | HTTP (private, internal, and a public webhook) · gRPC (east-west) |
 | Data | PostgreSQL |
 | Platform libraries | `authmw`, `dbx`, `grpcx`, `httpx`, `idempotency`, `logger/zapx`, `migratex`, `obsx`, `proto` |
