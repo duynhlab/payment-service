@@ -18,7 +18,7 @@ jobs:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@54fd20d46fd99b5fb85e6029247fcaba865c1481 # main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@ff848d88c8b3c301dcd1292cb8367221d3fed64e # main
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
