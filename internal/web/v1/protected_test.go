@@ -103,9 +103,6 @@ func TestProtectedPaymentsRoleGate(t *testing.T) {
 		"/payment/v1/protected/payments/attempts?status=open",
 		"/payment/v1/protected/payments/reconciliation/runs",
 		"/payment/v1/protected/payments/reconciliation/runs/1",
-		"/payment/v1/protected/attempts/open",
-		"/payment/v1/protected/reconciliations/runs",
-		"/payment/v1/protected/reconciliations/runs/1",
 	} {
 		if w := get(r, path); w.Code != http.StatusForbidden {
 			t.Fatalf("%s: want 403, got %d", path, w.Code)
@@ -257,22 +254,16 @@ func TestProtectedStaticSiblingsOfPaymentID(t *testing.T) {
 	}
 }
 
-// ADR-017 expand phase: the pre-canonical paths stay mounted on the same
-// handlers until the Backoffice has moved to the canonical ones.
-func TestProtectedDeprecatedAliasesMounted(t *testing.T) {
-	f := &fakeReaders{
-		open: []domain.Attempt{{ID: 4}}, openTotal: 1,
-		runs: []repository.ReconRunView{{ID: 3}}, runTotal: 1,
-		run: &repository.ReconRunView{ID: 3},
-	}
-	r := protectedEngine(t, f, backofficeRole)
+// ADR-017 contract step: the pre-canonical Backoffice paths are gone.
+func TestProtectedDeprecatedAliasesRemoved(t *testing.T) {
+	r := protectedEngine(t, &fakeReaders{}, backofficeRole)
 	for _, path := range []string{
 		"/payment/v1/protected/attempts/open",
 		"/payment/v1/protected/reconciliations/runs",
 		"/payment/v1/protected/reconciliations/runs/3",
 	} {
-		if w := get(r, path); w.Code != http.StatusOK {
-			t.Fatalf("alias %s: want 200, got %d", path, w.Code)
+		if w := get(r, path); w.Code != http.StatusNotFound {
+			t.Fatalf("alias %s: want 404 after the contract, got %d", path, w.Code)
 		}
 	}
 }

@@ -86,12 +86,6 @@ func (h *ProtectedHandler) mountProtected(r *gin.Engine, authMW ...gin.HandlerFu
 		protected.GET("/payments/reconciliation/runs", h.ListReconRuns)
 		protected.GET("/payments/reconciliation/runs/:id", h.GetReconRun)
 		protected.GET("/payments/:id", h.GetPayment)
-
-		// ADR-017 expand-phase aliases: the pre-canonical Backoffice paths,
-		// served by the same handlers until the portal has moved over.
-		protected.GET("/attempts/open", h.ListOpenAttempts)
-		protected.GET("/reconciliations/runs", h.ListReconRuns)
-		protected.GET("/reconciliations/runs/:id", h.GetReconRun)
 	}
 }
 
@@ -168,12 +162,11 @@ func (h *ProtectedHandler) ListAttempts(c *gin.Context) {
 	h.ListOpenAttempts(c)
 }
 
-// ListOpenAttempts serves the open-attempt list (page, page_size): the
-// operator's doubt worklist across all customers. ListAttempts and the
-// deprecated GET /attempts/open both end here. Every row is a provider
-// round-trip whose answer never arrived, so the money effect may or may not
-// have landed; the reconciler owns resolving them, and this read is how a
-// human sees the backlog it has not reached yet.
+// ListOpenAttempts serves the open-attempt list (page, page_size) behind
+// ListAttempts: the operator's doubt worklist across all customers. Every row
+// is a provider round-trip whose answer never arrived, so the money effect may
+// or may not have landed; the reconciler owns resolving them, and this read is
+// how a human sees the backlog it has not reached yet.
 func (h *ProtectedHandler) ListOpenAttempts(c *gin.Context) {
 	page, pageSize := httpx.ParsePage(c)
 	items, total, err := h.attempts.ListOpenPaged(c.Request.Context(), pageSize, httpx.Offset(page, pageSize))

@@ -152,15 +152,15 @@ func TestWebhook_ProcessorErrorIsRetryable(t *testing.T) {
 	}
 }
 
-// TestWebhook_DeprecatedAliasMounted locks the expand phase of the v3 path
-// migration (homelab ADR-017): the pre-v3 webhook path stays mounted until
-// the contract release removes it.
-func TestWebhook_DeprecatedAliasMounted(t *testing.T) {
+// TestWebhook_DeprecatedAliasRemoved locks the contract step of ADR-017: the
+// pre-v3 webhook path answers 404, so a provider still posting there fails
+// loudly instead of being served by a forgotten alias.
+func TestWebhook_DeprecatedAliasRemoved(t *testing.T) {
 	r := newWebhookRouter(&fakeWebhookProcessor{result: logicv1.WebhookResult{Status: "processed"}})
 	req := httptest.NewRequest(http.MethodPost, "/payment/v1/public/webhooks/mockpay", strings.NewReader("{}"))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
-	if rec.Code == http.StatusNotFound {
-		t.Errorf("deprecated webhook alias not mounted (got 404)")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("deprecated webhook alias still mounted: want 404, got %d", rec.Code)
 	}
 }
