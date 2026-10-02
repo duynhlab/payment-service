@@ -216,17 +216,20 @@ func TestGetRun_Errors(t *testing.T) {
 	}
 }
 
-// TestRecon_DeprecatedAliasMounted locks the expand phase of the v3 path
-// migration (homelab ADR-017): the pre-v3 reconciliation path stays mounted
-// until the contract release removes it.
-func TestRecon_DeprecatedAliasMounted(t *testing.T) {
+// TestRecon_DeprecatedAliasRemoved locks the contract step of ADR-017: the
+// pre-v3 reconciliation path is gone, not merely unused.
+func TestRecon_DeprecatedAliasRemoved(t *testing.T) {
 	r := gin.New()
 	RegisterReconciliationRoutes(r, NewReconciliationHandler(nil, nil))
-	req := httptest.NewRequest(http.MethodPost, "/payment/v1/internal/reconciliation/runs", nil)
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code == http.StatusNotFound {
-		t.Errorf("deprecated reconciliation alias not mounted (got 404)")
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/payment/v1/internal/reconciliation/runs"},
+		{http.MethodGet, "/payment/v1/internal/reconciliation/runs/1"},
+	} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s: want 404 after the contract, got %d", tc.method, tc.path, rec.Code)
+		}
 	}
 }
 

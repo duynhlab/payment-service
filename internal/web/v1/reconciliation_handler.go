@@ -38,10 +38,6 @@ const msgRunFailed = "Reconciliation run failed"
 // a response header is a header-injection sink.
 const reconRunsPath = "/payment/v1/internal/payments/reconciliation/runs"
 
-// reconRunsPathDeprecated is the pre-v3 path, kept mounted as an alias for one
-// release during the rollout. Remove at contract; see homelab ADR-017.
-const reconRunsPathDeprecated = "/payment/v1/internal/reconciliation/runs"
-
 // Shared JSON/log field keys.
 const (
 	fieldRunID         = "reconciliation.run_id"
@@ -94,9 +90,6 @@ func NewReconciliationHandler(runner ReconRunner, reader reconReader) *Reconcili
 func RegisterReconciliationRoutes(r *gin.Engine, h *ReconciliationHandler) {
 	r.POST(reconRunsPath, h.TriggerRun)
 	r.GET(reconRunsPath+"/:id", h.GetRun)
-	// Deprecated aliases — same handlers on the pre-v3 path.
-	r.POST(reconRunsPathDeprecated, h.TriggerRun)
-	r.GET(reconRunsPathDeprecated+"/:id", h.GetRun)
 }
 
 // TriggerRun handles POST /payment/v1/internal/payments/reconciliation/runs — runs one
