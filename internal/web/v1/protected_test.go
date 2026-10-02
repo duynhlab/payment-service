@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -99,6 +100,9 @@ func TestProtectedPaymentsRoleGate(t *testing.T) {
 	for _, path := range []string{
 		"/payment/v1/protected/payments",
 		"/payment/v1/protected/payments/1",
+		"/payment/v1/protected/payments/attempts?status=open",
+		"/payment/v1/protected/payments/reconciliation/runs",
+		"/payment/v1/protected/payments/reconciliation/runs/1",
 		"/payment/v1/protected/attempts/open",
 		"/payment/v1/protected/reconciliations/runs",
 		"/payment/v1/protected/reconciliations/runs/1",
@@ -193,7 +197,7 @@ func TestProtectedOpenAttempts(t *testing.T) {
 	}
 	r := protectedEngine(t, f, backofficeRole)
 
-	w := get(r, "/payment/v1/protected/attempts/open?page=3&page_size=5")
+	w := get(r, "/payment/v1/protected/payments/attempts?status=open&page=3&page_size=5")
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -212,8 +216,64 @@ func TestProtectedOpenAttempts(t *testing.T) {
 	}
 
 	f.openErr = context.DeadlineExceeded
-	if w := get(r, "/payment/v1/protected/attempts/open"); w.Code != http.StatusInternalServerError {
+	if w := get(r, "/payment/v1/protected/payments/attempts?status=open"); w.Code != http.StatusInternalServerError {
 		t.Fatalf("reader error: want 500, got %d", w.Code)
+	}
+}
+
+// The open-attempt list takes a required status, and open is the only state
+// the store can answer: a missing or other value must not quietly return the
+// open list under a different name.
+func TestProtectedAttemptsStatusFilter(t *testing.T) {
+	r := protectedEngine(t, &fakeReaders{}, backofficeRole)
+	for _, q := range []string{"", "?status=", "?status=closed", "?status=OPEN"} {
+		if w := get(r, "/payment/v1/protected/payments/attempts"+q); w.Code != http.StatusBadRequest {
+			t.Fatalf("status %q: want 400, got %d", q, w.Code)
+		}
+	}
+}
+
+// /payments/attempts and /payments/reconciliation/... are static siblings of
+// /payments/:id. Each must reach its own handler, not GetPayment's id parse
+// (which would answer 400 "id must be a positive integer").
+func TestProtectedStaticSiblingsOfPaymentID(t *testing.T) {
+	f := &fakeReaders{
+		open: []domain.Attempt{{ID: 4}}, openTotal: 1,
+		runs: []repository.ReconRunView{{ID: 3}}, runTotal: 1,
+		run: &repository.ReconRunView{ID: 3},
+	}
+	r := protectedEngine(t, f, backofficeRole)
+	for _, path := range []string{
+		"/payment/v1/protected/payments/attempts?status=open",
+		"/payment/v1/protected/payments/reconciliation/runs",
+		"/payment/v1/protected/payments/reconciliation/runs/3",
+	} {
+		if w := get(r, path); w.Code != http.StatusOK {
+			t.Fatalf("%s: want 200, got %d: %s", path, w.Code, w.Body.String())
+		}
+	}
+	if w := get(r, "/payment/v1/protected/payments/attempts"); !strings.Contains(w.Body.String(), "status must be open") {
+		t.Fatalf("attempts without status reached the wrong handler: %s", w.Body.String())
+	}
+}
+
+// ADR-017 expand phase: the pre-canonical paths stay mounted on the same
+// handlers until the Backoffice has moved to the canonical ones.
+func TestProtectedDeprecatedAliasesMounted(t *testing.T) {
+	f := &fakeReaders{
+		open: []domain.Attempt{{ID: 4}}, openTotal: 1,
+		runs: []repository.ReconRunView{{ID: 3}}, runTotal: 1,
+		run: &repository.ReconRunView{ID: 3},
+	}
+	r := protectedEngine(t, f, backofficeRole)
+	for _, path := range []string{
+		"/payment/v1/protected/attempts/open",
+		"/payment/v1/protected/reconciliations/runs",
+		"/payment/v1/protected/reconciliations/runs/3",
+	} {
+		if w := get(r, path); w.Code != http.StatusOK {
+			t.Fatalf("alias %s: want 200, got %d", path, w.Code)
+		}
 	}
 }
 
@@ -226,10 +286,10 @@ func TestReconRuns(t *testing.T) {
 	}
 	r := protectedEngine(t, f, backofficeRole)
 
-	if w := get(r, "/payment/v1/protected/reconciliations/runs?page=1&page_size=5"); w.Code != http.StatusOK {
+	if w := get(r, "/payment/v1/protected/payments/reconciliation/runs?page=1&page_size=5"); w.Code != http.StatusOK {
 		t.Fatalf("runs: want 200, got %d", w.Code)
 	}
-	w := get(r, "/payment/v1/protected/reconciliations/runs/3")
+	w := get(r, "/payment/v1/protected/payments/reconciliation/runs/3")
 	if w.Code != http.StatusOK {
 		t.Fatalf("run: want 200, got %d", w.Code)
 	}
@@ -242,18 +302,18 @@ func TestReconRuns(t *testing.T) {
 	}
 
 	f.run = nil
-	if w := get(r, "/payment/v1/protected/reconciliations/runs/99"); w.Code != http.StatusNotFound {
+	if w := get(r, "/payment/v1/protected/payments/reconciliation/runs/99"); w.Code != http.StatusNotFound {
 		t.Fatalf("missing run: want 404, got %d", w.Code)
 	}
-	if w := get(r, "/payment/v1/protected/reconciliations/runs/abc"); w.Code != http.StatusBadRequest {
+	if w := get(r, "/payment/v1/protected/payments/reconciliation/runs/abc"); w.Code != http.StatusBadRequest {
 		t.Fatalf("bad id: want 400, got %d", w.Code)
 	}
 	f.run = &repository.ReconRunView{ID: 3}
 	f.runErr = context.DeadlineExceeded
-	if w := get(r, "/payment/v1/protected/reconciliations/runs/3"); w.Code != http.StatusInternalServerError {
+	if w := get(r, "/payment/v1/protected/payments/reconciliation/runs/3"); w.Code != http.StatusInternalServerError {
 		t.Fatalf("run err: want 500, got %d", w.Code)
 	}
-	if w := get(r, "/payment/v1/protected/reconciliations/runs"); w.Code != http.StatusInternalServerError {
+	if w := get(r, "/payment/v1/protected/payments/reconciliation/runs"); w.Code != http.StatusInternalServerError {
 		t.Fatalf("runs err: want 500, got %d", w.Code)
 	}
 }
