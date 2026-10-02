@@ -81,7 +81,14 @@ func (h *ProtectedHandler) mountProtected(r *gin.Engine, authMW ...gin.HandlerFu
 	protected.Use(authMW...)
 	{
 		protected.GET("/payments", h.ListPayments)
+		// Static siblings of /payments/:id; gin routes them before the param.
+		protected.GET("/payments/attempts", h.ListAttempts)
+		protected.GET("/payments/reconciliation/runs", h.ListReconRuns)
+		protected.GET("/payments/reconciliation/runs/:id", h.GetReconRun)
 		protected.GET("/payments/:id", h.GetPayment)
+
+		// ADR-017 expand-phase aliases: the pre-canonical Backoffice paths,
+		// served by the same handlers until the portal has moved over.
 		protected.GET("/attempts/open", h.ListOpenAttempts)
 		protected.GET("/reconciliations/runs", h.ListReconRuns)
 		protected.GET("/reconciliations/runs/:id", h.GetReconRun)
@@ -146,11 +153,27 @@ func (h *ProtectedHandler) GetPayment(c *gin.Context) {
 	})
 }
 
-// ListOpenAttempts serves GET /attempts/open?page=&page_size= — the operator's
-// doubt worklist across all customers. Every row is a provider round-trip whose
-// answer never arrived, so the money effect may or may not have landed; the
-// reconciler owns resolving them, and this read is how a human sees the backlog
-// it has not reached yet.
+// attemptStatusOpen is the only attempt filter the store can answer: a
+// round-trip whose provider outcome never arrived.
+const attemptStatusOpen = "open"
+
+// ListAttempts serves GET /payments/attempts?status=open&page=&page_size=.
+// status is required; open is the only state the store can answer today, so
+// anything else is rejected rather than silently returning the open list.
+func (h *ProtectedHandler) ListAttempts(c *gin.Context) {
+	if c.Query("status") != attemptStatusOpen {
+		httpx.RespondError(c, http.StatusBadRequest, httpx.CodeValidation, "status must be open")
+		return
+	}
+	h.ListOpenAttempts(c)
+}
+
+// ListOpenAttempts serves the open-attempt list (page, page_size): the
+// operator's doubt worklist across all customers. ListAttempts and the
+// deprecated GET /attempts/open both end here. Every row is a provider
+// round-trip whose answer never arrived, so the money effect may or may not
+// have landed; the reconciler owns resolving them, and this read is how a
+// human sees the backlog it has not reached yet.
 func (h *ProtectedHandler) ListOpenAttempts(c *gin.Context) {
 	page, pageSize := httpx.ParsePage(c)
 	items, total, err := h.attempts.ListOpenPaged(c.Request.Context(), pageSize, httpx.Offset(page, pageSize))
@@ -161,7 +184,7 @@ func (h *ProtectedHandler) ListOpenAttempts(c *gin.Context) {
 	c.JSON(http.StatusOK, httpx.NewPaginated(items, page, pageSize, total))
 }
 
-// ListReconRuns serves GET /reconciliations/runs?page=&page_size=.
+// ListReconRuns serves GET /payments/reconciliation/runs?page=&page_size=.
 func (h *ProtectedHandler) ListReconRuns(c *gin.Context) {
 	page, pageSize := httpx.ParsePage(c)
 	runs, total, err := h.recon.ListRuns(c.Request.Context(), pageSize, httpx.Offset(page, pageSize))
@@ -172,7 +195,7 @@ func (h *ProtectedHandler) ListReconRuns(c *gin.Context) {
 	c.JSON(http.StatusOK, httpx.NewPaginated(runs, page, pageSize, total))
 }
 
-// GetReconRun serves GET /reconciliations/runs/:id — run header plus its
+// GetReconRun serves GET /payments/reconciliation/runs/:id — run header plus its
 // discrepancies, the operator's triage view.
 func (h *ProtectedHandler) GetReconRun(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
