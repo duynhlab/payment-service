@@ -97,7 +97,7 @@ jobs:
   notify:
     if: always()
     needs: [go-check, gitleaks, sonar, docker-build, trivy-report, docker-sign, release-binary]
-    uses: duynhlab/gha-workflows/.github/workflows/status.yml@28cee20e57431d6f4565e68be5f38c8a447c903e # main
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@93dfeeecb0aec27c39d5b35bfd9b6a5092a1064b # main
     with:
       slack_channel_id: "C0AD82A9A74"
       gsheet_spreadsheet_id: "1F2VUrAOyMGnETApp5yA-ldCW81ConiQXnWYZVxKas_0"
