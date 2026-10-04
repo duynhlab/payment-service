@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@28cee20e57431d6f4565e68be5f38c8a447c903e # main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@93dfeeecb0aec27c39d5b35bfd9b6a5092a1064b # main
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
