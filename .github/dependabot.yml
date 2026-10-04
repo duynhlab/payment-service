@@ -24,6 +24,12 @@ updates:
     schedule:
       interval: "daily"
     labels: ["dependencies", "github-actions"]
+    # One PR per gha-workflows release instead of one per reusable workflow:
+    # every ref moves to the same commit together.
+    groups:
+      gha-workflows:
+        patterns:
+          - "duynhlab/gha-workflows*"
 
   - package-ecosystem: "docker"
     directory: "/"

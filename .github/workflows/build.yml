@@ -25,14 +25,14 @@ jobs:
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
 
   gitleaks:
-    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@28cee20e57431d6f4565e68be5f38c8a447c903e # main
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@93dfeeecb0aec27c39d5b35bfd9b6a5092a1064b # main
     permissions:
       contents: read
       security-events: write
 
   sonar:
     needs: [go-check, gitleaks]
-    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@28cee20e57431d6f4565e68be5f38c8a447c903e # main
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@93dfeeecb0aec27c39d5b35bfd9b6a5092a1064b # main
     with:
       project-key: 'duynhlab_${{ github.event.repository.name }}'
       organization: 'duynhlab'
@@ -75,7 +75,7 @@ jobs:
 
   docker-sign:
     needs: [docker-build]
-    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@28cee20e57431d6f4565e68be5f38c8a447c903e # main
+    uses: duynhlab/gha-workflows/.github/workflows/docker-sign.yml@93dfeeecb0aec27c39d5b35bfd9b6a5092a1064b # main
     with:
       tags: ${{ needs.docker-build.outputs.tags }}
       digest: ${{ needs.docker-build.outputs.digest }}
