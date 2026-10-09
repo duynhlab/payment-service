@@ -64,8 +64,8 @@ github.com/duynhlab/pkg/idempotency v0.38.0 h1:gd40LQvPq5wHEZrFJTjeTKkCWWdLfmyP8
 github.com/duynhlab/pkg/idempotency v0.38.0/go.mod h1:siMy8EuxFjhSQSoGHzzA9GvEAAEUd/MbmriEsPwoLRY=
 github.com/duynhlab/pkg/logger/slogx v0.4.0 h1:9pAdFg9N0hDd+OQocIc41RZ6Nr2SjDpSgvJba0DOjHs=
 github.com/duynhlab/pkg/logger/slogx v0.4.0/go.mod h1:z61sQ3Q4of48VbaQSnPBCHgBzGX8YRvQaxEc82O66t0=
-github.com/duynhlab/pkg/migratex v0.37.0 h1:CAKzeYtxxKNPncS9DRDrl+5PKfVzAJmgxiVkIKlkp8U=
-github.com/duynhlab/pkg/migratex v0.37.0/go.mod h1:HxRDKXQidFhTciW5rX977V+eAYOy7GRf5nb8zHVYSjA=
+github.com/duynhlab/pkg/migratex v0.38.0 h1:ZQ5W/QIFGhK1F4jkNI85OtPPM9jozOXxjOqlUqjmVO4=
+github.com/duynhlab/pkg/migratex v0.38.0/go.mod h1:HxRDKXQidFhTciW5rX977V+eAYOy7GRf5nb8zHVYSjA=
 github.com/duynhlab/pkg/obsx v0.48.0 h1:DAdPJsQudqvbOpk1rF+kOMktiq+fzVSgY/C3OxMg68s=
 github.com/duynhlab/pkg/obsx v0.48.0/go.mod h1:jYj8QAaH2bag0vvw8gDI76dn0oaa4PhbjfTqRYle/+Q=
 github.com/duynhlab/pkg/proto v0.38.0 h1:CEbeYQQDKovMRCFxkI57TM+bE1+jCAtNasQNoOX5Lig=
