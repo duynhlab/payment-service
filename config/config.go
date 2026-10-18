@@ -114,6 +114,7 @@ type DatabaseConfig struct {
 	Name           string // Database name - from DB_NAME env
 	User           string // Database user - from DB_USER env
 	Password       string // Database password - from DB_PASSWORD env
+	PasswordFile   string // Password file path - from DB_PASSWORD_FILE env (read per new connection by pkg/dbx, overrides Password)
 	SSLMode        string // SSL mode - from DB_SSLMODE env (default: "disable")
 	MaxConnections int    // Max connections - from DB_POOL_MAX_CONNECTIONS env (default: 25)
 	PoolMode       string // Pool mode - from DB_POOL_MODE env (optional)
@@ -176,6 +177,7 @@ func Load() *Config {
 			Name:           getEnv("DB_NAME", ""),
 			User:           getEnv("DB_USER", ""),
 			Password:       getEnv("DB_PASSWORD", ""),
+			PasswordFile:   getEnv("DB_PASSWORD_FILE", ""),
 			SSLMode:        getEnv("DB_SSLMODE", "disable"),
 			MaxConnections: getEnvInt("DB_POOL_MAX_CONNECTIONS", 25),
 			PoolMode:       getEnv("DB_POOL_MODE", ""),
@@ -293,8 +295,8 @@ func (c *Config) validateDatabase() []string {
 	if c.Database.User == "" {
 		errs = append(errs, "DB_USER is required when DB_HOST is set")
 	}
-	if c.Database.Password == "" {
-		errs = append(errs, "DB_PASSWORD is required when DB_HOST is set")
+	if c.Database.Password == "" && c.Database.PasswordFile == "" {
+		errs = append(errs, "DB_PASSWORD or DB_PASSWORD_FILE is required when DB_HOST is set")
 	}
 	if c.Database.Port != "" {
 		if _, err := strconv.Atoi(c.Database.Port); err != nil {
