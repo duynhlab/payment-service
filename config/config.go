@@ -109,16 +109,18 @@ type LoggingConfig struct {
 // DatabaseConfig defines PostgreSQL database configuration
 // All database connections use separate environment variables (not DATABASE_URL string)
 type DatabaseConfig struct {
-	Host           string // Database host - from DB_HOST env
-	Port           string // Database port - from DB_PORT env (default: "5432")
-	Name           string // Database name - from DB_NAME env
-	User           string // Database user - from DB_USER env
-	Password       string // Database password - from DB_PASSWORD env
-	PasswordFile   string // Password file path - from DB_PASSWORD_FILE env (read per new connection by pkg/dbx, overrides Password)
-	SSLMode        string // SSL mode - from DB_SSLMODE env (default: "disable")
-	MaxConnections int    // Max connections - from DB_POOL_MAX_CONNECTIONS env (default: 25)
-	PoolMode       string // Pool mode - from DB_POOL_MODE env (optional)
-	PoolerType     string // Pooler type - from DB_POOLER_TYPE env (optional)
+	Host              string        // Database host - from DB_HOST env
+	Port              string        // Database port - from DB_PORT env (default: "5432")
+	Name              string        // Database name - from DB_NAME env
+	User              string        // Database user - from DB_USER env
+	Password          string        // Database password - from DB_PASSWORD env
+	PasswordFile      string        // Password file path - from DB_PASSWORD_FILE env (read per new connection by pkg/dbx, overrides Password)
+	SSLMode           string        // SSL mode - from DB_SSLMODE env (default: "disable")
+	MaxConnections    int           // Max connections - from DB_POOL_MAX_CONNECTIONS env (default: 25)
+	MaxConnLifetime   time.Duration // Pooled connection lifetime - from DB_POOL_MAX_CONN_LIFETIME env (optional, e.g. 45s; empty = pkg/dbx default)
+	HealthCheckPeriod time.Duration // Idle-connection check period - from DB_POOL_HEALTH_CHECK_PERIOD env (optional; empty = pgxpool default 1m)
+	PoolMode          string        // Pool mode - from DB_POOL_MODE env (optional)
+	PoolerType        string        // Pooler type - from DB_POOLER_TYPE env (optional)
 }
 
 // BuildDSN constructs PostgreSQL connection string from config
@@ -172,16 +174,18 @@ func Load() *Config {
 			Format: getEnv("LOG_FORMAT", "json"),
 		},
 		Database: DatabaseConfig{
-			Host:           getEnv("DB_HOST", ""),
-			Port:           getEnv("DB_PORT", "5432"),
-			Name:           getEnv("DB_NAME", ""),
-			User:           getEnv("DB_USER", ""),
-			Password:       getEnv("DB_PASSWORD", ""),
-			PasswordFile:   getEnv("DB_PASSWORD_FILE", ""),
-			SSLMode:        getEnv("DB_SSLMODE", "disable"),
-			MaxConnections: getEnvInt("DB_POOL_MAX_CONNECTIONS", 25),
-			PoolMode:       getEnv("DB_POOL_MODE", ""),
-			PoolerType:     getEnv("DB_POOLER_TYPE", ""),
+			Host:              getEnv("DB_HOST", ""),
+			Port:              getEnv("DB_PORT", "5432"),
+			Name:              getEnv("DB_NAME", ""),
+			User:              getEnv("DB_USER", ""),
+			Password:          getEnv("DB_PASSWORD", ""),
+			PasswordFile:      getEnv("DB_PASSWORD_FILE", ""),
+			SSLMode:           getEnv("DB_SSLMODE", "disable"),
+			MaxConnections:    getEnvInt("DB_POOL_MAX_CONNECTIONS", 25),
+			MaxConnLifetime:   getEnvOptionalDuration("DB_POOL_MAX_CONN_LIFETIME"),
+			HealthCheckPeriod: getEnvOptionalDuration("DB_POOL_HEALTH_CHECK_PERIOD"),
+			PoolMode:          getEnv("DB_POOL_MODE", ""),
+			PoolerType:        getEnv("DB_POOLER_TYPE", ""),
 		},
 		Payment: PaymentConfig{
 			AuthHoldTTL:             getEnvDuration("AUTH_HOLD_TTL", 168*time.Hour), // 7 days
@@ -456,4 +460,14 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// getEnvOptionalDuration parses a Go duration such as "45s". Empty, invalid or
+// negative returns 0, which leaves the pkg/dbx default in place.
+func getEnvOptionalDuration(key string) time.Duration {
+	d, err := time.ParseDuration(os.Getenv(key))
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
 }

@@ -52,8 +52,8 @@ github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4
 github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
 github.com/duynhlab/pkg/authmw v0.38.0 h1:J9nSlrD0aGrb50UNp4G0uJcUsORiAsYT7fuWA474iGc=
 github.com/duynhlab/pkg/authmw v0.38.0/go.mod h1:zJheLTQRZZaJknGZcO5jsbijPjA5VeypQmphSsPcZnM=
-github.com/duynhlab/pkg/dbx v0.39.0 h1:maHNyZQRXQ5HBFqTqcDesu+tKjO4iNvXnIfvH/a+Yk0=
-github.com/duynhlab/pkg/dbx v0.39.0/go.mod h1:vixxB5HoXUxO3hi15uL/BtMzF3Cfi8/bAiPuX40YrZk=
+github.com/duynhlab/pkg/dbx v0.40.0 h1:T3P/xY4Ww74wRvLUS39MSyYlM0ZL0s/FAg4lNhAS0j8=
+github.com/duynhlab/pkg/dbx v0.40.0/go.mod h1:vixxB5HoXUxO3hi15uL/BtMzF3Cfi8/bAiPuX40YrZk=
 github.com/duynhlab/pkg/grpcx v0.38.0 h1:M5c/LiPmMAvo4HGxDZ9ZoaNCSjiRa0xpjGdXm0Loni0=
 github.com/duynhlab/pkg/grpcx v0.38.0/go.mod h1:QWIROQ6eg+xw8+8ouREjpeVBGbC3pwaxiPAnHafrz9k=
 github.com/duynhlab/pkg/httpmw v0.4.0 h1:eQRGOJqFf2EtaOkV5EC59JM3+rUt8xRTCWAxxONAsDU=
