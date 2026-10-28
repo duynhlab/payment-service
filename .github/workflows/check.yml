@@ -11,14 +11,14 @@ permissions:
 
 jobs:
   pr-checks:
-    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@cc687b8a22c98ea19f33ca10f1958b47bf1b01ec # main
+    uses: duynhlab/gha-workflows/.github/workflows/pr-checks.yml@f7d2c1737e97dd0d1577209a995b1dfe79df1d48 # main
     with:
       slack_channel_id: "C0AD82A9A74"
     secrets:
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 
   go-check:
-    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@cc687b8a22c98ea19f33ca10f1958b47bf1b01ec # main
+    uses: duynhlab/gha-workflows/.github/workflows/go-check.yml@f7d2c1737e97dd0d1577209a995b1dfe79df1d48 # main
     with:
       command-test: 'go test -race -coverprofile=coverage.out ./...'
       lint: true
@@ -28,14 +28,14 @@ jobs:
       integration-command: 'go test -v -tags=integration -covermode=atomic -coverprofile=coverage-integration.out ./internal/core/repository/...'
 
   gitleaks:
-    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@cc687b8a22c98ea19f33ca10f1958b47bf1b01ec # main
+    uses: duynhlab/gha-workflows/.github/workflows/gitleaks.yml@f7d2c1737e97dd0d1577209a995b1dfe79df1d48 # main
     permissions:
       contents: read
       security-events: write
 
   sonar:
     needs: [go-check, gitleaks]
-    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@cc687b8a22c98ea19f33ca10f1958b47bf1b01ec # main
+    uses: duynhlab/gha-workflows/.github/workflows/sonarqube.yml@f7d2c1737e97dd0d1577209a995b1dfe79df1d48 # main
     with:
       project-key: 'duynhlab_${{ github.event.repository.name }}'
       organization: 'duynhlab'
@@ -49,7 +49,7 @@ jobs:
     # fail there — skip instead of painting every deps PR red.
     if: always() && github.actor != 'dependabot[bot]'
     needs: [pr-checks, go-check, gitleaks, sonar]
-    uses: duynhlab/gha-workflows/.github/workflows/status.yml@cc687b8a22c98ea19f33ca10f1958b47bf1b01ec # main
+    uses: duynhlab/gha-workflows/.github/workflows/status.yml@f7d2c1737e97dd0d1577209a995b1dfe79df1d48 # main
     with:
       slack_channel_id: "C0AD82A9A74"
       slack_thread_ts: ${{ needs.pr-checks.outputs.slack_thread_ts }}
