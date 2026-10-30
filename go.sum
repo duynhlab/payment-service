@@ -50,8 +50,8 @@ github.com/docker/go-connections v0.7.0 h1:6SsRfJddP22WMrCkj19x9WKjEDTB+ahsdiGYf
 github.com/docker/go-connections v0.7.0/go.mod h1:no1qkHdjq7kLMGUXYAduOhYPSJxxvgWBh7ogVvptn3Q=
 github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
 github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
-github.com/duynhlab/pkg/authmw v0.38.0 h1:J9nSlrD0aGrb50UNp4G0uJcUsORiAsYT7fuWA474iGc=
-github.com/duynhlab/pkg/authmw v0.38.0/go.mod h1:zJheLTQRZZaJknGZcO5jsbijPjA5VeypQmphSsPcZnM=
+github.com/duynhlab/pkg/authmw v0.39.0 h1:ypIOssFDS1cb2ZsdDxugOeTSBuwk68R9ZBdMXRHisL8=
+github.com/duynhlab/pkg/authmw v0.39.0/go.mod h1:zJheLTQRZZaJknGZcO5jsbijPjA5VeypQmphSsPcZnM=
 github.com/duynhlab/pkg/dbx v0.40.1 h1:xKEukAmrTJRaUCXr2YPDCu6foyDA/CjnInWg65YpUh8=
 github.com/duynhlab/pkg/dbx v0.40.1/go.mod h1:vixxB5HoXUxO3hi15uL/BtMzF3Cfi8/bAiPuX40YrZk=
 github.com/duynhlab/pkg/grpcx v0.38.0 h1:M5c/LiPmMAvo4HGxDZ9ZoaNCSjiRa0xpjGdXm0Loni0=
