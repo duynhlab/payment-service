@@ -1,0 +1,24 @@
+name: Delete workflow runs
+
+# Prunes finished Actions runs through the shared reusable workflow in
+# gha-workflows: every Monday at 08:17 Asia/Ho_Chi_Minh (01:17 UTC) it deletes
+# finished runs older than 7 days. Runs still queued or in progress and the
+# executing run itself are never deleted. No manual trigger: the window is a
+# repository decision, not a per-run choice.
+
+on:
+  schedule:
+    # Monday, off the hour to dodge the top-of-hour cron stampede.
+    - cron: "17 1 * * 1"
+
+permissions: {}
+
+jobs:
+  delete-runs:
+    uses: duynhlab/gha-workflows/.github/workflows/delete-workflow-runs.yml@33b9ec623c4a61dd1e107cd715ccdff1ca28ab78 # main
+    with:
+      retain_days: 7
+      dry_run: false
+    permissions:
+      actions: write
+      contents: read
