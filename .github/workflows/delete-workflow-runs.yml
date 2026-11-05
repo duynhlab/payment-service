@@ -15,7 +15,7 @@ permissions: {}
 
 jobs:
   delete-runs:
-    uses: duynhlab/gha-workflows/.github/workflows/delete-workflow-runs.yml@33b9ec623c4a61dd1e107cd715ccdff1ca28ab78 # main
+    uses: duynhlab/gha-workflows/.github/workflows/delete-workflow-runs.yml@4eb6afeecce6e299b41bed654d1580ae18cebfcb # main
     with:
       retain_days: 7
       dry_run: false
